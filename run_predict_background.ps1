@@ -34,7 +34,7 @@ if ($ExistingJobs.Count -gt 0) {
 $Wrapper = Join-Path $LogDir "_run_all_$Timestamp.generated.cmd"
 $Commands = foreach ($SourceDir in $SourceDirs) {
   $Source = $SourceDir
-  # NOTE: never delete the existing "<folder>_predicted" output here - --resume below relies on its
+  # NOTE: never delete the existing "<folder>\predicted_<folder>" output here - --resume below relies on its
   # saved labels/steps.jpg/results.csv to skip images already done (e.g. after a crash mid-batch).
   @"
 echo.>> "$Log"
@@ -66,7 +66,7 @@ if ($LASTEXITCODE -eq 0) {
 
 $p = Start-Process -FilePath $Wrapper -WindowStyle Hidden -PassThru
 Write-Output "Launched $($SourceDirs.Count) folders sequentially from scratch (wrapper PID $($p.Id))."
-Write-Output "Each output will be created beside its source as <folder>_predicted."
+Write-Output "Each output will be created inside its source as <folder>\predicted_<folder>."
 Write-Output "Log: $Log"
 
 

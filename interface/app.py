@@ -46,10 +46,11 @@ def load_preview(path: Path) -> Image.Image:
 
 
 def image_folders(root: Path) -> list[Path]:
-    """root and every subfolder that directly holds images, skipping *_predicted output folders."""
+    """root and every subfolder that directly holds images, skipping predicted_* (and legacy *_predicted) output folders."""
     dirs = [root] + sorted(p for p in root.rglob("*") if p.is_dir())
     return [d for d in dirs
-            if not any("_predicted" in part.lower() for part in d.relative_to(root).parts)
+            if not any(part.lower().startswith("predicted_") or "_predicted" in part.lower()
+                       for part in d.relative_to(root).parts)
             and list_images(d)]
 
 
@@ -100,7 +101,7 @@ def process_tab():
                     horizontal=True)
     source = st.text_input("Image path" if mode == "Single image" else "Folder path", key="source"
                            ).strip().strip('"')
-    out_root = st.text_input("Output folder (optional - default is '<name>_predicted' next to the source)"
+    out_root = st.text_input("Output folder (optional - default is 'predicted_<name>' inside the source folder)"
                              ).strip().strip('"')
     c1, c2 = st.columns(2)
     resume = c1.checkbox("Resume (reuse already-processed images)", value=True)
@@ -123,7 +124,7 @@ def process_tab():
         if not src.is_file() or src.suffix.lower() not in IMAGE_EXTS:
             st.error(f"Not a supported image: {src}")
             return
-        jobs = [(src, out_base or src.parent / f"{src.stem}_predicted", 1)]
+        jobs = [(src, out_base or src.parent / f"predicted_{src.stem}", 1)]
     else:
         if not src.is_dir():
             st.error(f"Not a folder: {src}")
@@ -135,9 +136,9 @@ def process_tab():
             n = min(n, limit) if limit else n
             if out_base:
                 rel = d.relative_to(src)
-                out = out_base / rel.parent / f"{rel.name or src.name}_predicted"
+                out = out_base / rel / f"predicted_{d.name}"
             else:
-                out = d.parent / f"{d.name}_predicted"
+                out = d / f"predicted_{d.name}"
             jobs.append((d, out, n))
     if not jobs:
         st.error("No images found.")

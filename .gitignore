@@ -14,7 +14,6 @@ pretrained_model/yolo_dataset_4cls_2x/
 .agents/
 agents/
 calibrations/*.IQC
-*.pt
 *.svs
 *.tif
 sssshhhhh.md
