@@ -12,7 +12,7 @@
       both streams into a single file (cmd.exe's "> log 2>&1" can).
   You never need to touch that generated .cmd yourself - just run this .ps1.
 #>
-$ProjectDir = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Desktop\yolo_skin_seg"
+$ProjectDir = (Get-Location).Path
 $Python     = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 $RawImagesRoot = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images"
 $LogDir     = Join-Path $ProjectDir "runs\background_logs"
