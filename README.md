@@ -3,7 +3,7 @@
 
 Train (on PMC data), finetune on (P&G data), pseudolabeling (on generated segmented P&G data) and run inference on H&E stained skin 
 
-# Download the repo from github (https://github.com/plaska-pg/skin_layer_segmentation)
+## Download the repo from github (https://github.com/plaska-pg/skin_layer_segmentation)
 
 ```powershell
 git clone https://github.com/plaska-pg/skin_layer_segmentation.git "$HOME\skin_layer_segmentation"
