@@ -1,0 +1,18 @@
+{
+  "_comment": "um_per_px per image, derived from calibrations/*.IQC (BX61_10X=0.645, Motic 40X scan=0.260). Matched to images by filename convention: GMDE *10X*/*10x* files were shot on the BX61 at 10X, the remaining (l1c1_Rotate90CW, s_ex_9_24_d2_*) are Motic 40X scans.",
+  "reference_um_per_px": 0.645,
+  "images": {
+    "GMDE 203 1 N-3 10X_with_roi2": 0.645,
+    "GMDE 204 ck 48 hr-2 10x_with_roi2": 0.645,
+    "GMDE 209 1 N-1 10X_with_roi": 0.645,
+    "GMDE 211 ck 48 hr-3 10x_with_roi": 0.645,
+    "GMDE 213 1 N-1 10X_with_roi": 0.645,
+    "GMDE 214 ck 48 hr-1 10x_with_roi": 0.645,
+    "GMDE 217 1 N-1 10X_with_roi": 0.645,
+    "GMDE 217 ck 48 hr-3 10x_with_roi": 0.645,
+    "GMDE 221 2 N-2 10X": 0.645,
+    "l1c1_Rotate90CW": 0.26,
+    "s_ex_9_24_d2_l11c2.svs-42Y5X84-W10": 0.26,
+    "s_ex_9_24_d2_l1c2.svs": 0.26
+  }
+}

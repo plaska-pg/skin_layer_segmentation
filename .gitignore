@@ -1,0 +1,21 @@
+
+# mostly for running at infrence, we use models in the models folder. The other folders are for training models and runs in that dev pipeline. not needed.
+.venv/
+__pycache__/
+runs/
+difficult_test_images/
+dataset_for_finetuning/images/
+dataset_for_finetuning/labels/
+dataset_pseudolabel_finetune/images/
+dataset_pseudolabel_finetune/labels/
+dataset_rotate/images/
+pretrained_model/train_4cls_2x/
+pretrained_model/yolo_dataset_4cls_2x/
+.agents/
+agents/
+calibrations/*.IQC
+*.pt
+*.svs
+*.tif
+sssshhhhh.md
+*.tiff

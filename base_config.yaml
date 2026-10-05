@@ -1,0 +1,34 @@
+# Base hyperparameters for the predict.py -> postprocess.py -> measurement.py
+# pipeline. Edit values here instead of hunting through each script; every
+# run's <out>/run_config.yaml records what was actually used, including any
+# --arg overrides passed on the predict.py command line.
+
+predict:
+  weights: runs\semseg\dataset_2cls_pseudo_v1\best.pt # runs/semseg/dataset_2cls_finetune_v2/best.pt
+  source: inference_images
+  device: auto
+  um_per_px: 0.645          # native um/px of --source images (0 disables rescaling) (10x)
+  reference_um_per_px: 0.645  # um/px the model was trained at (10x)
+  max_side: 3500           # cap longest edge fed to the model (GPU memory guard); null = no cap
+  workers: 1
+
+postprocess:
+  # um, not raw px: native pixel size varies with scan resolution (e.g. 0.26 vs
+  # 0.645 um/px), so a fixed px count means a different physical distance on
+  # different scans.
+  close_radii_um: [51.6, 103.2] #also extra dilation+erosion radius to bridge Epidermal gaps
+  touch_margin_um: 6.45
+  min_touch_frac: 0.20
+  sc_smooth_radius_um: 8   # opening radius that knocks small jagged noise off the SC boundary
+  lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
+  bottom_crop_frac: 0.40      # fraction of the rotated image's bottom rows dropped before ROI/measurement
+  rotation_weights: runs/rotation/rotate_model.pt   # trained orientation classifier (see rotate.py)
+  rotation_device: auto
+
+measurement:
+  skeleton_method: lee   # 'zhang' (skimage's 2D default) or 'lee'
+  hole_area_px: 64        # small holes filled before skeletonizing, so the skeleton graph is a tree
+  glass_level: 225        # image pixels with all channels >= this count as glass (free surface)
+  sc_surface_gl_margin_frac: 0.5   # excludes SC boundary within this fraction of SC's typical thickness from GL
+  sc_surface_gl_margin_min_px: 3   # margin floor, so a paper-thin SC still gets some separation from GL
+  sc_surface_gl_margin_max_px: 30  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
