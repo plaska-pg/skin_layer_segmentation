@@ -204,7 +204,8 @@ def main():
     ap.add_argument("--source", default=_PREDICT_CFG.get("source", "inference_images"),
                      help="a single image file OR a folder of images to predict on")
     ap.add_argument("--out", default=None,
-                     help="default: '<source name>_predicted', next to the source")
+                     help="default: '<source folder>/predicted_<source folder name>' (for a single image: "
+                          "'<image's folder>/predicted_<image stem>')")
     ap.add_argument("--device", default=_PREDICT_CFG.get("device", "auto"))
     ap.add_argument("--um-per-px", type=float, default=_PREDICT_CFG.get("um_per_px", 0.26),
                      help="native um/px of --source images (default matches inference_images' Motic 40X "
@@ -251,10 +252,10 @@ def main():
     # --source may be a single image file or a folder of images
     if src.is_file():
         files = [src] if src.suffix.lower() in IMAGE_EXTS else []
-        default_out = src.parent / f"{src.stem}_predicted"
+        default_out = src.parent / f"predicted_{src.stem}"
     else:
         files = sorted(p for p in src.iterdir() if p.suffix.lower() in IMAGE_EXTS)
-        default_out = src.parent / f"{src.name}_predicted"
+        default_out = src / f"predicted_{src.name}"
     out = Path(args.out) if args.out else default_out
     out.mkdir(parents=True, exist_ok=True)
     if not args.no_postprocess:

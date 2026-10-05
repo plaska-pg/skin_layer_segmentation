@@ -1,3 +1,8 @@
+ To train (on PMC data), finetune on (P&G data), pseudolabeling (on generated segmented P&G data) and run inference on H&E stained skin 
+
+# Train a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
+How to train:
+Download the data, convert to yolo format, and run UNET model to segment just the "Keratin" and "Epidermis" classes. Keratin is equivalent to "SC layer" and Epidermis is equivalnt to "Granular Layer" in finetuning but then back to Epidermis. I want to make this consistent throughout the pipeline later.
 
 # Environment setup
 
@@ -17,7 +22,13 @@ pip install -r requirements.txt
 data and model saved here: yolo_skin_seg\pretrained_model
 training resolution was 0.645 µm/px
 
-# then finetuned on our segmented images in yolo_skin_seg\dataset
+# then finetuned on our segmented images in dataset_for_finetuning
+
+# then pseudolabeling on nicely segmented images
+  use .txt segmentation cooredinates in the labels folder (corresponding to an image with the same prefix) 
+
+  Instead of making the _predicted folder alongside the images folder, I want to make _predeicted folder a subfolder of the images folder. I want to rename it predicted_<image_dir_name>. That way it would be easier to load the txt segments on the images because they're all under the same folder. 
+
 
 # then for interence on data in yolo_skin_seg\inference_images
 
@@ -89,3 +100,6 @@ Copy-Item $input.FullName $one
 python predict.py `
   --source $one `
   --out "C:\Users\plas.ka\Desktop\one_prediction"
+
+
+  # next try follicle detection model 
