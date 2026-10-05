@@ -260,6 +260,22 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
 
 
 
+def _near_mask(mask: np.ndarray, radius: float) -> np.ndarray:
+   """distance_transform_edt(~mask) < radius, computed only on mask's bbox padded
+   by radius so huge images don't need a full-frame float64 EDT."""
+   out = np.zeros_like(mask, bool)
+   if not mask.any():
+       return out
+   rows, cols = np.any(mask, axis=1), np.any(mask, axis=0)
+   r0, r1 = np.argmax(rows), len(rows) - np.argmax(rows[::-1])
+   c0, c1 = np.argmax(cols), len(cols) - np.argmax(cols[::-1])
+   pad = int(np.ceil(radius)) + 1
+   r0, c0 = max(r0 - pad, 0), max(c0 - pad, 0)
+   r1, c1 = min(r1 + pad, mask.shape[0]), min(c1 + pad, mask.shape[1])
+   out[r0:r1, c0:c1] = distance_transform_edt(~mask[r0:r1, c0:c1]) < radius
+   return out
+
+
 def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_px: int = HOLE_AREA_PX,
                sc_prep: tuple = None, gl_prep: tuple = None):
    """Split each layer's boundary into the two sides a span runs between.
@@ -305,7 +321,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_p
        typ_sc = 0.0
    gl_margin_px = float(np.clip(SC_SURFACE_GL_MARGIN_FRAC * typ_sc,
                                 SC_SURFACE_GL_MARGIN_MIN_PX, SC_SURFACE_GL_MARGIN_MAX_PX))
-   near_gl = distance_transform_edt(~gl) < gl_margin_px if gl.any() else np.zeros_like(gl, bool)
+   near_gl = _near_mask(gl, gl_margin_px)
    sides = {"sc_junction": sc_ring & d_gl, "sc_surface": sc_ring & ~d_gl & ~near_gl}
 
 
@@ -319,7 +335,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_p
        if gl_skel is None:
            gl_skel = skeletonize(gl)
        typ = 2 * np.median(gl_dt[gl_skel]) if gl_skel.any() else 20.0
-       near_sc = distance_transform_edt(~sc) < max(0.5 * typ, 5.0)
+       near_sc = _near_mask(sc, max(0.5 * typ, 5.0))
        top = top | (gl_ring & near_sc)
        bottom = gl_ring & ~top
    sides["gl_top"], sides["gl_bottom"] = top, bottom
