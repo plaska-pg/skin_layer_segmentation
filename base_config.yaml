@@ -4,7 +4,7 @@
 # --arg overrides passed on the predict.py command line.
 
 predict:
-  weights: runs\semseg\dataset_2cls_pseudo_v1\best.pt # runs/semseg/dataset_2cls_finetune_v2/best.pt
+  weights: models\best.pt # runs/semseg/dataset_2cls_finetune_v2/best.pt
   source: inference_images
   device: auto
   um_per_px: 0.645          # native um/px of --source images (0 disables rescaling) (10x)
@@ -22,7 +22,7 @@ postprocess:
   sc_smooth_radius_um: 8   # opening radius that knocks small jagged noise off the SC boundary
   lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
   bottom_crop_frac: 0.40      # fraction of the rotated image's bottom rows dropped before ROI/measurement
-  rotation_weights: runs/rotation/rotate_model.pt   # trained orientation classifier (see rotate.py)
+  rotation_weights: models/rotate_model.pt   # trained orientation classifier (see rotate.py)
   rotation_device: auto
 
 measurement:

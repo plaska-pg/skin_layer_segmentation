@@ -1,4 +1,18 @@
 
+# Environment setup
+
+install python3.14. You can do this by typing python in the powershell terminal (if on windows). This'll pull up an install window. 
+
+Create the venv on a **local** disk, not inside OneDrive (OneDrive sync corrupts/slows venvs).
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+`requirements.txt` pins the exact packages. The background `run_predict_background*.ps1` scripts resolve the interpreter from `.venv\Scripts\python.exe` under `$ProjectDir`, so keep the venv there (or update `$ProjectDir`).
+
 # Pretrained a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
 data and model saved here: yolo_skin_seg\pretrained_model
 training resolution was 0.645 µm/px

@@ -13,7 +13,7 @@
   You never need to touch that generated .cmd yourself - just run this .ps1.
 #>
 $ProjectDir = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Desktop\yolo_skin_seg"
-$Python     = "C:\Users\plas.ka\AppData\Local\Programs\Python\Python314\python.exe"
+$Python     = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 $RawImagesRoot = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images"
 $LogDir     = Join-Path $ProjectDir "runs\background_logs"
 $Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
