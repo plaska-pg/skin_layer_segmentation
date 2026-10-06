@@ -302,7 +302,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX
        typ_sc = 0.0
    gl_margin_px = float(np.clip(SC_SURFACE_GL_MARGIN_FRAC * typ_sc,
                                 SC_SURFACE_GL_MARGIN_MIN_PX, SC_SURFACE_GL_MARGIN_MAX_PX))
-   near_gl = distance_transform_edt(~gl) < gl_margin_px if gl.any() else np.zeros_like(gl, bool)
+   near_gl = _near_mask(gl, gl_margin_px)
    sides = {"sc_junction": sc_ring & d_gl, "sc_surface": sc_ring & ~d_gl & ~near_gl}
 
 
@@ -316,7 +316,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX
        if gl_skel is None:
            gl_skel = skeletonize(gl)
        typ = 2 * np.median(gl_dt[gl_skel]) if gl_skel.any() else 20.0
-       near_sc = distance_transform_edt(~sc) < max(0.5 * typ, 5.0)
+       near_sc = _near_mask(sc, max(0.5 * typ, 5.0))
        top = top | (gl_ring & near_sc)
        bottom = gl_ring & ~top
    sides["gl_top"], sides["gl_bottom"] = top, bottom
