@@ -1,8 +1,12 @@
+original dataset is Histo-Set. It was converted to yolo format: train_dataset_yolo_format_Histo-Set_4cls_2x.  contains these classes:
+   0: SC
+  1: Epidermis
+  2: glands
+  3: follicles
 
-yolo_dataset_4cls_2x was created from another original dataset. 
+Original dataset. Whole-slide H&E images captured at 20x on a HEIDSTAR HDS-MS-200A brightfield microscope, about 15,000 by 4,000 to 8,000 px per slide. AT20× magnification, the HEIDSTAR HDS‑MS‑200A brightfield microscope has an image resolution of approximately 0.25 µm per pixel
 
-Original dataset. Whole-slide H&E images captured at 20x on a HEIDSTAR HDS-MS-200A brightfield microscope, about 15,000 by 4,000 to 8,000 px per slide, with no micrometre-per-pixel metadata in the files. At this scale the keratin layer is 140 to 300 px thick and the epidermis 120 to 600 px.
-
+## onverted Histo-Seg dataset to Histo-Seg_yolo_train_dataset (shrunk and subsettted) 
   Converted datasets. Every dataset is a fixed shrink of the source, then cut into 1024 px tiles. The shrink sets the effective magnification.
 
   ┌────────────────────────────────────┬────────┬───────────────┬────────────────┬────────────┬─────────────┐

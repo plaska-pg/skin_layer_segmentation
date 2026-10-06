@@ -9,8 +9,7 @@ dataset_for_finetuning/labels/
 dataset_pseudolabel_finetune/images/
 dataset_pseudolabel_finetune/labels/
 dataset_rotate/images/
-pretrained_model/train_4cls_2x/
-pretrained_model/yolo_dataset_4cls_2x/
+pretrained_model/
 .agents/
 agents/
 calibrations/*.IQC
