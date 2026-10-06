@@ -108,7 +108,7 @@ def process_tab():
     limit = int(c2.number_input("Limit images per folder (0 = all)", min_value=0, value=0, step=1))
 
     st.subheader("Configuration")
-    base_cfg = yaml.safe_load(BASE_CONFIG.read_text()) or {}
+    base_cfg = yaml.safe_load(BASE_CONFIG.read_text(encoding="utf-8")) or {}
     cfg = config_editor(base_cfg)
 
     if not st.button("Run", type="primary"):

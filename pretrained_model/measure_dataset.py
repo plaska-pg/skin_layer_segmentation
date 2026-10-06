@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-measure_dataset.py -- batch SC/Granular Layer segmentation + geometry measurements.
+measure_dataset.py -- batch SC/Epidermis segmentation + geometry measurements.
 
 Walks --source for subfolders of images, runs the trained semseg model on each
 image (same scale-correction + small-blob/adjacency cleanup as
@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from surface_utils import layer_height_stats  # noqa: E402
 
 TOP_CLASS = "SC"
-OTHER_CLASS = "Granular Layer"
+OTHER_CLASS = "Epidermis"
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
@@ -77,7 +77,7 @@ def main():
     ap.add_argument("--min-blob-px", type=int, default=200)
     ap.add_argument("--adjacency-margin-px", type=int, default=15)
     ap.add_argument("--min-touch-frac", type=float, default=0.4,
-                    help="drop SC+Granular Layer entirely for an image unless at least this fraction of "
+                    help="drop SC+Epidermis entirely for an image unless at least this fraction of "
                          "EACH class's own pixels touch the other (within --adjacency-margin-px). 0 = off")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()

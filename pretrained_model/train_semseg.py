@@ -400,7 +400,8 @@ def cmd_train(args):
     names = read_names(data_dir)
     n_classes = len(names) + 1  # + background
     device = pick_device(args.device)
-    out = Path(args.project) / args.name
+    run_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    out = Path(args.project) / f"{args.name}_{run_stamp}"
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps({k: v for k, v in vars(args).items() if k != "func"}, indent=2))
     print(f"device={device}  classes={['background'] + names}  out={out}")
@@ -525,8 +526,8 @@ def filter_small_components(mask: np.ndarray, min_px: int) -> np.ndarray:
 def filter_unadjacent_components(mask: np.ndarray, rules: list, margin_px: int, class_index: dict) -> np.ndarray:
     """rules: list of (child_name, parent_name). Drop connected components of the
     child class that don't overlap a margin_px-dilated parent-class mask - e.g. SC
-    is anatomically always adjacent to Granular Layer, so a stray SC blob elsewhere
-    in the image (with no nearby Granular Layer prediction) is almost certainly noise.
+    is anatomically always adjacent to Epidermis, so a stray SC blob elsewhere
+    in the image (with no nearby Epidermis prediction) is almost certainly noise.
     Rotation-invariant: only cares about adjacency, not "above/below"."""
     if not rules:
         return mask
@@ -605,7 +606,7 @@ def filter_abnormal_components(mask: np.ndarray, class_id: int, min_h_um: float,
 
 
 def parse_dimension_limits(spec: str) -> dict:
-    """'SC:67.4,3332.6,573.1,5557.2;Granular Layer:94.5,3198,581,5887' ->
+    """'SC:67.4,3332.6,573.1,5557.2;Epidermis:94.5,3198,581,5887' ->
     {"SC": (67.4, 3332.6, 573.1, 5557.2), ...} (min_h, max_h, min_w, max_w) in um."""
     limits = {}
     for block in spec.split(";"):
@@ -750,7 +751,7 @@ def main():
     t.add_argument("--pretrained-classes", default=None,
                     help="comma-separated old checkpoint class names, positionally aligned to this "
                          "dataset's names (needed when --init-weights' class names differ from "
-                         "this dataset's, e.g. 'keratin,epidermis' -> SC,Granular Layer); "
+                         "this dataset's, e.g. 'keratin,epidermis' -> SC,Epidermis); "
                          "defaults to this dataset's own names if omitted")
     t.set_defaults(func=cmd_train)
 
@@ -770,7 +771,7 @@ def main():
                    help="drop predicted connected components smaller than this many pixels (per class); "
                         "removes small stray/noisy blobs. 0 = off")
     p.add_argument("--require-adjacent", default=None,
-                   help="comma-separated 'Child:Parent' class-name rules (e.g. 'SC:Granular Layer') - drops "
+                   help="comma-separated 'Child:Parent' class-name rules (e.g. 'SC:Epidermis') - drops "
                         "connected components of Child that don't touch/overlap a (dilated) Parent-class "
                         "region, since some classes are anatomically always adjacent to another. "
                         "Rotation-invariant (adjacency-based, not orientation-based).")
@@ -779,7 +780,7 @@ def main():
                         "tolerate the model's boundary being slightly off (used with --require-adjacent "
                         "and --touch-classes)")
     p.add_argument("--touch-classes", default=None,
-                   help="'ClassA,ClassB' (e.g. 'SC,Granular Layer') - drops BOTH classes entirely (whole "
+                   help="'ClassA,ClassB' (e.g. 'SC,Epidermis') - drops BOTH classes entirely (whole "
                         "image) unless at least --min-touch-frac of EACH class's own pixels lie within "
                         "--adjacency-margin-px of the other. Stricter than --require-adjacent's per-"
                         "component any-overlap check: catches cases where the two are mostly not touching "
@@ -787,7 +788,7 @@ def main():
     p.add_argument("--min-touch-frac", type=float, default=0.4,
                    help="minimum mutual-contact fraction required by --touch-classes (default 0.4 = 40%%)")
     p.add_argument("--canonicalize", default=None,
-                   help="'Top,Other' class names (e.g. 'SC,Granular Layer') - rotates the image+mask so "
+                   help="'Top,Other' class names (e.g. 'SC,Epidermis') - rotates the image+mask so "
                         "that band lies horizontal (via PCA on their combined pixels), then flips "
                         "vertically if needed so Top consistently ends up above Other. Saved overlay is "
                         "the rotated version. A fixed, self-consistent convention, not tied to how the "

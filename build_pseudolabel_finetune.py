@@ -31,7 +31,7 @@ OUT_DATASET = PROJECT / "dataset_pseudolabel_finetune"
 RAW = Path(r"C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts"
            r"\W Cheng Section (BDT-Skin) - Histology\Raw images")
 SVS_DIR = RAW / "S-EX_SEP_2024_D2_H_E"
-LABEL_DIR = RAW / "S-EX_SEP_2024_D2_H_E_predicted" / "labels"
+LABEL_DIR = RAW / f"predicted_{SVS_DIR.name}" / "labels"
 
 REFERENCE_UM_PER_PX = 0.645  # train_semseg.py reference scale (dataset_for_finetuning/scale_calibration.json)
 FALLBACK_UM_PER_PX = 0.257732  # Motic 40X value recorded for this series if a .svs lacks the MPP tag

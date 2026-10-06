@@ -28,7 +28,7 @@ How to train:
 Download the data, convert to yolo format, and run UNET model to segment just the "Keratin" and "Epidermis" classes. Keratin is equivalent to "SC layer" and Epidermis is equivalnt to "Granular Layer" in finetuning but then back to Epidermis. I want to make this consistent throughout the pipeline later.
 
 ## Pretrained a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
-data and model saved here: yolo_skin_seg\pretrained_model
+data and model saved here: pretrained_model and also I copied the one being used to models/best.pt
 training resolution was 0.645 µm/px
 
 ## then finetuned on our segmented images in dataset_for_finetuning
@@ -36,16 +36,13 @@ training resolution was 0.645 µm/px
 ## then pseudolabeling on nicely segmented images
   use .txt segmentation cooredinates in the labels folder (corresponding to an image with the same prefix) 
 
-  Instead of making the _predicted folder alongside the images folder, I want to make _predeicted folder a subfolder of the images folder. I want to rename it predicted_<image_dir_name>. That way it would be easier to load the txt segments on the images because they're all under the same folder. 
-
-
 ## then for interence on data in yolo_skin_seg\inference_images
 
 python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX 8_24 TIFF_H_E"
 
 python predict.py --source "runs\predict_sample_src" --limit 5
 
-I want to run every image in the subfolders in the Raw images, and want the predicted images to go in a subfolder_name_predicted folder.
+python predict.py --source "difficult_test_images" --limit 3
 
 ## to do:>
 

@@ -52,7 +52,6 @@ CLASS_COLORS = {"SC": (58, 161, 232), "Epidermal": (192, 168, 31)}  # BGR
 _MEAS_CFG = CONFIG.get("measurement", {})
 SKELETON_METHOD = _MEAS_CFG.get("skeleton_method", "lee")  # 'zhang' (skimage's 2D default) or 'lee'
 HOLE_AREA_PX = _MEAS_CFG.get("hole_area_px", 64)  # small holes filled before skeletonizing, so the skeleton graph is a tree
-GLASS_LEVEL = _MEAS_CFG.get("glass_level", 225)  # image pixels with all channels >= this count as glass (free surface)
 SC_SURFACE_GL_MARGIN_FRAC = _MEAS_CFG.get("sc_surface_gl_margin_frac", 0.5)  # excludes SC boundary within this fraction of SC's typical thickness from GL
 SC_SURFACE_GL_MARGIN_MIN_PX = _MEAS_CFG.get("sc_surface_gl_margin_min_px", 3)  # margin floor, so a paper-thin SC still gets some separation from GL
 SC_SURFACE_GL_MARGIN_MAX_PX = _MEAS_CFG.get("sc_surface_gl_margin_max_px", 30)  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
@@ -260,7 +259,7 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
 
 
 
-def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_px: int = HOLE_AREA_PX,
+def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX,
                sc_prep: tuple = None, gl_prep: tuple = None):
    """Split each layer's boundary into the two sides a span runs between.
      SC:  'surface'  = SC boundary touching neither SC nor GL, AND farther
@@ -268,7 +267,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_p
                        typical thickness (clamped to [MIN_PX, MAX_PX]) -
                        (air/glass or loose debris)
           'junction' = SC boundary touching GL
-     GL:  'top'      = GL boundary touching SC, or touching glass where no SC covers it
+     GL:  'top'      = GL boundary touching SC
           'bottom'   = GL boundary touching tissue that is not SC (the dermal side)
    Boundary pixels closer to SC than half the GL's typical thickness are treated
    as 'top' even if the touching pixel is tissue-coloured, so unlabelled keratin
@@ -286,10 +285,8 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_p
    else:
        gl, gl_dt, gl_skel = remove_small_holes(gl.astype(bool), max_size=hole_area_px), None, None
    k3 = np.ones((3, 3), np.uint8)
-   glass = np.all(img_bgr >= GLASS_LEVEL, axis=2)
    d_sc = cv2.dilate(sc.astype(np.uint8), k3) > 0
    d_gl = cv2.dilate(gl.astype(np.uint8), k3) > 0
-   d_glass = cv2.dilate(glass.astype(np.uint8), k3) > 0
 
 
    sc_ring = _inner_ring(sc)
@@ -310,7 +307,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, img_bgr: np.ndarray, hole_area_p
 
 
    gl_ring = _inner_ring(gl)
-   top = gl_ring & (d_sc | (d_glass & ~d_sc))
+   top = gl_ring & d_sc
    bottom = gl_ring & ~top
    if sc.any() and gl.any():
        # typical GL thickness from its distance transform along the medial axis
@@ -535,7 +532,7 @@ def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
 
    lines = [_fmt("SC", sc_stats, sc_holes), _fmt("Epidermal", gl_stats, gl_holes),
             f"EDJ tortuosity {gl_tortuosity:.2f}    "
-            f"white = EDJ junction \n red = SC spine \n magenta = Epidermal spine"]
+            f"\n white = EDJ junction \n red = SC spine \n magenta = Epidermal spine"]
    h, w = vis.shape[:2]
    font_scale = max(0.5, w / 1800)          # caption size tracks the image width
    font_th = max(1, round(font_scale * 1.5))
@@ -632,7 +629,7 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     sc_clean, sc_dt, sc_skel = sc_prep
     gl_clean, gl_dt, gl_skel = gl_prep
 
-    _, _, sides = layer_sides(sc_bin, gl_bin, rotated_img, sc_prep=sc_prep, gl_prep=gl_prep)
+    _, _, sides = layer_sides(sc_bin, gl_bin, sc_prep=sc_prep, gl_prep=gl_prep)
 
     if spines is not None:
         sc_spine, gl_spine = spines["SC"], spines["Epidermal"]
