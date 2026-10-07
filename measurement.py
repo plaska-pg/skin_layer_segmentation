@@ -37,7 +37,7 @@ Area/Length denominator.
 
 import cv2
 import numpy as np
-from scipy.ndimage import binary_fill_holes, distance_transform_edt
+from scipy.ndimage import binary_fill_holes
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
@@ -55,6 +55,20 @@ HOLE_AREA_PX = _MEAS_CFG.get("hole_area_px", 64)  # small holes filled before sk
 SC_SURFACE_GL_MARGIN_FRAC = _MEAS_CFG.get("sc_surface_gl_margin_frac", 0.5)  # excludes SC boundary within this fraction of SC's typical thickness from GL
 SC_SURFACE_GL_MARGIN_MIN_PX = _MEAS_CFG.get("sc_surface_gl_margin_min_px", 3)  # margin floor, so a paper-thin SC still gets some separation from GL
 SC_SURFACE_GL_MARGIN_MAX_PX = _MEAS_CFG.get("sc_surface_gl_margin_max_px", 30)  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
+
+
+def _distance_transform(mask: np.ndarray) -> np.ndarray:
+   mask = np.asarray(mask, dtype=bool)
+   out = np.zeros(mask.shape, np.float32)
+   ys, xs = np.nonzero(mask)
+   if ys.size == 0:
+       return out
+   y0, y1 = max(ys.min() - 1, 0), min(ys.max() + 2, mask.shape[0])
+   x0, x1 = max(xs.min() - 1, 0), min(xs.max() + 2, mask.shape[1])
+   # Include adjacent in-image background without inventing background past image edges.
+   crop = mask[y0:y1, x0:x1].astype(np.uint8)
+   out[y0:y1, x0:x1] = cv2.distanceTransform(crop, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+   return out
 
 
 
@@ -180,9 +194,9 @@ def skeleton_spine(skel: np.ndarray, dt: np.ndarray):
 def _prep_layer(mask: np.ndarray, hole_area_px: int = HOLE_AREA_PX):
    """Hole-filled mask + its distance transform + medial-axis skeleton, computed
    once so layer_sides / layer_stats / the spine panel all reuse them instead of
-   each recomputing the (expensive) skeletonize + distance_transform_edt."""
+   each recomputing the (expensive) skeletonize + distance transform."""
    clean = remove_small_holes(mask.astype(bool), max_size=hole_area_px)
-   dt = distance_transform_edt(clean)
+   dt = _distance_transform(clean)
    skel = skeletonize(clean, method=SKELETON_METHOD)
    return clean, dt, skel
 
@@ -204,7 +218,7 @@ def _layer_spine(mask: np.ndarray, hole_area_px: int = HOLE_AREA_PX,
    if clean is None:
        clean = remove_small_holes(mask.astype(bool), max_size=hole_area_px)
    if dt is None:
-       dt = distance_transform_edt(clean)
+       dt = _distance_transform(clean)
    if skel is None:
        skel = skeletonize(clean, method=SKELETON_METHOD)
    comp_labels = label(clean, connectivity=2)
@@ -296,7 +310,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX
        if sc_skel is None:
            sc_skel = skeletonize(sc)
        if sc_dt is None:
-           sc_dt = distance_transform_edt(sc)
+           sc_dt = _distance_transform(sc)
        typ_sc = 2 * np.median(sc_dt[sc_skel]) if sc_skel.any() else 0.0
    else:
        typ_sc = 0.0
@@ -312,7 +326,7 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX
    if sc.any() and gl.any():
        # typical GL thickness from its distance transform along the medial axis
        if gl_dt is None:
-           gl_dt = distance_transform_edt(gl)
+           gl_dt = _distance_transform(gl)
        if gl_skel is None:
            gl_skel = skeletonize(gl)
        typ = 2 * np.median(gl_dt[gl_skel]) if gl_skel.any() else 20.0

@@ -27,6 +27,9 @@ pip install -r requirements.txt
 How to train:
 Download the data, convert to yolo format, and run UNET model to segment just the "Keratin" and "Epidermis" classes. Keratin is equivalent to "SC layer" and Epidermis is equivalnt to "Granular Layer" in finetuning but then back to Epidermis. I want to make this consistent throughout the pipeline later.
 
+Note the model was trained on 0.28um/px
+
+
 ## Pretrained a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
 data and model saved here: pretrained_model and also I copied the one being used to models/best.pt
 training resolution was 0.645 µm/px

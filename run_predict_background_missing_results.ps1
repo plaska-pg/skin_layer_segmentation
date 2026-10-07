@@ -62,7 +62,7 @@ $Commands = foreach ($SourceDir in $SourceDirs) {
   @"
 echo.>> "$Log"
 echo ===== %date% %time% - $Source ===== >> "$Log"
-"$Python" -u predict.py --source "$Source" >> "$Log" 2>&1
+"$Python" -u predict.py --source "$Source" --resume >> "$Log" 2>&1
 echo [%date% %time%] Exit code: %errorlevel% >> "$Log"
 "@
 }
