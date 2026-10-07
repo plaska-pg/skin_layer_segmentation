@@ -7,7 +7,7 @@ predict:
   weights: models/best.pt # runs/semseg/dataset_2cls_finetune_v2/best.pt
   source: inference_images
   device: auto
-  um_per_px: 0.645          # native um/px of --source images (0 disables rescaling) (10x)
+  um_per_px: 0.255          # native um/px of --source images (0 disables rescaling) (10x)
   reference_um_per_px: 0.645  # um/px the model was trained at (10x)
   max_side: 3500           # cap longest edge fed to the model (GPU memory guard); null = no cap
   workers: 1
