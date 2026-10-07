@@ -283,7 +283,8 @@ def _near_mask(mask: np.ndarray, radius: float) -> np.ndarray:
    pad = int(np.ceil(radius)) + 1
    r0, c0 = max(r0 - pad, 0), max(c0 - pad, 0)
    r1, c1 = min(r1 + pad, mask.shape[0]), min(c1 + pad, mask.shape[1])
-   out[r0:r1, c0:c1] = distance_transform_edt(~mask[r0:r1, c0:c1]) < radius
+   bg = (~mask[r0:r1, c0:c1]).astype(np.uint8)
+   out[r0:r1, c0:c1] = cv2.distanceTransform(bg, cv2.DIST_L2, cv2.DIST_MASK_PRECISE) < radius
    return out
 
 
