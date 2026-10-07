@@ -199,15 +199,15 @@ def write_yolo_labels(pred_mask: np.ndarray, class_index: dict, out_path: Path, 
 def main():
     builtins.print = _timestamped_print
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "runs/semseg/dataset_2cls_finetune_v2/best.pt"),
+    ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "models/best.pt"),
                      help="ResUNet checkpoint trained on SC/Granular Layer (dataset/dataset.yaml)")
     ap.add_argument("--source", default=_PREDICT_CFG.get("source", "inference_images"),
                      help="a single image file OR a folder of images to predict on")
     ap.add_argument("--out", default=None,
                      help="default: '<source folder>/predicted_<source folder name>' (for a single image: "
-                          "'<image's folder>/predicted_<image stem>')")
+                          "'<image's folder>/PREDICTED_<image stem>')")
     ap.add_argument("--device", default=_PREDICT_CFG.get("device", "auto"))
-    ap.add_argument("--um-per-px", type=float, default=_PREDICT_CFG.get("um_per_px", 0.26),
+    ap.add_argument("--um-per-px", type=float, default=_PREDICT_CFG.get("um_per_px", 0.2577),
                      help="native um/px of --source images (default matches inference_images' Motic 40X "
                           "calibration in calibrations/Motic 40X scan calibration.IQC). 0 disables rescaling. "
                           "For .svs files, the scanner's own embedded MPP tag is used instead when present.")

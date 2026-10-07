@@ -19,7 +19,7 @@ def load_config(path: Path = None) -> dict:
     p = Path(path) if path else BASE_CONFIG_PATH
     if not p.exists():
         return {}
-    return yaml.safe_load(p.read_text()) or {}
+    return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 
 CONFIG = load_config()
