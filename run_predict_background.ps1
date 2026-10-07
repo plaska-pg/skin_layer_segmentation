@@ -22,7 +22,7 @@ $ImageExtensions = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs")
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
-$SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_Exp 6.24 D5")
+$SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX_NOV_24_D2_H_E")
 
 $ExistingJobs = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
   Where-Object { $_.CommandLine -match '(?i)predict\.py' })
@@ -39,7 +39,7 @@ $Commands = foreach ($SourceDir in $SourceDirs) {
   @"
 echo.>> "$Log"
 echo ===== %date% %time% - $Source ===== >> "$Log"
-"$Python" -u predict.py --source "$Source" >> "$Log" 2>&1
+"$Python" -u predict.py --source "$Source" --resume>> "$Log" 2>&1
 echo [%date% %time%] Exit code: %errorlevel% >> "$Log"
 "@
 }
