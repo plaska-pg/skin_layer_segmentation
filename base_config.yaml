@@ -16,8 +16,8 @@ postprocess:
   # um, not raw px: native pixel size varies with scan resolution (e.g. 0.26 vs
   # 0.645 um/px), so a fixed px count means a different physical distance on
   # different scans.
-  close_radii_um: [51.6, 103.2] #also extra dilation+erosion radius to bridge Epidermal gaps
-  touch_margin_um: 6.45
+  close_radii_um: [46.6, 103.2] # merges a segment until min_touch_frac (like 20%) of the segment is touching the other segment.  also extra dilation+erosion radius to bridge Epidermal gaps and smoothing
+  touch_margin_um: 6.45 # sets how close the two regions’ edges must be to count as “touching.”
   min_touch_frac: 0.20
   sc_smooth_radius_um: 8   # opening radius that knocks small jagged noise off the SC boundary
   lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
@@ -28,7 +28,6 @@ postprocess:
 measurement:
   skeleton_method: lee   # 'zhang' (skimage's 2D default) or 'lee'
   hole_area_px: 64        # small holes filled before skeletonizing, so the skeleton graph is a tree
-  glass_level: 225        # image pixels with all channels >= this count as glass (free surface)
   sc_surface_gl_margin_frac: 0.5   # excludes SC boundary within this fraction of SC's typical thickness from GL
   sc_surface_gl_margin_min_px: 3   # margin floor, so a paper-thin SC still gets some separation from GL
   sc_surface_gl_margin_max_px: 30  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
