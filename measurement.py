@@ -257,6 +257,20 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
    return labels == ids[np.argmax(counts)]
 
 
+def _near_mask(mask: np.ndarray, radius: float) -> np.ndarray:
+   """distance_transform_edt(~mask) < radius, computed only on mask's bbox padded
+   by radius so huge images don't need a full-frame float64 EDT."""
+   out = np.zeros_like(mask, bool)
+   if not mask.any():
+       return out
+   rows, cols = np.any(mask, axis=1), np.any(mask, axis=0)
+   r0, r1 = np.argmax(rows), len(rows) - np.argmax(rows[::-1])
+   c0, c1 = np.argmax(cols), len(cols) - np.argmax(cols[::-1])
+   pad = int(np.ceil(radius)) + 1
+   r0, c0 = max(r0 - pad, 0), max(c0 - pad, 0)
+   r1, c1 = min(r1 + pad, mask.shape[0]), min(c1 + pad, mask.shape[1])
+   out[r0:r1, c0:c1] = distance_transform_edt(~mask[r0:r1, c0:c1]) < radius
+   return out
 
 
 def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX,

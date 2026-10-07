@@ -3,6 +3,13 @@
 
 Train (on PMC data), finetune on (P&G data), pseudolabeling (on generated segmented P&G data) and run inference on H&E stained skin 
 
+## Quick start
+
+Run the app interface
+```
+streamlit run interface/app.py
+```
+
 ## Download the repo from github (https://github.com/plaska-pg/skin_layer_segmentation)
 
 ```powershell
@@ -108,4 +115,6 @@ python predict.py `
   --out "C:\Users\plas.ka\Desktop\one_prediction"
 
 
-  ## next try follicle detection model 
+# to do
+ try follicle detection model 
+ make better at different image sizes and resolutions
