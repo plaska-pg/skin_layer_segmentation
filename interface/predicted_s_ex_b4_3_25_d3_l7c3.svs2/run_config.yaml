@@ -1,0 +1,41 @@
+run:
+  created_at: '2026-10-06T14:07:55.347462-04:00'
+  source: C:\Users\plas.ka\skin_layer_segmentation\interface\s_ex_b4_3_25_d3_l7c3.svs2.tif
+  output: C:\Users\plas.ka\skin_layer_segmentation\interface\predicted_s_ex_b4_3_25_d3_l7c3.svs2
+  image_count: 1
+  device: cuda
+  model_class_names:
+  - SC
+  - Granular Layer
+  base_config_path: C:\Users\plas.ka\skin_layer_segmentation\runs\interface\config_20261006_140747.yaml
+parameters:
+  weights: models/best.pt
+  source: C:\Users\plas.ka\skin_layer_segmentation\interface\s_ex_b4_3_25_d3_l7c3.svs2.tif
+  out: C:\Users\plas.ka\skin_layer_segmentation\interface\predicted_s_ex_b4_3_25_d3_l7c3.svs2
+  device: auto
+  um_per_px: 0.645
+  reference_um_per_px: 0.645
+  max_side: 3500
+  no_postprocess: false
+  no_labels: false
+  resume: true
+  csv_out: null
+  limit: null
+  workers: 1
+resolved:
+  weights: C:\Users\plas.ka\skin_layer_segmentation\models\best.pt
+  csv_output: C:\Users\plas.ka\skin_layer_segmentation\interface\predicted_s_ex_b4_3_25_d3_l7c3.svs2\results.csv
+  reference_um_per_px: 0.645
+  postprocess: true
+  close_radii_um:
+  - 46.6
+  - 103.2
+  touch_margin_um: 6.45
+  min_touch_frac: 0.2
+  sc_smooth_radius_um: 8
+  lateral_clip_frac: 0.05
+  bottom_crop_frac: 0.4
+  input_files:
+  - file: s_ex_b4_3_25_d3_l7c3.svs2.tif
+    um_per_px: 0.645
+    inference_scale: 1.0

@@ -3,6 +3,7 @@
     streamlit run interface/app.py
 """
 
+import base64
 import os
 import re
 import subprocess
@@ -27,6 +28,36 @@ PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 PREVIEW_MAX_SIDE = 2000  # downscale QA jpgs before sending them to the browser
 
 st.set_page_config(page_title="Skin segmentation", layout="wide")
+
+header_image = base64.b64encode(Path(__file__).with_name("mod.jpg").read_bytes()).decode("ascii")
+st.html(f"""
+<style>
+.stMainBlockContainer {{
+    padding-top: 100px;
+}}
+header[data-testid="stHeader"] {{
+    background: transparent;
+}}
+/* stMain is the scroll container, so this banner scrolls away with the content */
+section[data-testid="stMain"] {{
+    position: relative;
+    isolation: isolate;
+}}
+section[data-testid="stMain"]::before {{
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 110px;
+    background: url("data:image/jpeg;base64,{header_image}") center / cover no-repeat;
+    opacity: 0.35;
+    pointer-events: none;
+    z-index: -1;
+}}
+
+</style>
+""")
 
 
 # ----------------------------------------------------------------------------
