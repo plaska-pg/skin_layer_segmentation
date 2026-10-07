@@ -112,3 +112,9 @@ python predict.py `
 
 
   ## next try follicle detection model 
+
+
+folders to do: 
+  S_EX_NOV_24_D2_H_E (log entry) and S_Exp 6.24 D5
+
+
