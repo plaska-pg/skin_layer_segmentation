@@ -36,7 +36,7 @@ from train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
 
 from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
 from postprocess import (EPIDERMAL_ERODE_DILATE_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
-                         FOLLICLE_WEIGHTS, LATERAL_CLIP_FRAC, ROI_CONF, ROI_ENABLED, ROI_WEIGHTS,
+                         FOLLICLE_PADDING_UM, FOLLICLE_WEIGHTS, GLAND_ERODE_DILATE_UM, LATERAL_CLIP_FRAC, ROI_CONF, ROI_ENABLED, ROI_WEIGHTS,
                          SC_ERODE_DILATE_UM, overlay, process_image, write_yolo_labels)  # noqa: E402
 from measurement import CSV_COLUMNS, _rasterise  # noqa: E402
 
@@ -75,10 +75,12 @@ def write_run_config(path: Path, args, src: Path, out: Path, device, names, file
             "postprocess": not args.no_postprocess,
             "sc_erod_dil_kernel_size_um": SC_ERODE_DILATE_UM,
             "epidermal_erod_dil_kernel_size_um": EPIDERMAL_ERODE_DILATE_UM,
+            "gland_erod_dil_kernel_size_um": GLAND_ERODE_DILATE_UM,
             "lateral_clip_frac": LATERAL_CLIP_FRAC,
             "follicle_enabled": FOLLICLE_ENABLED,
             "follicle_weights": str(Path(FOLLICLE_WEIGHTS).resolve()),
             "follicle_conf": FOLLICLE_CONF,
+            "follicle_padding_um": FOLLICLE_PADDING_UM,
             "follicle_mask_frac": FOLLICLE_MASK_FRAC,
             "roi_enabled": ROI_ENABLED,
             "roi_weights": str(Path(ROI_WEIGHTS).resolve()),
@@ -244,6 +246,7 @@ def main():
               f"follicle_enabled={FOLLICLE_ENABLED}; follicle_mask_frac={FOLLICLE_MASK_FRAC}; "
               f"sc_erod_dil_kernel_size_um={SC_ERODE_DILATE_UM}; "
               f"epidermal_erod_dil_kernel_size_um={EPIDERMAL_ERODE_DILATE_UM}; "
+              f"gland_erod_dil_kernel_size_um={GLAND_ERODE_DILATE_UM}; "
               f"lateral_clip_frac={LATERAL_CLIP_FRAC}", flush=True)
     labels_dir = out / "raw_segmentations"
     post_labels_dir = out / "postprocessed_segmentations"

@@ -23,7 +23,7 @@ total mask Area (A, pixel count) divided by the medial-axis backbone/
 centerline length (L) of the layer - Mean Height = A / L. L is the main-
 spine skeleton (skeleton_spine, per connected component, longest geodesic
 path through the skeleton, summed across components). layer_sides() still
-splits each layer's boundary into a junction (SC/GL) side and a free-surface
+splits each layer's boundary into an SC-Epidermal_boundary side and a free-surface
 / dermal side, purely so the Measurement panel can draw those reference
 lines; only area, mean height, tortuosity, and hole count are reported.
 
@@ -55,6 +55,8 @@ HOLE_AREA_PX = _MEAS_CFG.get("hole_area_px", 64)  # small holes filled before sk
 SC_SURFACE_GL_MARGIN_FRAC = _MEAS_CFG.get("sc_surface_gl_margin_frac", 0.5)  # excludes SC boundary within this fraction of SC's typical thickness from GL
 SC_SURFACE_GL_MARGIN_MIN_PX = _MEAS_CFG.get("sc_surface_gl_margin_min_px", 3)  # margin floor, so a paper-thin SC still gets some separation from GL
 SC_SURFACE_GL_MARGIN_MAX_PX = _MEAS_CFG.get("sc_surface_gl_margin_max_px", 30)  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
+EDJ_CUT_MARGIN_PX = _MEAS_CFG.get("edj_cut_margin_px", 3)  # EDJ points this close to an artificial cut are dropped
+EDJ_SMOOTH_EPS_PX = _MEAS_CFG.get("edj_smooth_eps_px", 1.0)  # approxPolyDP tolerance for EDJ length
 TISSUE_SAT_THRESHOLD = _MEAS_CFG.get("tissue_saturation_threshold", 20)  # HSV saturation (0-255) above which a pixel counts as tissue
 
 
@@ -187,7 +189,7 @@ def skeleton_spine(skel: np.ndarray, dt: np.ndarray):
 
 
 # ----------------------------------------------------------------------------
-# boundary-to-boundary spans (surface -> SC/GL junction -> bottom)
+# boundary-to-boundary spans (surface -> SC-Epidermal_boundary -> bottom)
 # ----------------------------------------------------------------------------
 
 
@@ -291,15 +293,16 @@ def _near_mask(mask: np.ndarray, radius: float) -> np.ndarray:
 
 
 def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX,
-               sc_prep: tuple = None, gl_prep: tuple = None):
+               sc_prep: tuple = None, gl_prep: tuple = None, cut_mask: np.ndarray = None):
    """Split each layer's boundary into the two sides a span runs between.
      SC:  'surface'  = SC boundary touching neither SC nor GL, AND farther
                        from GL than SC_SURFACE_GL_MARGIN_FRAC of SC's own
                        typical thickness (clamped to [MIN_PX, MAX_PX]) -
                        (air/glass or loose debris)
-          'junction' = SC boundary touching GL
+          'SC-Epidermal_boundary' = SC boundary touching GL
      GL:  'top'      = GL boundary touching SC
-          'bottom'   = GL boundary touching tissue that is not SC (the dermal side)
+          'bottom'   = EDJ: GL outer contour away from SC, excluding hole edges,
+                       artificial cuts (`cut_mask`) and the image border (see _edj_runs)
    Boundary pixels closer to SC than half the GL's typical thickness are treated
    as 'top' even if the touching pixel is tissue-coloured, so unlabelled keratin
    flakes on the outside do not get mistaken for the dermal boundary.
@@ -334,12 +337,11 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX
    gl_margin_px = float(np.clip(SC_SURFACE_GL_MARGIN_FRAC * typ_sc,
                                 SC_SURFACE_GL_MARGIN_MIN_PX, SC_SURFACE_GL_MARGIN_MAX_PX))
    near_gl = _near_mask(gl, gl_margin_px)
-   sides = {"sc_junction": sc_ring & d_gl, "sc_surface": sc_ring & ~d_gl & ~near_gl}
+   sides = {"SC-Epidermal_boundary": sc_ring & d_gl, "sc_surface": sc_ring & ~d_gl & ~near_gl}
 
 
    gl_ring = _inner_ring(gl)
-   top = gl_ring & d_sc
-   bottom = gl_ring & ~top
+   near_sc = d_sc
    if sc.any() and gl.any():
        # typical GL thickness from its distance transform along the medial axis
        if gl_dt is None:
@@ -347,11 +349,41 @@ def layer_sides(sc: np.ndarray, gl: np.ndarray, hole_area_px: int = HOLE_AREA_PX
        if gl_skel is None:
            gl_skel = skeletonize(gl)
        typ = 2 * np.median(gl_dt[gl_skel]) if gl_skel.any() else 20.0
-       near_sc = _near_mask(sc, max(0.5 * typ, 5.0))
-       top = top | (gl_ring & near_sc)
-       bottom = gl_ring & ~top
-   sides["gl_top"], sides["gl_bottom"] = top, bottom
+       near_sc = d_sc | _near_mask(sc, max(0.5 * typ, 5.0))
+   sides["gl_top"] = gl_ring & near_sc
+   sides["gl_bottom"], sides["edj_runs"] = _edj_runs(gl, near_sc, cut_mask)
    return sc, gl, sides
+
+
+def _edj_runs(gl: np.ndarray, near_sc: np.ndarray, cut_mask: np.ndarray = None):
+   """Split GL's outer contours (so no hole edges) into EDJ pieces: contiguous
+   contour points not in near_sc, not within EDJ_CUT_MARGIN_PX of cut_mask and
+   not on the image border. Contours with no excluded point (islands) are
+   skipped. Returns (edj_mask, runs) - runs are ordered (N, 2) x,y arrays."""
+   excl = near_sc.copy()
+   if cut_mask is not None and cut_mask.any():
+       m = 2 * int(EDJ_CUT_MARGIN_PX) + 1
+       k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (m, m))
+       excl |= cv2.dilate(cut_mask.astype(np.uint8), k) > 0
+   excl[[0, -1], :] = True
+   excl[:, [0, -1]] = True
+   edj_mask = np.zeros(gl.shape, bool)
+   runs = []
+   cnts, _ = cv2.findContours(gl.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+   for c in cnts:
+       pts = c[:, 0, :]
+       keep = ~excl[pts[:, 1], pts[:, 0]]
+       if keep.all() or not keep.any():
+           continue
+       # start the closed contour on an excluded point so no run wraps around
+       start = int(np.argmin(keep))
+       pts, keep = np.roll(pts, -start, axis=0), np.roll(keep, -start)
+       edges = np.diff(np.concatenate([[0], keep.astype(np.int8), [0]]))
+       for s, e in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+           run = pts[s:e]
+           runs.append(run)
+           edj_mask[run[:, 1], run[:, 0]] = True
+   return edj_mask, runs
 
 
 
@@ -394,23 +426,21 @@ def epidermis_midline(gl_mask: np.ndarray):
 
 
 
-def epidermis_tortuosity(gl_mask: np.ndarray, sc_mask: np.ndarray) -> float:
-   """Arc length / chord length of Epidermal's boundary, EXCLUDING the
-   side touching SC (the far/dermal side) - 1.0 = flat, higher = wavier/more
-   rete-ridge-like. 1.0 if there isn't enough far-side boundary to measure."""
-   gl_u8 = gl_mask.astype(np.uint8)
-   k3 = np.ones((3, 3), np.uint8)
-   boundary = (cv2.dilate(gl_u8, k3) > 0) & ~gl_mask.astype(bool)
-   near_sc = boundary & (cv2.dilate(sc_mask.astype(np.uint8), k3) > 0)
-   far_ring = boundary & ~near_sc
-   ys, xs = np.nonzero(far_ring)
-   if len(xs) < 50:
+def epidermis_tortuosity(edj_runs) -> float:
+   """Sum of EDJ piece arc lengths (pixel staircase removed by approxPolyDP) /
+   sum of their end-to-end distances - 1.0 = flat, higher = wavier/more
+   rete-ridge-like. 1.0 if there isn't enough EDJ to measure."""
+   arc = chord = 0.0
+   for run in edj_runs:
+       if len(run) < 2:
+           continue
+       poly = cv2.approxPolyDP(run.reshape(-1, 1, 2).astype(np.int32), EDJ_SMOOTH_EPS_PX, False)
+       poly = poly[:, 0, :].astype(np.float64)
+       arc += float(np.hypot(*np.diff(poly, axis=0).T).sum())
+       chord += float(np.hypot(*(run[-1] - run[0]).astype(np.float64)))
+   if arc < 50 or chord <= 0:
        return 1.0
-   pts = np.stack([xs, ys], axis=1).astype(np.float64)
-   _, _, vt = np.linalg.svd(pts - pts.mean(0), full_matrices=False)
-   along = (pts - pts.mean(0)) @ vt[0]
-   chord = along.max() - along.min()
-   return float(len(xs) / max(chord, 1.0))
+   return arc / chord
 
 
 
@@ -476,8 +506,8 @@ def _nearest_point_spans(vis: np.ndarray, src_mask: np.ndarray, dst_mask: np.nda
                          sc_mask: np.ndarray = None, n_spans: int = 50,
                          color=(0, 200, 0), max_color=None, line_px: int = 1) -> None:
    """Line from n_spans points evenly spaced along src_mask's x extent to
-   each point's nearest point on dst_mask - shared by the junction-to-GL-
-   bottom spans and the junction-to-SC-surface spans. Targets are spaced
+   each point's nearest point on dst_mask - shared by the SC-Epidermal_boundary-to-GL-
+   bottom spans and the SC-Epidermal_boundary-to-SC-surface spans. Targets are spaced
    evenly by x-position, then snapped to the closest actual src_mask pixel,
    so spans are evenly spaced regardless of how densely src_mask is sampled
    at each x. If sc_mask is given, spans that cross back through it (a sign
@@ -516,14 +546,14 @@ def _nearest_point_spans(vis: np.ndarray, src_mask: np.ndarray, dst_mask: np.nda
        cv2.line(vis, (x0, y0), (x1, y1), c, line_px, cv2.LINE_AA)
 
 
-def draw_junction_spans(vis: np.ndarray, sides: dict, sc_mask: np.ndarray = None, n_spans: int = 50,
-                        color=(0, 200, 0), max_color=(0, 0, 255), line_px: int = 1) -> None:
-   """Line from n_spans points evenly spaced along the SC/GL junction's x
+def draw_sc_epidermal_boundary_spans(vis: np.ndarray, sides: dict, sc_mask: np.ndarray = None, n_spans: int = 50,
+                                     color=(0, 200, 0), max_color=(0, 0, 255), line_px: int = 1) -> None:
+   """Line from n_spans points evenly spaced along the SC-Epidermal_boundary's x
    extent (white) to each point's nearest point on the GL bottom boundary
-   (dark red) - local junction-to-dermal spans; see _nearest_point_spans.
+   (dark red) - local SC-Epidermal_boundary-to-dermal spans; see _nearest_point_spans.
    The single longest surviving span is drawn in max_color instead of
    color."""
-   _nearest_point_spans(vis, sides["sc_junction"], sides["gl_bottom"], sc_mask, n_spans, color, max_color, line_px)
+   _nearest_point_spans(vis, sides["SC-Epidermal_boundary"], sides["gl_bottom"], sc_mask, n_spans, color, max_color, line_px)
 
 
 def draw_scale_bar(vis: np.ndarray, um_per_px: float, target_frac: float = 0.15) -> None:
@@ -572,7 +602,7 @@ def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
    line_px = max(2, min(6, round(min(vis.shape[:2]) / 1500)))
    if sides is not None:
        k = np.ones((line_px, line_px), np.uint8)
-       vis[cv2.dilate(_fit_rows(sides["sc_junction"], h_img).astype(np.uint8), k) > 0] = (255, 255, 255)
+       vis[cv2.dilate(_fit_rows(sides["gl_bottom"], h_img).astype(np.uint8), k) > 0] = EDJ_COLOR
    if spines is not None:
        # the medial-axis spines whose length is the mean-height denominator
        k = np.ones((line_px, line_px), np.uint8)
@@ -590,7 +620,7 @@ def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
    if gland_summary is not None:
        lines.append(f"Glands (green): {gland_summary[0]}  mean size {gland_summary[1]:.0f} {unit}^2")
    lines.append(f"EDJ tortuosity {gl_tortuosity:.2f}    "
-                f"\n white = EDJ junction \n red = SC spine \n magenta = Epidermal spine")
+                f"\n black = EDJ \n red = SC spine \n magenta = Epidermal spine")
    h, w = vis.shape[:2]
    font_scale = max(0.5, w / 1800)          # caption size tracks the image width
    font_th = max(1, round(font_scale * 1.5))
@@ -613,27 +643,30 @@ def draw_gl_midline_panel(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask:
    if xs.size >= 2:
        line_px = max(2, min(6, round(min(vis.shape[:2]) / 1500)))
        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2).astype(np.int32)
-       cv2.polylines(vis, [pts], isClosed=False, color=(255, 255, 255), thickness=line_px + 2, lineType=cv2.LINE_AA)
        cv2.polylines(vis, [pts], isClosed=False, color=(0, 0, 255), thickness=line_px, lineType=cv2.LINE_AA)
    return vis
 
 
 SPINE_COLORS = {"SC": (0, 0, 255), "Epidermal": (255, 0, 255)}  # BGR: red / magenta
+EDJ_COLOR = (0, 0, 0)
 
 
 def draw_spine_panel(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarray,
                      sc_stats: dict, gl_stats: dict, um_per_px: float,
-                     spines: dict = None, lengths_px: dict = None) -> np.ndarray:
+                     spines: dict = None, lengths_px: dict = None, edj: np.ndarray = None) -> np.ndarray:
    """SC/Epidermal overlay with each layer's ACTUAL medial-axis spine -
    the centerline mean_height is computed from (area / this length) - drawn
    in its own color, plus a label row with each spine's length/area/mean
    height. Distinct from draw_gl_midline_panel's per-column-centroid line,
    which is not what mean height uses.
    `spines`/`lengths_px` (from measure_layers) may be passed to reuse the
-   already-computed spines instead of recomputing them here."""
+   already-computed spines instead of recomputing them here.
+   `edj` (Epidermal dermal-side boundary mask), if given, is drawn in black."""
    vis = overlay(rotated_img, {"SC": sc_mask, "Epidermal": gl_mask})
    line_px = max(2, min(6, round(min(vis.shape[:2]) / 1500)))
    k = np.ones((line_px, line_px), np.uint8)
+   if edj is not None:
+       vis[cv2.dilate(edj.astype(np.uint8), k) > 0] = EDJ_COLOR
    lens = {}
    for name, mask in (("SC", sc_mask), ("Epidermal", gl_mask)):
        if spines is not None and name in spines:
@@ -651,7 +684,7 @@ def draw_spine_panel(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.n
 
    lines = [_fmt("SC", sc_stats), _fmt("Epidermal", gl_stats),
             "red = SC medial-axis spine, magenta = Epidermal medial-axis spine "
-            "(mean height = area / spine length)"]
+            "(mean height = area / spine length)" + (", black = EDJ" if edj is not None else "")]
    pad = 24 * len(lines) + 6
    h, w = vis.shape[:2]
    canvas = np.full((h + pad, w, 3), 255, np.uint8)
@@ -670,7 +703,8 @@ def draw_spine_panel(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.n
 
 def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarray, um_per_px: float,
                     date: str = "", spines: dict = None, lengths_px: dict = None,
-                    gland_mask: np.ndarray = None, panel_img: np.ndarray = None):
+                    gland_mask: np.ndarray = None, panel_img: np.ndarray = None,
+                    cut_mask: np.ndarray = None):
     """Runs all SC/Epidermal measurements + draws the Measurement panel.
     `date` is passed through verbatim into the row (e.g. the source image's
     last-modified date - callers decide what it means and how to format it).
@@ -682,9 +716,10 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     gland class) leaves both columns blank.
     `panel_img` (default rotated_img) is what the Measurement panel is drawn on;
     it may be taller than the masks (e.g. the uncropped frame) - they are zero-padded.
+    `cut_mask` marks artificial cuts (ROI/follicle/lateral trim) excluded from the EDJ.
     Returns (row_dict, measurement_panel_image, spine_cache) - row_dict has every
     CSV_COLUMNS key EXCEPT 'folder name'/'file name' (postprocess.py adds those);
-    spine_cache = {'spines': {...}, 'lengths_px': {...}} so a caller can draw the
+    spine_cache = {'spines': {...}, 'lengths_px': {...}, 'edj': mask} so a caller can draw the
     spine panel without recomputing the (expensive) skeleton/spine."""
     sc_bin, gl_bin = sc_mask.astype(bool), gl_mask.astype(bool)
     sc_prep = _prep_layer(sc_bin)   # (clean, dt, skel) - shared by layer_sides/layer_stats/spine
@@ -692,7 +727,7 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     sc_clean, sc_dt, sc_skel = sc_prep
     gl_clean, gl_dt, gl_skel = gl_prep
 
-    _, _, sides = layer_sides(sc_bin, gl_bin, sc_prep=sc_prep, gl_prep=gl_prep)
+    _, _, sides = layer_sides(sc_bin, gl_bin, sc_prep=sc_prep, gl_prep=gl_prep, cut_mask=cut_mask)
 
     if spines is not None:
         sc_spine, gl_spine = spines["SC"], spines["Epidermal"]
@@ -702,7 +737,7 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
         gl_spine, gl_len = _layer_spine(gl_clean, clean=gl_clean, dt=gl_dt, skel=gl_skel)
     sc_stats = layer_stats(sc_clean, um_per_px, centerline_px=sc_len)
     gl_stats = layer_stats(gl_clean, um_per_px, centerline_px=gl_len)
-    gl_tortuosity = epidermis_tortuosity(gl_bin, sc_bin)
+    gl_tortuosity = epidermis_tortuosity(sides["edj_runs"])
     sc_holes = class_hole_count(sc_bin)   # on the original masks: hole-filling must not hide defects
     gl_holes = class_hole_count(gl_bin)
     gland_summary = gland_stats(gland_mask, um_per_px) if gland_mask is not None else None
@@ -723,7 +758,8 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
         row["num_glands"] = gland_summary[0]
         row["total_sebocyte_um2"] = round(gland_summary[2], 2)
     spine_cache = {"spines": {"SC": sc_spine, "Epidermal": gl_spine},
-                   "lengths_px": {"SC": sc_len, "Epidermal": gl_len}}
+                   "lengths_px": {"SC": sc_len, "Epidermal": gl_len},
+                   "edj": sides["gl_bottom"]}
     return row, panel, spine_cache
 
 
