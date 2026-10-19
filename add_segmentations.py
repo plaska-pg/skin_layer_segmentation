@@ -15,9 +15,12 @@ same polygons in both label files.
 
 Mouse: left-click = add vertex | left-drag = trace freehand | click first vertex = close polygon
     right/middle-drag = pan | wheel = zoom at cursor | Pan toggle = left-drag to pan
+Edit mode (Edit button / e): left-drag a vertex of any SC / Epidermis / gland polygon to move it,
+    left-click an edge to insert a vertex, right-click / Delete / Backspace a vertex to remove it
+    (only the active class is editable while other outlines are hidden with h)
 Keys:  1 / 2 / 3 = SC / Epidermis / gland   Tab = next class
-       Enter = close polygon   Esc = cancel polygon (quit if none)   u / Ctrl+Z = undo
-    g = toggle Pan mode   x = delete active-class polygon under cursor
+       Enter = close polygon   Esc = cancel polygon / leave Edit mode (else quit)   u / Ctrl+Z = undo
+    g = toggle Pan mode   e = toggle Edit mode   x = delete active-class polygon under cursor
     h = hide/show other outlines   f = fit   + / - = zoom
        n / space / Right = next image   p / Left = previous image   s = save   q = save and quit
 """
@@ -42,10 +45,13 @@ LAYER_COLORS = [(255, 200, 0), (0, 200, 255), (200, 120, 255), (0, 128, 255)]
 WIN = "add_segmentations"
 HUD = 44
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-BUTTONS = [("Class", "class", 150), ("Pan", "pan", 90), ("< Prev", "prev", 90), ("Undo", "undo", 90), ("Next >", "next", 90)]
-KEY_LEFT, KEY_RIGHT, CTRL_Z, ENTER, TAB = 2424832, 2555904, 26, 13, 9  # cv2.waitKeyEx codes on Windows
+BUTTONS = [("Class", "class", 150), ("Pan", "pan", 90), ("Edit", "edit", 90), ("< Prev", "prev", 90),
+           ("Undo", "undo", 90), ("Next >", "next", 90)]
+KEY_LEFT, KEY_RIGHT, KEY_DEL, CTRL_Z, ENTER, TAB, BACKSPACE = 2424832, 2555904, 3014656, 26, 13, 9, 8  # cv2.waitKeyEx codes on Windows
 CLOSE_PX = 10  # display px from the first vertex within which a click/release closes the polygon
 TRACE_PX = 5  # display px between vertices added while left-dragging
+VERTEX_PX = 8  # display px within which a click grabs a vertex in Edit mode
+EDGE_PX = 6  # display px within which a click on an edge inserts a vertex in Edit mode
 
 
 def read_names(data_yaml: Path):
@@ -169,6 +175,8 @@ class Annotator:
         self.points, self.strokes, self.tracing = [], [], False
         self.pan = None
         self.pan_mode = False
+        self.edit_mode = False
+        self.drag = None  # (class id, polygon index, vertex index) being dragged in Edit mode
         self.mouse = (0, 0)
         self.dirty = True
         if args.start:
@@ -207,6 +215,7 @@ class Annotator:
         self.layers = [(line_class(l), parse_poly(l)) for l in self.other[self.entries[stem]["labels"][0]]]
         self.points, self.strokes, self.tracing = [], [], False
         self.pan = None
+        self.drag = None
         # pyramid so zoomed-out views don't resize the full-resolution image every frame
         self.pyr = [img]
         while max(self.pyr[-1].shape[:2]) > 1024:
@@ -257,14 +266,27 @@ class Annotator:
             pts = [self.to_disp(px, py) for px, py in self.points] + [self.mouse]
             cv2.polylines(canvas, [np.array(pts, np.int32)], False, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.circle(canvas, pts[0], CLOSE_PX, (0, 0, 255), 1, cv2.LINE_AA)
+        if self.edit_mode:
+            for cls, _, poly in self.editable():
+                for px, py in self.disp_poly(poly):
+                    if 0 <= px < self.W and HUD <= py < self.H:
+                        cv2.circle(canvas, (int(px), int(py)), 3, self.color(cls), -1, cv2.LINE_AA)
+            hit = self.drag or self.vertex_at(*self.mouse)
+            if hit:
+                cls, k, vi = hit
+                px, py = self.disp_poly(polys[cls][k])[vi]
+                cv2.circle(canvas, (int(px), int(py)), 6, (255, 255, 255), 2, cv2.LINE_AA)
 
         ix, iy = self.to_img(*self.mouse)
         cv2.rectangle(canvas, (0, 0), (self.W, HUD), (0, 0, 0), -1)
         drawing = f"   drawing: {len(self.points)} pts (Enter closes, Esc cancels)" if self.points else ""
         counts = "  ".join(f"{c}: {len(polys[self.ids[c]])}" for c in CLASSES)
         line1 = f"[{self.i + 1}/{len(self.stems)}] {self.stems[self.i]}   {counts}{drawing}"
-        line2 = (f"zoom {self.s:.3f}  x={int(ix)} y={int(iy)}  | 1/2/3/Tab class, click/drag outline, "
-                 "R/M-drag pan, g Pan mode, wheel zoom, x delete, h others, f fit")
+        if self.edit_mode:
+            hint = "EDIT: drag vertex, click edge = add, R-click/Del = remove, Esc exit"
+        else:
+            hint = "1/2/3 class, drag draw, R-drag pan, g pan, e edit, x del, h, f fit"
+        line2 = f"zoom {self.s:.2f} x={int(ix)} y={int(iy)} | {hint}"
         cv2.putText(canvas, line1, (8, 17), FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(canvas, line2, (8, 36), FONT, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
         for label, action, (bx, by, bw, bh) in self.buttons:
@@ -274,6 +296,9 @@ class Annotator:
             elif action == "pan":
                 label = "Pan ON" if self.pan_mode else "Pan"
                 bg = (130, 100, 40) if self.pan_mode else (90, 90, 90)
+            elif action == "edit":
+                label = "Edit ON" if self.edit_mode else "Edit"
+                bg = (40, 100, 130) if self.edit_mode else (90, 90, 90)
             else:
                 bg = (60, 140, 60) if action == "next" else (90, 90, 90)
             cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), bg, -1)
@@ -317,15 +342,79 @@ class Annotator:
             self.hist().append(("del", self.cur().pop(k), k, self.aid))
             self.changed.add(self.stems[self.i])
 
+    def editable(self):
+        """(class id, polygon index, polygon) of every polygon that Edit mode may change."""
+        polys = self.polys[self.stems[self.i]]
+        ids = list(polys) if self.show_layers else [self.aid]
+        return [(c, k, p) for c in ids for k, p in enumerate(polys[c])]
+
+    def vertex_at(self, x, y):
+        best, bd = None, VERTEX_PX
+        for c, k, p in self.editable():
+            d = np.hypot(*(self.disp_poly(p) - (x, y)).T)
+            vi = int(d.argmin())
+            if d[vi] <= bd:
+                best, bd = (c, k, vi), d[vi]
+        return best
+
+    def edge_at(self, x, y):
+        """(class id, polygon index, insert index) of the nearest edge, closing edge included."""
+        best, bd = None, EDGE_PX
+        q = np.array([x, y], np.float64)
+        for c, k, p in self.editable():
+            a = self.disp_poly(p).astype(np.float64)
+            ab = np.roll(a, -1, axis=0) - a
+            t = np.clip(((q - a) * ab).sum(1) / np.maximum((ab ** 2).sum(1), 1e-9), 0, 1)
+            d = np.hypot(*(a + t[:, None] * ab - q).T)
+            j = int(d.argmin())
+            if d[j] <= bd:
+                best, bd = (c, k, j + 1), d[j]
+        return best
+
+    def start_drag(self, x, y, ix, iy):
+        hit = self.vertex_at(x, y)
+        edge = None if hit else self.edge_at(x, y)
+        if not (hit or edge):
+            return
+        c, k, vi = hit or edge
+        lst = self.polys[self.stems[self.i]][c]
+        self.hist().append(("edit", lst[k].copy(), k, c))
+        if edge:
+            lst[k] = np.insert(lst[k], vi, (ix / self.iw, iy / self.ih), axis=0)
+        self.drag = (c, k, vi)
+        self.changed.add(self.stems[self.i])
+
+    def end_drag(self):
+        c, k, _ = self.drag
+        self.drag = None
+        # a click on a vertex without moving it leaves nothing to undo
+        if np.array_equal(self.hist()[-1][1], self.polys[self.stems[self.i]][c][k]):
+            self.hist().pop()
+
+    def delete_vertex(self, hit):
+        if not hit:
+            return
+        c, k, vi = hit
+        lst = self.polys[self.stems[self.i]][c]
+        if len(lst[k]) <= 3:
+            print("a polygon needs at least 3 vertices; use x to delete the whole polygon", flush=True)
+            return
+        self.hist().append(("edit", lst[k], k, c))
+        lst[k] = np.delete(lst[k], vi, axis=0)
+        self.changed.add(self.stems[self.i])
+
     def undo(self):
         if self.points:
             del self.points[self.strokes.pop():]
             return
+        self.drag = None
         if self.hist():
             op, g, k, cls_id = self.hist().pop()
             lst = self.polys[self.stems[self.i]][cls_id]
             if op == "add":
                 lst.pop(k)
+            elif op == "edit":
+                lst[k] = g
             else:
                 lst.insert(k, g)
         elif self.cur():
@@ -372,8 +461,14 @@ class Annotator:
             self.active = CLASSES[(CLASSES.index(self.active) + 1) % len(CLASSES)]
         elif action == "pan":
             self.pan_mode = not self.pan_mode
-            self.pan = None
+            self.edit_mode = False
+            self.pan = self.drag = None
             self.tracing = False
+        elif action == "edit":
+            self.edit_mode = not self.edit_mode
+            self.pan_mode = False
+            self.pan = self.drag = None
+            self.points, self.strokes, self.tracing = [], [], False
         self.dirty = True
 
     # ---------------------------------------------------------------- events
@@ -388,6 +483,8 @@ class Annotator:
             elif self.pan_mode:
                 self.pan = (cv2.EVENT_FLAG_LBUTTON, x, y)
                 self.tracing = False
+            elif self.edit_mode:
+                self.start_drag(x, y, ix, iy)
             elif self.near_first(x, y):
                 self.close_poly()
             else:
@@ -397,12 +494,17 @@ class Annotator:
         elif ev == cv2.EVENT_LBUTTONUP:
             if self.pan and self.pan[0] == cv2.EVENT_FLAG_LBUTTON:
                 self.pan = None
+            if self.drag:
+                self.end_drag()
             # a freehand stroke released near the first vertex closes the polygon
             if self.tracing and len(self.points) - self.strokes[-1] > 1 and self.near_first(x, y):
                 self.close_poly()
             self.tracing = False
         elif ev in (cv2.EVENT_RBUTTONDOWN, cv2.EVENT_MBUTTONDOWN):
-            if y >= HUD:
+            hit = self.vertex_at(x, y) if self.edit_mode and ev == cv2.EVENT_RBUTTONDOWN and y >= HUD else None
+            if hit:
+                self.delete_vertex(hit)
+            elif y >= HUD:
                 button = cv2.EVENT_FLAG_RBUTTON if ev == cv2.EVENT_RBUTTONDOWN else cv2.EVENT_FLAG_MBUTTON
                 self.pan = (button, x, y)
                 self.tracing = False
@@ -415,6 +517,12 @@ class Annotator:
                     self.pan = (button, x, y)
                 else:
                     self.pan = None
+            elif self.drag:
+                if flags & cv2.EVENT_FLAG_LBUTTON:
+                    c, k, vi = self.drag
+                    self.polys[self.stems[self.i]][c][k][vi] = (ix / self.iw, iy / self.ih)
+                else:
+                    self.end_drag()
             elif self.tracing and flags & cv2.EVENT_FLAG_LBUTTON:
                 lx, ly = self.to_disp(*self.points[-1])
                 if math.hypot(x - lx, y - ly) >= TRACE_PX:
@@ -444,6 +552,8 @@ class Annotator:
                 self.points, self.strokes, self.tracing = [], [], False
             elif k == ENTER and self.points:
                 self.close_poly()
+            elif k == 27 and self.edit_mode:
+                self.act("edit")
             elif k in (ord("q"), 27):
                 break
             elif k in (ord("n"), 32, KEY_RIGHT):
@@ -458,6 +568,10 @@ class Annotator:
                 self.act("class")
             elif k == ord("g"):
                 self.act("pan")
+            elif k == ord("e"):
+                self.act("edit")
+            elif k in (KEY_DEL, BACKSPACE) and self.edit_mode:
+                self.delete_vertex(self.vertex_at(*self.mouse))
             elif k == ord("x"):
                 self.delete_under_cursor()
             elif k == ord("f"):

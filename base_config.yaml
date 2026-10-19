@@ -4,7 +4,7 @@
 # --arg overrides passed on the predict.py command line.
 
 predict:
-  weights: runs/semseg/dataset_3cls_gland_v2/best.pt
+  weights: models/3cls_best.pt
   source: inference_images
   device: auto
   um_per_px: 0.2577          # native um/px of --source images (0 disables rescaling) (10x) (0.2577um/px = 40x)
