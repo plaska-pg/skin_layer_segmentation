@@ -35,10 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "pretrained_model"))
 from train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
 
 from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
-from postprocess import (BOTTOM_CROP_FRAC, CLOSE_RADII_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
-                         FOLLICLE_WEIGHTS,
-                         LATERAL_CLIP_FRAC, MIN_TOUCH_FRAC, SC_SMOOTH_RADIUS_UM,
-                         TOUCH_MARGIN_UM, overlay, process_image, write_yolo_labels)  # noqa: E402
+from postprocess import (EPIDERMAL_ERODE_DILATE_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
+                         FOLLICLE_WEIGHTS, LATERAL_CLIP_FRAC, ROI_CONF, ROI_ENABLED, ROI_WEIGHTS,
+                         SC_ERODE_DILATE_UM, overlay, process_image, write_yolo_labels)  # noqa: E402
 from measurement import CSV_COLUMNS, _rasterise  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs"}  # .svs (Aperio) is TIFF-based - cv2 reads its
@@ -74,16 +73,16 @@ def write_run_config(path: Path, args, src: Path, out: Path, device, names, file
             "csv_output": str((Path(args.csv_out) if args.csv_out else out / "_results.csv").resolve()),
             "reference_um_per_px": args.reference_um_per_px,
             "postprocess": not args.no_postprocess,
-            "close_radii_um": list(CLOSE_RADII_UM),
-            "touch_margin_um": TOUCH_MARGIN_UM,
-            "min_touch_frac": MIN_TOUCH_FRAC,
-            "sc_smooth_radius_um": SC_SMOOTH_RADIUS_UM,
+            "sc_erod_dil_kernel_size_um": SC_ERODE_DILATE_UM,
+            "epidermal_erod_dil_kernel_size_um": EPIDERMAL_ERODE_DILATE_UM,
             "lateral_clip_frac": LATERAL_CLIP_FRAC,
-            "bottom_crop_frac": BOTTOM_CROP_FRAC,
             "follicle_enabled": FOLLICLE_ENABLED,
             "follicle_weights": str(Path(FOLLICLE_WEIGHTS).resolve()),
             "follicle_conf": FOLLICLE_CONF,
             "follicle_mask_frac": FOLLICLE_MASK_FRAC,
+            "roi_enabled": ROI_ENABLED,
+            "roi_weights": str(Path(ROI_WEIGHTS).resolve()),
+            "roi_conf": ROI_CONF,
             "input_files": [
                 {
                     "file": p.name,
@@ -241,12 +240,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     if not args.no_postprocess:
         print("postprocess hyperparameters: "
-              f"close_radii_um={CLOSE_RADII_UM}; "
-              f"touch_margin_um={TOUCH_MARGIN_UM}; "
-              f"min_touch_frac={MIN_TOUCH_FRAC}; "
-              f"sc_smooth_radius_um={SC_SMOOTH_RADIUS_UM}; "
-              f"lateral_clip_frac={LATERAL_CLIP_FRAC}; "
-              f"bottom_crop_frac={BOTTOM_CROP_FRAC}", flush=True)
+              f"roi_enabled={ROI_ENABLED}; roi_conf={ROI_CONF}; "
+              f"follicle_enabled={FOLLICLE_ENABLED}; follicle_mask_frac={FOLLICLE_MASK_FRAC}; "
+              f"sc_erod_dil_kernel_size_um={SC_ERODE_DILATE_UM}; "
+              f"epidermal_erod_dil_kernel_size_um={EPIDERMAL_ERODE_DILATE_UM}; "
+              f"lateral_clip_frac={LATERAL_CLIP_FRAC}", flush=True)
     labels_dir = out / "raw_segmentations"
     post_labels_dir = out / "postprocessed_segmentations"
     if not args.no_labels:

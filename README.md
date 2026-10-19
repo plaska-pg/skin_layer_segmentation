@@ -88,8 +88,21 @@ python rotate.py predict --weights runs/rotation/rotate_model.pt --source diffic
 
 ### Follicle detection model:
 YOLO11n-OBB, copied from pretrained_model\runs\follicle_det\rot1-2\weights\best.pt to models\follicle_det.pt.
-In postprocess.py it runs on the full rotated image (before the bottom crop) and adds a "Follicles (N)" panel
+In postprocess.py it runs on the rotated image and adds a "Follicles (N)" panel
 to the steps image. Configure via the `follicle_*` keys in base_config.yaml (`follicle_enabled: false` to turn off).
+
+### ROI detection model:
+YOLO11n-OBB (class `roi`), copied from pretrained_model\runs\roi_det\train\weights\best.pt to models\roi_det.pt.
+Runs on the rotated image and adds a "ROI Boxes (N)" panel to the steps image. Configure via the `roi_*` keys
+in base_config.yaml; if no ROI is detected (or `roi_enabled: false`) the full frame is used.
+
+### Postprocessing order (postprocess.py)
+1. Rotate
+2. Detect follicles
+3. Detect ROI boxes
+4. Remove SC/Epidermis outside the union of ROI boxes and inside the bottom `follicle_mask_frac` of each follicle box
+5. Per-class elliptical opening then closing (`sc_erod_dil_kernel_size_um`, `epidermal_erod_dil_kernel_size_um`)
+6. Trim `lateral_clip_frac` per side, then measure
 
 # to do
  make better at different image sizes and resolutions
@@ -100,25 +113,4 @@ folders to do:
 
 improve follicle detection 
 
-maybe make model to identify ROI instead of postprocessing
-
-After segmentation and rotation,
-- In postprocessing, 
-1. identify the bottom 80% of follicle bounding box area (make the percent a config param)
-2. remove all SC and Epidermis segmentation pixels that are within the bottom 80% of the follicle bounding box
-3. Continue with measurment
-
-simplify erosion and dilaton for all the classes 
-
 Validate epidermal thickness on "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\Results-Learnings\Makio Analysis\AntiAging\MDE credentialling\Histology\Epi_Thickness_CA_face.csv"
-
-
-instead of close_radii_um to identify region of interest, I want to use roi_det model. (pretrained_model\runs\roi_det\train\weights\best.pt)
-So postprocessing would look like this:
- 1. Rotate
- 2. detect follicles (shows follicles as step in the _steps image)
- 3. detect roi  (shows roi bounding boxes as step in the _steps image)
- 4. remove all SC and Epidermis segmentations that are outside of the ROI bounding box. In this step the SC and Epidermis segmentations overlapping with the follicle 80% are also removed
- 4. grouping (Erosion and dilation of the SC and Epidermis masks - actually adjusts the segmentations, there should be config params SC_erod_dil_kernel_size, Epidermal_erod_dil_kernel_size.  use kernel shape MORPH_ELLIPSE)
- 5. proceed with measurement
-  
