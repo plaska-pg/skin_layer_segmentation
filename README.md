@@ -48,14 +48,14 @@ python add_segmentations.py --dataset "dataset_for_finetuning"
 
 ```
 .\.venv\Scripts\python.exe -u pretrained_model\3cls_hist_seg\train_semseg.py train `
->>   --data dataset_for_finetuning `
->>   --init-weights pretrained_model\3cls_hist_seg\best.pt `
->>   --pretrained-classes "SC,Epidermis,glands" `
->>   --encoder resnet34 --epochs 200 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
->>   --class-weights "SC=3" --oversample "gland=1.5" `
->>   --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
->>   --val-every 5 --patience 15 --workers 0 --device auto `
->>   --project runs\semseg --name dataset_3cls_gland_v2
+   --data dataset_for_finetuning `
+  --init-weights pretrained_model\3cls_hist_seg\best.pt `
+  --pretrained-classes "SC,Epidermis,glands" `
+  --encoder resnet34 --epochs 200 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
+  --class-weights "SC=3" --oversample "gland=1.5" `
+   --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
+   --val-every 5 --patience 15 --workers 0 --device auto `
+  --project runs\semseg --name dataset_3cls_gland_v3
 ```
 
 
@@ -101,16 +101,16 @@ in base_config.yaml; if no ROI is detected (or `roi_enabled: false`) the full fr
 2. Detect follicles
 3. Detect ROI boxes
 4. Remove SC/Epidermis outside the union of ROI boxes and inside the bottom `follicle_mask_frac` of each follicle box
-5. Per-class elliptical opening then closing (`sc_erod_dil_kernel_size_um`, `epidermal_erod_dil_kernel_size_um`)
+5. Per-class elliptical opening then closing (`sc_erod_dil_kernel_size_um`, `epidermal_erod_dil_kernel_size_um`, `gland_erod_dil_kernel_size_um`)
 6. Trim `lateral_clip_frac` per side, then measure
 
 # to do
  make better at different image sizes and resolutions
 
-folders to do: 
-  S_EX_NOV_24_D2_H_E (log entry) and S_Exp 6.24 D5
-
-
-improve follicle detection 
-
 Validate epidermal thickness on "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\Results-Learnings\Makio Analysis\AntiAging\MDE credentialling\Histology\Epi_Thickness_CA_face.csv"
+
+
+
+ python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF" --limit 5
+
+  python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "C:\Users\plas.ka\skin_layer_segmentation\difficult_test_images" --limit 3

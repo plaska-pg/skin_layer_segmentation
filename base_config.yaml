@@ -17,7 +17,8 @@ postprocess:
   # 0.645 um/px), so a fixed px count means a different physical distance on
   # different scans.
   sc_erod_dil_kernel_size_um: 5          # elliptical kernel diameter for SC opening then closing (0 disables)
-  epidermal_erod_dil_kernel_size_um: 10  # same for Epidermis
+  epidermal_erod_dil_kernel_size_um: 15  # same for Epidermis
+  gland_erod_dil_kernel_size_um: 10      # same for gland (0 disables)
   lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
   rotation_weights: models/rotate_model.pt   # trained orientation classifier (see rotate.py)
   rotation_device: auto
@@ -25,7 +26,8 @@ postprocess:
   follicle_weights: models/follicle_det.pt   # see pretrained_model/train_follicle_det.py
   follicle_device: auto
   follicle_conf: 0.1 # confidence threshold for follicle detection
-  follicle_mask_frac: 0.8   # SC/Epidermis pixels in the bottom fraction of each follicle box (cut parallel to its top edge) are removed before measurement (0 disables)
+  follicle_padding_um: 20    # expand each side of the oriented follicle box by this many um before masking (0 disables)
+  follicle_mask_frac: 1.0   #bottom fraction of each follicle box (cut parallel to its top edge) are removed from SC and Epidermis before measurement (0 disables)
   follicle_max_side: 1024   # long side the image is downscaled to before detection; must match training
   follicle_imgsz: 1024
   roi_enabled: true                     # YOLO-OBB ROI detector; SC/Epidermis outside the union of its boxes is removed (full frame if none detected)
@@ -37,8 +39,10 @@ postprocess:
 
 measurement:
   skeleton_method: lee   # 'zhang' (skimage's 2D default) or 'lee'
-  hole_area_px: 64        # small holes filled before skeletonizing, so the skeleton graph is a tree
+  hole_area_px: 64        # small holes filled before skeletonizing
   sc_surface_gl_margin_frac: 0.5   # excludes SC boundary within this fraction of SC's typical thickness from GL
   sc_surface_gl_margin_min_px: 3   # margin floor, so a paper-thin SC still gets some separation from GL
   sc_surface_gl_margin_max_px: 30  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
+  edj_cut_margin_px: 3    # EDJ points within this distance of an artificial cut (lateral trim, ROI, follicle mask) are dropped
+  edj_smooth_eps_px: 1.0  # approxPolyDP tolerance removing pixel staircase before measuring EDJ length
   tissue_saturation_threshold: 20  # HSV saturation (0-255) above which a pixel counts as tissue for total_tissue_um2 (blank slide ~8)
