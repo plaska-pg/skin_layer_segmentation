@@ -1,5 +1,5 @@
  # Skin layer segmentation and quantification
- Measures the Epidermis and Stratum Corneum layers on H&E skin images.
+ Measures the Epidermis, Stratum Corneum layers, and Glands on H&E skin images.
 
 Train (on PMC data), finetune on (P&G data), pseudolabeling (on generated segmented P&G data) and run inference on H&E stained skin 
 
@@ -10,13 +10,15 @@ Run the app interface
 streamlit run interface/app.py
 ```
 
-## Download the repo from github (https://github.com/plaska-pg/skin_layer_segmentation)
+## For pipeline Dev
+
+### Download the repo from github (https://github.com/plaska-pg/skin_layer_segmentation)
 
 ```powershell
 git clone https://github.com/plaska-pg/skin_layer_segmentation.git "$HOME\skin_layer_segmentation"
 cd "$HOME\skin_layer_segmentation"
 ```
-## Environment setup
+### Environment setup
 
 Install python3.14. You can do this by typing python in the powershell terminal (if on windows). This'll pull up an install window. The commands above clone the repo into your home folder (for example, `C:\Users\plas.ka\skin_layer_segmentation` on this computer), keeping the virtual environment off OneDrive.
 
@@ -30,97 +32,93 @@ pip install -r requirements.txt
 
 
 
-## Train a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
+### Pre-train a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
 How to train:
-Download the data, convert to yolo format, and run UNET model to segment just the "Keratin" and "Epidermis" classes. Keratin is equivalent to "SC layer" and Epidermis is equivalnt to "Granular Layer" in finetuning but then back to Epidermis. I want to make this consistent throughout the pipeline later.
+Download the data, convert to yolo format, and run UNET model to segment the "Keratin", "Epidermis", and "gland" classes. 
+OG dataset was 0.28um/px (20x), but published at 0.7 um/px (8x) So the pretrained model was trained at 0.7um/px
+pretrained 3 class model: C:\Users\plas.ka\skin_layer_segmentation\pretrained_model\3cls_hist_seg 
 
-Note the model was trained on 0.28um/px
+### Add or adjust P&G segmentations (pre-finetuning)
+
+```
+python add_segmentations.py --dataset "dataset_for_finetuning"
+```
+
+### then finetune on our segmented images in dataset_for_finetuning
+
+```
+.\.venv\Scripts\python.exe -u pretrained_model\3cls_hist_seg\train_semseg.py train `
+>>   --data dataset_for_finetuning `
+>>   --init-weights pretrained_model\3cls_hist_seg\best.pt `
+>>   --pretrained-classes "SC,Epidermis,glands" `
+>>   --encoder resnet34 --epochs 200 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
+>>   --class-weights "SC=3" --oversample "gland=1.5" `
+>>   --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
+>>   --val-every 5 --patience 15 --workers 0 --device auto `
+>>   --project runs\semseg --name dataset_3cls_gland_v2
+```
 
 
-## Pretrained a skin segmentation model using this data: https://pmc.ncbi.nlm.nih.gov/articles/PMC11803237/
-data and model saved here: pretrained_model and also I copied the one being used to models/best.pt
-training resolution was 0.645 µm/px
-
-## then finetuned on our segmented images in dataset_for_finetuning
-
-## then pseudolabeling on nicely segmented images
+### then pseudolabeling on nicely segmented images
   use .txt segmentation cooredinates in the labels folder (corresponding to an image with the same prefix) 
 
-## then for interence on data in yolo_skin_seg\inference_images
+### then for interence on data in yolo_skin_seg\inference_images
 
 python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX 8_24 TIFF_H_E"
 
 python predict.py --source "runs\predict_sample_src" --limit 5
 
-python predict.py --source "difficult_test_images" --limit 3
+python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "difficult_test_images" --limit 2
 
-## to do:>
-
-python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_Exp_SEP_2024_D3_H_E"
-
-python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_Exp 6.24 D5"
-
-
-## to check on process status:
-
-Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'predict\.py' } | Select-Object ProcessId, CommandLine
-
-## to know:
+### to know:
 
 BX61 10X → 0.645 µm/px
 Motic 40X scan → 0.260 µm/px
 
-## commands
 
-to kill:
-Stop-Process -Id 8092
+## Other Models
 
-to check on processes:
-Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'predict\.py' } | Select-Object ProcessId, CommandLine
-
-to run:
-.\run_predict_background.ps1
-
-
-## rotation model: 
+### Rotation model: 
+Rotates the image so that the SC and Epidermis layers are at the top. 
 ------------- train:--------------
 python rotate.py train --dataset dataset_rotate --output runs/rotation/rotate_model.pt --pretrained --device cuda --epochs 50 --samples-per-image 4 --batch-size 4
 ----------- inference:---------------
 python rotate.py predict --weights runs/rotation/rotate_model.pt --source difficult_test_images --out runs/rotation/difficult_test_predictions --device cuda
 
-## examples where segmentation/postprocessing is not good
-"C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S-EX_SEP_2024_D2_H_E_predicted\S_EX_9_24_D2_L1C4_steps.jpg"
 
-"C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S-EX_SEP_2024_D2_H_E_predicted\S_EX_9_24_D2_L1C4_steps.jpg"
-
-"C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S-EX_SEP_2024_D2_H_E_predicted\S_EX_9_24_D2_L4C4_steps.jpg"
-
-
-"C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S-EX_SEP_2024_D2_H_E_predicted\S_EX_9_24_D2_L3C1_steps.jpg"
-
-
-try 25.8 morphological closing
-
-
-$one = "$env:TEMP\yolo_one_image"
-New-Item -ItemType Directory -Force $one
-
-$input = Get-ChildItem `
-  "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S-EX_SEP_2024_D2_H_E" `
-  -File |
-  Where-Object { $_.BaseName -eq "S_EX_9_24_D2_L1C4" } |
-  Select-Object -First 1
-
-Copy-Item $input.FullName $one
-
-python predict.py `
-  --source $one `
-  --out "C:\Users\plas.ka\Desktop\one_prediction"
-
+### Follicle detection model:
+YOLO11n-OBB, copied from pretrained_model\runs\follicle_det\rot1-2\weights\best.pt to models\follicle_det.pt.
+In postprocess.py it runs on the full rotated image (before the bottom crop) and adds a "Follicles (N)" panel
+to the steps image. Configure via the `follicle_*` keys in base_config.yaml (`follicle_enabled: false` to turn off).
 
 # to do
- try follicle detection model 
  make better at different image sizes and resolutions
 
 folders to do: 
   S_EX_NOV_24_D2_H_E (log entry) and S_Exp 6.24 D5
+
+
+improve follicle detection 
+
+maybe make model to identify ROI instead of postprocessing
+
+After segmentation and rotation,
+- In postprocessing, 
+1. identify the bottom 80% of follicle bounding box area (make the percent a config param)
+2. remove all SC and Epidermis segmentation pixels that are within the bottom 80% of the follicle bounding box
+3. Continue with measurment
+
+simplify erosion and dilaton for all the classes 
+
+Validate epidermal thickness on "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\Results-Learnings\Makio Analysis\AntiAging\MDE credentialling\Histology\Epi_Thickness_CA_face.csv"
+
+
+instead of close_radii_um to identify region of interest, I want to use roi_det model. (pretrained_model\runs\roi_det\train\weights\best.pt)
+So postprocessing would look like this:
+ 1. Rotate
+ 2. detect follicles (shows follicles as step in the _steps image)
+ 3. detect roi  (shows roi bounding boxes as step in the _steps image)
+ 4. remove all SC and Epidermis segmentations that are outside of the ROI bounding box. In this step the SC and Epidermis segmentations overlapping with the follicle 80% are also removed
+ 4. grouping (Erosion and dilation of the SC and Epidermis masks - actually adjusts the segmentations, there should be config params SC_erod_dil_kernel_size, Epidermal_erod_dil_kernel_size.  use kernel shape MORPH_ELLIPSE)
+ 5. proceed with measurement
+  

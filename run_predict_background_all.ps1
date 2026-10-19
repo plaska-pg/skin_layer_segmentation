@@ -49,7 +49,7 @@ $Wrapper = Join-Path $LogDir "_run_all_$Timestamp.generated.cmd"
 $Commands = foreach ($SourceDir in $SourceDirs) {
   $Source = $SourceDir.FullName
   # NOTE: never delete the existing "<folder>\predicted_<folder>" output here - --resume below relies on its
-  # saved labels/steps.jpg/results.csv to skip images already done (e.g. after a crash mid-batch).
+  # saved raw_segmentations/steps.jpg/_results.csv to skip images already done (e.g. after a crash mid-batch).
   @"
 echo.>> "$Log"
 echo ===== %date% %time% - $Source ===== >> "$Log"

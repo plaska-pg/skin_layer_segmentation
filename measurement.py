@@ -46,7 +46,7 @@ from skimage.morphology import remove_small_holes, skeletonize
 
 from config import CONFIG
 
-CLASS_COLORS = {"SC": (58, 161, 232), "Epidermal": (192, 168, 31)}  # BGR
+CLASS_COLORS = {"SC": (58, 161, 232), "Epidermal": (192, 168, 31), "gland": (60, 200, 60)}  # BGR
 
 # values come from base_config.yaml's measurement section (fallback = previous hardcoded defaults)
 _MEAS_CFG = CONFIG.get("measurement", {})
@@ -55,6 +55,7 @@ HOLE_AREA_PX = _MEAS_CFG.get("hole_area_px", 64)  # small holes filled before sk
 SC_SURFACE_GL_MARGIN_FRAC = _MEAS_CFG.get("sc_surface_gl_margin_frac", 0.5)  # excludes SC boundary within this fraction of SC's typical thickness from GL
 SC_SURFACE_GL_MARGIN_MIN_PX = _MEAS_CFG.get("sc_surface_gl_margin_min_px", 3)  # margin floor, so a paper-thin SC still gets some separation from GL
 SC_SURFACE_GL_MARGIN_MAX_PX = _MEAS_CFG.get("sc_surface_gl_margin_max_px", 30)  # margin cap, so an unusually thick SC doesn't over-exclude its outer boundary
+TISSUE_SAT_THRESHOLD = _MEAS_CFG.get("tissue_saturation_threshold", 20)  # HSV saturation (0-255) above which a pixel counts as tissue
 
 
 def _distance_transform(mask: np.ndarray) -> np.ndarray:
@@ -79,6 +80,7 @@ CSV_COLUMNS = [
    "Epidermal mean height", "Epidermal area",
    "EDJ tortuosity",
     "SC_hole_num", "Epidermal_hole_num",
+    "num_glands", "total_sebocyte_um2", "total_tissue_um2",
 ]
 
 
@@ -367,7 +369,7 @@ def layer_stats(layer: np.ndarray, um_per_px: float, centerline_px: float = None
    return {"mean_height": mean_height, "area": area}
 
 
-def granular_layer_midline(gl_mask: np.ndarray):
+def epidermis_midline(gl_mask: np.ndarray):
    """Per-column centroid (mean row) of the Epidermal mask - one point
    per column that contains any GL pixel, ordered left to right. A simple
    horizontal-ish midline through the layer, distinct from the medial-axis
@@ -392,7 +394,7 @@ def granular_layer_midline(gl_mask: np.ndarray):
 
 
 
-def granular_layer_tortuosity(gl_mask: np.ndarray, sc_mask: np.ndarray) -> float:
+def epidermis_tortuosity(gl_mask: np.ndarray, sc_mask: np.ndarray) -> float:
    """Arc length / chord length of Epidermal's boundary, EXCLUDING the
    side touching SC (the far/dermal side) - 1.0 = flat, higher = wavier/more
    rete-ridge-like. 1.0 if there isn't enough far-side boundary to measure."""
@@ -426,6 +428,19 @@ def class_hole_count(mask: np.ndarray) -> int:
    m = mask.astype(bool)
    holes = binary_fill_holes(m) & ~m
    return int(label(holes, connectivity=1).max())
+
+
+def gland_stats(gland_mask: np.ndarray, um_per_px: float):
+    """(number of glands, mean gland area, total gland area) in um^2."""
+    n = int(label(gland_mask.astype(bool), connectivity=2).max())
+    area = float(gland_mask.astype(bool).sum()) * um_per_px ** 2
+    return n, (area / n if n else 0.0), area
+
+
+def tissue_area_um2(img_bgr: np.ndarray, um_per_px: float, sat_threshold: float = TISSUE_SAT_THRESHOLD) -> float:
+    """Total stained-tissue area (um^2): blank slide is near-unsaturated, H&E tissue is not."""
+    sat = cv2.medianBlur(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)[..., 1], 7)
+    return float((sat > sat_threshold).sum()) * um_per_px ** 2
 
 
 
@@ -534,24 +549,36 @@ def draw_scale_bar(vis: np.ndarray, um_per_px: float, target_frac: float = 0.15)
                 font_scale, (0, 0, 0), font_th, cv2.LINE_AA)
 
 
+def _fit_rows(mask: np.ndarray, h: int) -> np.ndarray:
+   """Zero-pad (or crop) mask to h rows so a mask from a bottom-cropped frame overlays the full frame."""
+   if mask.shape[0] >= h:
+       return mask[:h]
+   return np.pad(mask, ((0, h - mask.shape[0]), (0, 0)))
+
+
 def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
                            gl_tortuosity, sc_holes, gl_holes, um_per_px: float, sides=None,
-                           spines: dict = None) -> np.ndarray:
-   vis = overlay(rotated_img, {"SC": sc_mask, "Epidermal": gl_mask})
-   for name, m in (("SC", sc_mask), ("Epidermal", gl_mask)):
+                           spines: dict = None, gland_mask: np.ndarray = None,
+                           gland_summary: tuple = None) -> np.ndarray:
+   h_img = rotated_img.shape[0]
+   masks = {"SC": _fit_rows(sc_mask, h_img), "Epidermal": _fit_rows(gl_mask, h_img)}
+   if gland_mask is not None:
+       masks["gland"] = _fit_rows(gland_mask.astype(bool), h_img)
+   vis = overlay(rotated_img, masks)
+   for name, m in masks.items():
        cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
        cv2.drawContours(vis, cnts, -1, (20, 20, 20), 4, cv2.LINE_AA)
        cv2.drawContours(vis, cnts, -1, CLASS_COLORS[name], 2, cv2.LINE_AA)
    line_px = max(2, min(6, round(min(vis.shape[:2]) / 1500)))
    if sides is not None:
        k = np.ones((line_px, line_px), np.uint8)
-       vis[cv2.dilate(sides["sc_junction"].astype(np.uint8), k) > 0] = (255, 255, 255)
+       vis[cv2.dilate(_fit_rows(sides["sc_junction"], h_img).astype(np.uint8), k) > 0] = (255, 255, 255)
    if spines is not None:
        # the medial-axis spines whose length is the mean-height denominator
        k = np.ones((line_px, line_px), np.uint8)
        for name in ("SC", "Epidermal"):
            if name in spines:
-               vis[cv2.dilate(spines[name].astype(np.uint8), k) > 0] = SPINE_COLORS[name]
+               vis[cv2.dilate(_fit_rows(spines[name], h_img).astype(np.uint8), k) > 0] = SPINE_COLORS[name]
    unit = "um" if um_per_px != 1.0 else "px"
    if unit == "um":
        draw_scale_bar(vis, um_per_px)
@@ -559,9 +586,11 @@ def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
    def _fmt(name, stats, holes):
        return f"{name}: mean height {stats['mean_height']:.1f} {unit}  area {stats['area']:.0f} {unit}  holes {holes}"
 
-   lines = [_fmt("SC", sc_stats, sc_holes), _fmt("Epidermal", gl_stats, gl_holes),
-            f"EDJ tortuosity {gl_tortuosity:.2f}    "
-            f"\n white = EDJ junction \n red = SC spine \n magenta = Epidermal spine"]
+   lines = [_fmt("SC", sc_stats, sc_holes), _fmt("Epidermal", gl_stats, gl_holes)]
+   if gland_summary is not None:
+       lines.append(f"Glands (green): {gland_summary[0]}  mean size {gland_summary[1]:.0f} {unit}^2")
+   lines.append(f"EDJ tortuosity {gl_tortuosity:.2f}    "
+                f"\n white = EDJ junction \n red = SC spine \n magenta = Epidermal spine")
    h, w = vis.shape[:2]
    font_scale = max(0.5, w / 1800)          # caption size tracks the image width
    font_th = max(1, round(font_scale * 1.5))
@@ -578,9 +607,9 @@ def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
 
 def draw_gl_midline_panel(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarray) -> np.ndarray:
    """SC/Epidermal overlay with the Epidermal's per-column-centroid
-   midline (see granular_layer_midline) drawn over it, as its own panel."""
+   midline (see epidermis_midline) drawn over it, as its own panel."""
    vis = overlay(rotated_img, {"SC": sc_mask, "Epidermal": gl_mask})
-   xs, ys = granular_layer_midline(gl_mask)
+   xs, ys = epidermis_midline(gl_mask)
    if xs.size >= 2:
        line_px = max(2, min(6, round(min(vis.shape[:2]) / 1500)))
        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2).astype(np.int32)
@@ -640,7 +669,8 @@ def draw_spine_panel(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.n
 
 
 def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarray, um_per_px: float,
-                    date: str = "", spines: dict = None, lengths_px: dict = None):
+                    date: str = "", spines: dict = None, lengths_px: dict = None,
+                    gland_mask: np.ndarray = None, panel_img: np.ndarray = None):
     """Runs all SC/Epidermal measurements + draws the Measurement panel.
     `date` is passed through verbatim into the row (e.g. the source image's
     last-modified date - callers decide what it means and how to format it).
@@ -648,6 +678,10 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     medial-axis spine masks + their lengths instead of computing them from
     sc_mask/gl_mask - lets a caller build the spine from the un-clipped mask
     first and pass in the clip-restricted result (see postprocess.py).
+    `gland_mask` feeds num_glands / total_sebocyte_um2; None (model without a
+    gland class) leaves both columns blank.
+    `panel_img` (default rotated_img) is what the Measurement panel is drawn on;
+    it may be taller than the masks (e.g. the uncropped frame) - they are zero-padded.
     Returns (row_dict, measurement_panel_image, spine_cache) - row_dict has every
     CSV_COLUMNS key EXCEPT 'folder name'/'file name' (postprocess.py adds those);
     spine_cache = {'spines': {...}, 'lengths_px': {...}} so a caller can draw the
@@ -668,13 +702,15 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
         gl_spine, gl_len = _layer_spine(gl_clean, clean=gl_clean, dt=gl_dt, skel=gl_skel)
     sc_stats = layer_stats(sc_clean, um_per_px, centerline_px=sc_len)
     gl_stats = layer_stats(gl_clean, um_per_px, centerline_px=gl_len)
-    gl_tortuosity = granular_layer_tortuosity(gl_bin, sc_bin)
+    gl_tortuosity = epidermis_tortuosity(gl_bin, sc_bin)
     sc_holes = class_hole_count(sc_bin)   # on the original masks: hole-filling must not hide defects
     gl_holes = class_hole_count(gl_bin)
+    gland_summary = gland_stats(gland_mask, um_per_px) if gland_mask is not None else None
 
-    panel = draw_measurement_panel(rotated_img, sc_clean, gl_clean, sc_stats, gl_stats,
-                                   gl_tortuosity, sc_holes, gl_holes, um_per_px, sides,
-                                   spines={"SC": sc_spine, "Epidermal": gl_spine})
+    panel = draw_measurement_panel(rotated_img if panel_img is None else panel_img, sc_clean, gl_clean,
+                                   sc_stats, gl_stats, gl_tortuosity, sc_holes, gl_holes, um_per_px, sides,
+                                   spines={"SC": sc_spine, "Epidermal": gl_spine},
+                                   gland_mask=gland_mask, gland_summary=gland_summary)
 
     row = {"date": date}
     for prefix, stats in (("SC", sc_stats), ("Epidermal", gl_stats)):
@@ -683,6 +719,9 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     row["EDJ tortuosity"] = round(gl_tortuosity, 2)
     row["SC_hole_num"] = sc_holes
     row["Epidermal_hole_num"] = gl_holes
+    if gland_summary is not None:
+        row["num_glands"] = gland_summary[0]
+        row["total_sebocyte_um2"] = round(gland_summary[2], 2)
     spine_cache = {"spines": {"SC": sc_spine, "Epidermal": gl_spine},
                    "lengths_px": {"SC": sc_len, "Epidermal": gl_len}}
     return row, panel, spine_cache
@@ -694,7 +733,9 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
 
 
 _NAME_ALIASES = {"SC": "SC", "keratin": "SC",
-                "Epidermal": "Epidermal", "Granular_Layer": "Epidermal", "epidermis": "Epidermal"}
+                "Epidermal": "Epidermal", "Epidermis": "Epidermal", "epidermis": "Epidermal",
+                "Granular_Layer": "Epidermal", "Granular Layer": "Epidermal",
+                "gland": "gland", "glands": "gland"}
 
 
 
@@ -722,7 +763,7 @@ def _file_date(path) -> str:
 
 
 def _iter_inputs(args):
-   """Yield (folder_name, file_name, image_bgr, sc_mask, gl_mask, date_str)."""
+   """Yield (folder_name, file_name, image_bgr, sc_mask, gl_mask, gland_mask or None, date_str)."""
    from pathlib import Path
    import yaml
    if args.data:
@@ -737,7 +778,8 @@ def _iter_inputs(args):
                if img is None:
                    continue
                m = _rasterise(data / "labels" / split / (ip.stem + ".txt"), *img.shape[:2])
-               yield split, ip.name, img, m == ids["SC"], m == ids["Epidermal"], _file_date(ip)
+               yield (split, ip.name, img, m == ids["SC"], m == ids["Epidermal"],
+                      m == ids["gland"] if "gland" in ids else None, _file_date(ip))
    else:
        preds = Path(args.preds)
        images = Path(args.images) if args.images else None
@@ -755,7 +797,8 @@ def _iter_inputs(args):
                        break
            if img is None:
                img = np.full((*m.shape, 3), 255, np.uint8)
-           yield preds.name, stem + ".jpg", img, m == ids["SC"], m == ids["Epidermal"], _file_date(img_path)
+           yield (preds.name, stem + ".jpg", img, m == ids["SC"], m == ids["Epidermal"],
+                  m == ids["gland"] if "gland" in ids else None, _file_date(img_path))
 
 
 
@@ -770,7 +813,7 @@ def main():
    src.add_argument("--preds", help="folder of *_mask.png from train_semseg.py predict")
    ap.add_argument("--split", default="val", help="train | val | all (with --data)")
    ap.add_argument("--images", help="images the predictions were made on (with --preds)")
-   ap.add_argument("--names", default="SC,Granular_Layer,glands,follicles",
+   ap.add_argument("--names", default="SC,Epidermis,glands,follicles",
                    help="class order for --preds masks (value k = class k-1)")
    ap.add_argument("--um-per-px", type=float, default=1.0,
                    help="micrometres per pixel of the INPUT image; 1.0 = report in pixels")
@@ -782,8 +825,8 @@ def main():
    out = Path(args.out)
    (out / "panels").mkdir(parents=True, exist_ok=True)
    rows = []
-   for folder, fname, img, sc, gl, date_str in _iter_inputs(args):
-       row, panel, _ = measure_layers(img, sc, gl, args.um_per_px, date=date_str)
+   for folder, fname, img, sc, gl, gland, date_str in _iter_inputs(args):
+       row, panel, _ = measure_layers(img, sc, gl, args.um_per_px, date=date_str, gland_mask=gland)
        row = {"folder name": folder, "file name": fname, **row}
        rows.append(row)
        if not args.no_panels:

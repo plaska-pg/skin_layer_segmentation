@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-predict.py -- run the trained SC/Granular Layer ResUNet model (see
+predict.py -- run the trained SC/Epidermis ResUNet model (see
 pretrained_model/train_semseg.py) on a folder of images and, by default,
 postprocess each prediction (postprocess.py: close -> identify ROI -> rotate
 -> measure) into a labeled composite QA image plus a dataset-wide CSV.
@@ -35,8 +35,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "pretrained_model"))
 from train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
 
 from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
-from postprocess import (BOTTOM_CROP_FRAC, CLOSE_RADII_UM, LATERAL_CLIP_FRAC, MIN_TOUCH_FRAC, SC_SMOOTH_RADIUS_UM,
-                         TOUCH_MARGIN_UM, overlay, process_image)  # noqa: E402
+from postprocess import (BOTTOM_CROP_FRAC, CLOSE_RADII_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
+                         FOLLICLE_WEIGHTS,
+                         LATERAL_CLIP_FRAC, MIN_TOUCH_FRAC, SC_SMOOTH_RADIUS_UM,
+                         TOUCH_MARGIN_UM, overlay, process_image, write_yolo_labels)  # noqa: E402
 from measurement import CSV_COLUMNS, _rasterise  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs"}  # .svs (Aperio) is TIFF-based - cv2 reads its
@@ -69,7 +71,7 @@ def write_run_config(path: Path, args, src: Path, out: Path, device, names, file
         "parameters": vars(args),
         "resolved": {
             "weights": str(Path(args.weights).resolve()),
-            "csv_output": str((Path(args.csv_out) if args.csv_out else out / "results.csv").resolve()),
+            "csv_output": str((Path(args.csv_out) if args.csv_out else out / "_results.csv").resolve()),
             "reference_um_per_px": args.reference_um_per_px,
             "postprocess": not args.no_postprocess,
             "close_radii_um": list(CLOSE_RADII_UM),
@@ -78,6 +80,10 @@ def write_run_config(path: Path, args, src: Path, out: Path, device, names, file
             "sc_smooth_radius_um": SC_SMOOTH_RADIUS_UM,
             "lateral_clip_frac": LATERAL_CLIP_FRAC,
             "bottom_crop_frac": BOTTOM_CROP_FRAC,
+            "follicle_enabled": FOLLICLE_ENABLED,
+            "follicle_weights": str(Path(FOLLICLE_WEIGHTS).resolve()),
+            "follicle_conf": FOLLICLE_CONF,
+            "follicle_mask_frac": FOLLICLE_MASK_FRAC,
             "input_files": [
                 {
                     "file": p.name,
@@ -168,39 +174,11 @@ def load_model(weights: str, device):
     return model, names, class_index
 
 
-def mask_to_yolo_polygons(mask: np.ndarray, min_area_px: float = 20.0):
-    """Yields one (N, 2) array of (x, y) points per external contour of mask,
-    normalised to [0, 1] by the mask's own width/height - same convention as
-    dataset/labels/*.txt. Contours smaller than min_area_px (specks/noise)
-    are dropped; holes are not represented (RETR_EXTERNAL only)."""
-    h, w = mask.shape[:2]
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours:
-        if len(c) < 3 or cv2.contourArea(c) < min_area_px:
-            continue
-        pts = c.reshape(-1, 2).astype(np.float64)
-        pts[:, 0] /= w
-        pts[:, 1] /= h
-        yield pts
-
-
-def write_yolo_labels(pred_mask: np.ndarray, class_index: dict, out_path: Path, min_area_px: float = 20.0) -> None:
-    """Writes pred_mask's per-class contours as YOLO-seg polygon lines (same
-    format/class-id convention as dataset/labels/*.txt): one line per polygon,
-    '<class_id 0-indexed> x1 y1 x2 y2 ...' with coordinates normalised [0, 1]."""
-    lines = []
-    for name, idx in class_index.items():
-        for pts in mask_to_yolo_polygons(pred_mask == idx, min_area_px):
-            coords = " ".join(f"{v:.6f}" for v in pts.flatten())
-            lines.append(f"{idx - 1} {coords}")
-    out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
-
-
 def main():
     builtins.print = _timestamped_print
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "models/best.pt"),
-                     help="ResUNet checkpoint trained on SC/Granular Layer (dataset/dataset.yaml)")
+                     help="ResUNet checkpoint trained on SC/Epidermis (dataset/dataset.yaml)")
     ap.add_argument("--source", default=_PREDICT_CFG.get("source", "inference_images"),
                      help="a single image file OR a folder of images to predict on")
     ap.add_argument("--out", default=None,
@@ -222,13 +200,15 @@ def main():
     ap.add_argument("--no-postprocess", action="store_true",
                      help="skip close/ROI/rotate/measure - just write raw prediction overlays")
     ap.add_argument("--no-labels", action="store_true",
-                     help="skip writing <out>/labels/<stem>.txt YOLO-seg polygon labels for the raw "
-                          "(un-rotated, un-closed) per-image prediction mask")
+                     help="skip writing <out>/raw_segmentations/<stem>.txt (raw prediction mask) and "
+                          "<out>/postprocessed_segmentations/<stem>.txt (final ROI SC/Epidermis + glands, "
+                          "mapped back to the original image frame) YOLO-seg polygon labels")
     ap.add_argument("--resume", action="store_true",
-                     help="if <out>/labels/<stem>.txt already exists from a previous (e.g. crashed) run, "
-                          "reuse it instead of re-running GPU inference for that image - postprocess/measure "
-                          "still re-runs (cheap, CPU-only) so results.csv comes out complete either way")
-    ap.add_argument("--csv-out", default=None, help="default: <out>/results.csv")
+                     help="continue a previous (e.g. crashed) run in the same --out: images that already have a "
+                          "row in the CSV are skipped and their row is kept; otherwise, if "
+                          "<out>/raw_segmentations/<stem>.txt exists it is reused instead of re-running GPU "
+                          "inference, and postprocess/measure re-runs")
+    ap.add_argument("--csv-out", default=None, help="default: <out>/_results.csv")
     ap.add_argument("--limit", type=int, default=None, help="only process the first N images (for quick test runs)")
     ap.add_argument("--workers", type=int, default=_PREDICT_CFG.get("workers", 1),
                      help="run the CPU-bound postprocess/measure step for up to N images concurrently in "
@@ -239,8 +219,9 @@ def main():
 
     device = pick_device(args.device)
     model, names, class_index = load_model(args.weights, device)
-    if not args.no_postprocess and not {"SC", "Granular Layer"} <= set(names):
-        raise SystemExit(f"--weights checkpoint names {names} must include 'SC' and 'Granular Layer' "
+    # 'Granular Layer' is the epidermis class name in older checkpoints (e.g. models/best.pt)
+    if not args.no_postprocess and not ("SC" in names and {"Epidermis", "Granular Layer"} & set(names)):
+        raise SystemExit(f"--weights checkpoint names {names} must include 'SC' and 'Epidermis' "
                           f"for postprocessing; pass --no-postprocess to skip it")
 
     scale = (args.um_per_px / args.reference_um_per_px) if args.um_per_px else 1.0
@@ -266,9 +247,12 @@ def main():
               f"sc_smooth_radius_um={SC_SMOOTH_RADIUS_UM}; "
               f"lateral_clip_frac={LATERAL_CLIP_FRAC}; "
               f"bottom_crop_frac={BOTTOM_CROP_FRAC}", flush=True)
-    labels_dir = out / "labels"
+    labels_dir = out / "raw_segmentations"
+    post_labels_dir = out / "postprocessed_segmentations"
     if not args.no_labels:
         labels_dir.mkdir(parents=True, exist_ok=True)
+        if not args.no_postprocess:
+            post_labels_dir.mkdir(parents=True, exist_ok=True)
     if not files:
         raise SystemExit(f"no images found in {src}")
     if args.limit:
@@ -278,17 +262,27 @@ def main():
     write_run_config(run_config_path, args, src, out, device, names, files, effective_mpp)
     print(f"Wrote run configuration to {run_config_path}", flush=True)
 
-    csv_path = Path(args.csv_out) if args.csv_out else out / "results.csv"
+    csv_path = Path(args.csv_out) if args.csv_out else out / "_results.csv"
     prior_rows = {}
     if args.resume and csv_path.exists():
         with csv_path.open(newline="") as f:
             prior_rows = {r["file name"]: r for r in csv.DictReader(f)}
 
     rows = []
+    # prior rows are already in memory, so it's safe to truncate the CSV and rewrite it row by row
+    csv_file = csv_path.open("w", newline="")
+    writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    csv_file.flush()
+
+    def _write_row(row):
+        rows.append(row)
+        writer.writerow(row)
+        csv_file.flush()
 
     def _collect(name, row):
         if row:
-            rows.append(row)
+            _write_row(row)
             print(f"{name}: SC area {row['SC area']:.0f}  Epidermal area {row['Epidermal area']:.0f}", flush=True)
 
     use_pool = args.workers > 1 and not args.no_postprocess
@@ -296,21 +290,16 @@ def main():
     pending = {}  # future -> file name, capped at args.workers so raw images in flight stay bounded
 
     for i, p in enumerate(files, 1):
-        done_marker = out / f"{p.stem}_overlay.jpg" if args.no_postprocess else out / f"{p.stem}_steps.jpg"
-        measurement_marker = out / f"{p.stem}_measurement.jpg"
         label_path = labels_dir / f"{p.stem}.txt"
-        if args.resume and done_marker.exists() and measurement_marker.exists() and p.stem in prior_rows:
-            # fully done in a prior run (steps.jpg + a results.csv row already exist) - reuse that row
-            # verbatim so we never re-read the image or re-run postprocess/measure for it.
-            print(f"[{i}/{len(files)}] {p.name}: already processed, reusing its results.csv row", flush=True)
-            rows.append(prior_rows[p.stem])
-            continue
-        if args.resume and done_marker.exists() and measurement_marker.exists() and not label_path.exists():
-            # done in a prior run before --resume/label-saving existed: no saved mask to cheaply recompute
-            # a CSV row from, so just skip re-running (expensive) GPU inference for it entirely.
-            print(f"[{i}/{len(files)}] {p.name}: output already exists and no saved label to reuse, "
-                  f"skipping (its CSV row will be missing this run)", flush=True)
-            continue
+        post_label_path = None if args.no_labels else post_labels_dir / f"{p.stem}.txt"
+        if args.resume:
+            if args.no_postprocess and (out / f"{p.stem}_overlay.jpg").exists():
+                print(f"[{i}/{len(files)}] {p.name}: overlay already exists, skipping", flush=True)
+                continue
+            if not args.no_postprocess and p.stem in prior_rows:
+                print(f"[{i}/{len(files)}] {p.name}: already processed, reusing its CSV row", flush=True)
+                _write_row(prior_rows[p.stem])
+                continue
         print(f"[{i}/{len(files)}] {p.name}: reading...", flush=True)
         orig_bgr = cv2.imread(str(p))
         if orig_bgr is None:
@@ -341,7 +330,7 @@ def main():
 
         if executor is None:
             row = process_image(p.stem, src.name, orig_bgr, pred_mask, class_index,
-                                 um_per_px or 1.0, out, source_path=p)
+                                 um_per_px or 1.0, out, source_path=p, seg_path=post_label_path)
             _collect(p.name, row)
             continue
 
@@ -350,7 +339,7 @@ def main():
             for fut in done:
                 _collect(pending.pop(fut), fut.result())
         fut = executor.submit(process_image, p.stem, src.name, orig_bgr, pred_mask, class_index,
-                               um_per_px or 1.0, out, source_path=p)
+                               um_per_px or 1.0, out, source_path=p, seg_path=post_label_path)
         pending[fut] = p.name
 
     if pending:
@@ -360,12 +349,8 @@ def main():
     if executor:
         executor.shutdown(wait=True)
 
-    if rows:
-        with csv_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"\nWrote {len(rows)} rows to {csv_path}")
+    csv_file.close()
+    print(f"\nWrote {len(rows)} rows to {csv_path}")
     print(f"Processed {len(files)} images -> {out}")
 
 
