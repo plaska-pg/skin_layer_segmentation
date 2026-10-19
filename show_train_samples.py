@@ -9,7 +9,7 @@ actually trains on (augmentations + rasterised labels, pseudolabels included).
     python show_train_samples.py --count 40 --cols 5
 
 Writes a single montage JPG (default runs/train_samples_preview.jpg). Each panel
-is one augmented crop on the left and the same crop with its SC/Granular-Layer
+is one augmented crop on the left and the same crop with its SC/Epidermis
 label overlaid on the right, captioned with the source filename.
 """
 
@@ -93,7 +93,7 @@ def main():
 
     # legend strip: which colour is which class
     legend = np.full((34, grid.shape[1], 3), (30, 30, 30), np.uint8)
-    for j, (cls, col) in enumerate([("SC", PALETTE[0]), ("Granular Layer", PALETTE[1])]):
+    for j, (cls, col) in enumerate([("SC", PALETTE[0]), ("Epidermis", PALETTE[1])]):
         x0 = 10 + j * 260
         cv2.rectangle(legend, (x0, 8), (x0 + 24, 26), tuple(int(v) for v in col), -1)
         cv2.putText(legend, cls, (x0 + 32, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)

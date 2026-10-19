@@ -243,7 +243,7 @@ def process_tab():
             preview.image(load_preview(latest), caption=latest.name, width="stretch")
         except OSError:
             pass
-    results = [out / "results.csv" for out in out_dirs if (out / "results.csv").exists()]
+    results = [out / "_results.csv" for out in out_dirs if (out / "_results.csv").exists()]
     if results:
         st.subheader("Results")
         st.dataframe(pd.concat([pd.read_csv(p) for p in results], ignore_index=True))
@@ -253,10 +253,13 @@ def process_tab():
 # Explore data
 # ----------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Searching for results.csv...")
+@st.cache_data(show_spinner="Searching for _results.csv...")
 def load_results(root: str) -> pd.DataFrame:
     frames = []
-    for p in sorted(Path(root).rglob("results.csv")):
+    paths = set(Path(root).rglob("_results.csv"))
+    # legacy 'results.csv' from older runs, unless superseded by a sibling _results.csv
+    paths |= {p for p in Path(root).rglob("results.csv") if not (p.parent / "_results.csv").exists()}
+    for p in sorted(paths):
         try:
             df = pd.read_csv(p)
         except Exception as e:  # noqa: BLE001 - skip unreadable/partial csvs, keep the rest
@@ -276,13 +279,13 @@ def explore_tab():
         return
     df = load_results(root)
     if df.empty:
-        st.info("No results.csv files found.")
+        st.info("No _results.csv files found.")
         return
 
     folders = sorted(df["folder name"].astype(str).unique()) if "folder name" in df else []
     selected = st.multiselect("Folders", folders, default=folders)
     view = df[df["folder name"].astype(str).isin(selected)] if folders else df
-    st.caption(f"{len(view)} rows from {view['results path'].nunique()} results.csv file(s)")
+    st.caption(f"{len(view)} rows from {view['results path'].nunique()} _results.csv file(s)")
     st.dataframe(view)
     st.download_button("Download combined CSV", view.to_csv(index=False), "combined_results.csv", "text/csv")
 

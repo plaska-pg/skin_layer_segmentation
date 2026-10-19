@@ -22,7 +22,7 @@ $ImageExtensions = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs")
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
-$SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX_NOV_24_D2_H_E")
+$SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF")
 
 $ExistingJobs = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
   Where-Object { $_.CommandLine -match '(?i)predict\.py' })
@@ -35,7 +35,7 @@ $Wrapper = Join-Path $LogDir "_run_all_$Timestamp.generated.cmd"
 $Commands = foreach ($SourceDir in $SourceDirs) {
   $Source = $SourceDir
   # NOTE: never delete the existing "<folder>\predicted_<folder>" output here - --resume below relies on its
-  # saved labels/steps.jpg/results.csv to skip images already done (e.g. after a crash mid-batch).
+  # saved raw_segmentations/steps.jpg/_results.csv to skip images already done (e.g. after a crash mid-batch).
   @"
 echo.>> "$Log"
 echo ===== %date% %time% - $Source ===== >> "$Log"
