@@ -3,23 +3,22 @@
 postprocess.py -- turn a raw SC/Epidermal prediction mask into a measured,
 canonically-oriented region of interest, plus a side-by-side QA image.
 
-Pipeline (see plan.md for the full spec/rationale):
+Pipeline:
   1. rotate the full image and prediction mask in 90-degree steps using the
       trained orientation classifier (see rotate.py)
-  2. close small gaps per class (grouping only - never adds pixels to the
-      mask actually used for measurement), then pick the SC/Epidermal pair
-      with the highest mutual boundary-touch fraction as the ROI
-  3. erode then dilate (morphological opening) the SC segment to smooth out
-      jagged segmentation noise along its boundary
-  4. remove SC/Epidermal pixels inside the bottom follicle_mask_frac of each
-      detected follicle's oriented box (cut parallel to the box's top edge)
-  5. measure each class - see measurement.py (perpendicular-to-tangent
+  2. detect follicles (YOLO-OBB) on the rotated image
+  3. detect ROI boxes (YOLO-OBB roi_det) on the rotated image
+  4. keep only SC/Epidermal pixels inside the union of ROI boxes (full frame
+      if none detected) and outside the bottom follicle_mask_frac of each
+      follicle box (cut parallel to the box's top edge)
+  5. per-class elliptical opening then closing (sc_/epidermal_erod_dil_kernel_size_um)
+  6. measure each class - see measurement.py (perpendicular-to-tangent
       thickness on smoothed boundary curves, tortuosity, hole count)
-  6. render a labeled composite: Original | Raw Prediction | Rotated
-      Prediction | Follicles | ROI (closed) | Epidermal Midline | Height Spine
-      (the Follicles panel is YOLO-OBB detections on the full rotated image)
+  7. render a labeled composite: Original | Raw Prediction | Rotated
+      Prediction | Follicles | ROI Boxes | ROI (masked + morph) |
+      Epidermal Midline | Height Spine
 
-Gland predictions are only rotated - never cropped, grouped, smoothed or clipped.
+Gland predictions are only rotated - never masked, smoothed or clipped.
 """
 
 import threading
@@ -39,12 +38,9 @@ from rotate import build_model, pick_device, predict_orientation, rotate_k
 # different scans. Values come from base_config.yaml's postprocess section
 # (fallback matches the codebase's existing 10px-at-0.645um/px convention).
 _PP_CFG = CONFIG.get("postprocess", {})
-CLOSE_RADII_UM = tuple(_PP_CFG.get("close_radii_um", (12.9, 25.8, 51.6, 103.2)))
-TOUCH_MARGIN_UM = _PP_CFG.get("touch_margin_um", 6.45)
-MIN_TOUCH_FRAC = _PP_CFG.get("min_touch_frac", 0.2)
-SC_SMOOTH_RADIUS_UM = _PP_CFG.get("sc_smooth_radius_um", 6.45)  # opening radius knocking jagged noise off the SC boundary
+SC_ERODE_DILATE_UM = _PP_CFG.get("sc_erod_dil_kernel_size_um", 5.0)
+EPIDERMAL_ERODE_DILATE_UM = _PP_CFG.get("epidermal_erod_dil_kernel_size_um", 10.0)
 LATERAL_CLIP_FRAC = _PP_CFG.get("lateral_clip_frac", 0.10)  # fraction of the rotated ROI's horizontal extent trimmed per side
-BOTTOM_CROP_FRAC = _PP_CFG.get("bottom_crop_frac", 0.40)  # fraction of the rotated image's bottom rows dropped before ROI/measurement
 ROTATION_WEIGHTS = _PP_CFG.get("rotation_weights", "runs/rotation/rotate_model.pt")
 ROTATION_DEVICE = _PP_CFG.get("rotation_device", "auto")
 FOLLICLE_ENABLED = _PP_CFG.get("follicle_enabled", True)
@@ -54,6 +50,12 @@ FOLLICLE_CONF = _PP_CFG.get("follicle_conf", 0.25)
 FOLLICLE_MAX_SIDE = _PP_CFG.get("follicle_max_side", 1024)
 FOLLICLE_IMGSZ = _PP_CFG.get("follicle_imgsz", 1024)
 FOLLICLE_MASK_FRAC = _PP_CFG.get("follicle_mask_frac", 0.8)
+ROI_ENABLED = _PP_CFG.get("roi_enabled", True)
+ROI_WEIGHTS = _PP_CFG.get("roi_weights", "models/roi_det.pt")
+ROI_DEVICE = _PP_CFG.get("roi_device", "auto")
+ROI_CONF = _PP_CFG.get("roi_conf", 0.25)
+ROI_MAX_SIDE = _PP_CFG.get("roi_max_side", 1024)
+ROI_IMGSZ = _PP_CFG.get("roi_imgsz", 1024)
 
 
 def lateral_clip_window(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LATERAL_CLIP_FRAC):
@@ -89,98 +91,22 @@ def clip_lateral_margins(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float =
 
 
 # ----------------------------------------------------------------------------
-# closing / grouping (gap bridging without synthetic pixels)
+# morphology
 # ----------------------------------------------------------------------------
 
-def morphological_group(binary: np.ndarray, radius: int) -> np.ndarray:
-    """Per-pixel logical-group id (0 = background). Grouping only: closing
-    decides which original fragments belong together, but the returned ids are
-    masked back to the ORIGINAL foreground pixels - no filled-in pixels leak
-    into anything measured/rotated downstream. Uses a rectangular kernel
-    (separable/fast in OpenCV regardless of size) rather than an elliptical
-    one - these images are large (multi-thousand px) and radius can grow into
-    the hundreds of px, where a non-separable elliptical kernel is far too
-    slow."""
-    if not binary.any():
-        return np.zeros(binary.shape, np.int32)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * radius + 1, 2 * radius + 1))
-    closed = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-    _, labels = cv2.connectedComponents(closed, connectivity=8)
-    return np.where(binary, labels, 0)
+def kernel_px(size_um: float, um_per_px: float) -> int:
+    """Kernel diameter in native px (forced odd); <= 1 means no-op."""
+    size = int(round(size_um / um_per_px)) if size_um > 0 else 0
+    return size + 1 if size > 1 and size % 2 == 0 else size
 
 
-def largest_group_mask(group_labels: np.ndarray):
-    """Return the binary mask of the largest-by-area group, or None if empty."""
-    ids, counts = np.unique(group_labels[group_labels > 0], return_counts=True)
-    if len(ids) == 0:
-        return None
-    return group_labels == ids[np.argmax(counts)]
-
-
-def boundary_ring(comp: np.ndarray) -> np.ndarray:
-    comp_u8 = comp.astype(np.uint8)
-    ring = comp_u8 - cv2.erode(comp_u8, np.ones((3, 3), np.uint8))
-    return ring if ring.any() else comp_u8
-
-
-def smooth_mask(mask: np.ndarray, radius: int) -> np.ndarray:
-    """Morphological opening (erode then dilate, elliptical kernel): knocks
-    off small jagged protrusions/noise along the boundary without growing
-    the segment or shifting its overall position, unlike a closing."""
-    if radius <= 0 or not mask.any():
+def erode_dilate(mask: np.ndarray, size_px: int) -> np.ndarray:
+    """Elliptical opening (removes specks/jagged edges) then closing (bridges small gaps)."""
+    if size_px <= 1 or not mask.any():
         return mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
-    return cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
-
-
-def close_mask(mask: np.ndarray, radius: int) -> np.ndarray:
-    """Dilate then erode a mask to bridge short gaps between segments."""
-    if radius <= 0 or not mask.any():
-        return mask.astype(bool)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * radius + 1, 2 * radius + 1))
-    return cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
-
-
-def mutual_touch_frac(a: np.ndarray, b: np.ndarray, margin_px: int):
-    """Fraction of a's own boundary ring within margin_px of b, and vice versa."""
-    kernel = np.ones((margin_px * 2 + 1, margin_px * 2 + 1), np.uint8) if margin_px > 0 else None
-    a_u8, b_u8 = a.astype(np.uint8), b.astype(np.uint8)
-    b_dil = cv2.dilate(b_u8, kernel) if kernel is not None else b_u8
-    a_dil = cv2.dilate(a_u8, kernel) if kernel is not None else a_u8
-    ring_a, ring_b = boundary_ring(a_u8), boundary_ring(b_u8)
-    frac_a = float((ring_a & b_dil).sum()) / max(int(ring_a.sum()), 1)
-    frac_b = float((ring_b & a_dil).sum()) / max(int(ring_b.sum()), 1)
-    return frac_a, frac_b
-
-
-def find_roi(mask: np.ndarray, sc_id: int, gl_id: int, um_per_px: float = 1.0,
-             radii_um=CLOSE_RADII_UM, margin_um=TOUCH_MARGIN_UM, min_frac=MIN_TOUCH_FRAC):
-    """Grow the closing radius (converted from um to this mask's own native
-    px via um_per_px) until the largest SC/Epidermal logical components
-    mutually touch >= min_frac on both sides. Returns a dict with
-    sc_mask/gl_mask/radius/ok(/best_frac if not ok), or None if either class
-    is entirely absent from the mask."""
-    sc_bin, gl_bin = mask == sc_id, mask == gl_id
-    if not sc_bin.any() or not gl_bin.any():
-        return None
-    margin_px = max(1, round(margin_um / um_per_px))
-    fallback = None
-    for r_um in radii_um:
-        r = max(1, round(r_um / um_per_px))
-        sc_mask = largest_group_mask(morphological_group(sc_bin, r))
-        gl_mask = largest_group_mask(morphological_group(gl_bin, r))
-        if sc_mask is None or gl_mask is None:
-            continue
-        gl_mask = close_mask(gl_mask, r)
-        frac_sc, frac_gl = mutual_touch_frac(sc_mask, gl_mask, margin_px)
-        fallback = (sc_mask, gl_mask, r, min(frac_sc, frac_gl))
-        if frac_sc >= min_frac and frac_gl >= min_frac:
-                return {"sc_mask": sc_mask, "gl_mask": gl_mask, "radius": r, "radius_um": r_um,
-                    "touch_frac_sc": frac_sc, "touch_frac_gl": frac_gl, "ok": True}
-    if fallback is None:
-        return None
-    sc_mask, gl_mask, r, worst = fallback
-    return {"sc_mask": sc_mask, "gl_mask": gl_mask, "radius": r, "ok": False, "best_frac": worst}
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size_px, size_px))
+    out = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    return cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel).astype(bool)
 
 
 # ----------------------------------------------------------------------------
@@ -216,40 +142,39 @@ def rotate_to_canonical(img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarra
 
 
 # ----------------------------------------------------------------------------
-# follicle detection
+# YOLO-OBB detection (follicles, ROI)
 # ----------------------------------------------------------------------------
 
-_follicle_model_cache = {}
+_obb_model_cache = {}
 # predict.py runs process_image in a ThreadPoolExecutor; ultralytics predict isn't thread-safe
-_follicle_lock = threading.Lock()
+_obb_lock = threading.Lock()
 
 
-def _get_follicle_model(weights_path: str = FOLLICLE_WEIGHTS, device_str: str = FOLLICLE_DEVICE):
-    """Lazily loads+caches the YOLO-OBB follicle detector. Returns (model,
-    device) or None (warning printed once) if the weights or ultralytics are
-    unavailable, so the pipeline still runs without the follicle panel."""
+def _get_obb_model(weights_path: str, device_str: str, name: str):
+    """Lazily loads+caches a YOLO-OBB detector. Returns (model, device) or
+    None (warning printed once) if the weights or ultralytics are unavailable,
+    so the pipeline still runs without that detector."""
     key = (weights_path, device_str)
-    if key not in _follicle_model_cache:
+    if key not in _obb_model_cache:
         model = None
         if not Path(weights_path).exists():
-            print(f"WARNING: follicle weights not found at {weights_path}; skipping follicle detection", flush=True)
+            print(f"WARNING: {name} weights not found at {weights_path}; skipping {name} detection", flush=True)
         else:
             try:
                 from ultralytics import YOLO
                 model = (YOLO(weights_path), str(pick_device(device_str)))
             except ImportError:
-                print("WARNING: ultralytics not installed; skipping follicle detection", flush=True)
-        _follicle_model_cache[key] = model
-    return _follicle_model_cache[key]
+                print(f"WARNING: ultralytics not installed; skipping {name} detection", flush=True)
+        _obb_model_cache[key] = model
+    return _obb_model_cache[key]
 
 
-def detect_follicles(img_bgr: np.ndarray, weights_path: str = FOLLICLE_WEIGHTS,
-                     device_str: str = FOLLICLE_DEVICE, conf: float = FOLLICLE_CONF,
-                     max_side: int = FOLLICLE_MAX_SIDE, imgsz: int = FOLLICLE_IMGSZ):
+def detect_obb(img_bgr: np.ndarray, weights_path: str, device_str: str, conf: float,
+               max_side: int, imgsz: int, name: str = "OBB"):
     """Returns a list of (quad, conf) with quad a 4x2 float array of OBB
     corners in img_bgr's pixel coordinates, or None if no detector is available."""
-    with _follicle_lock:
-        loaded = _get_follicle_model(weights_path, device_str)
+    with _obb_lock:
+        loaded = _get_obb_model(weights_path, device_str, name)
         if loaded is None:
             return None
         model, device = loaded
@@ -260,6 +185,14 @@ def detect_follicles(img_bgr: np.ndarray, weights_path: str = FOLLICLE_WEIGHTS,
         r = model.predict(small, imgsz=imgsz, conf=conf, device=device, verbose=False)[0]
     quads = r.obb.xyxyxyxy.cpu().numpy() / f
     return list(zip(quads, r.obb.conf.cpu().numpy().tolist()))
+
+
+def roi_mask(shape, boxes) -> np.ndarray:
+    """Bool mask of the union of all ROI oriented boxes."""
+    mask = np.zeros(shape[:2], np.uint8)
+    for quad, _ in boxes:
+        cv2.fillPoly(mask, [np.round(quad).astype(np.int32).reshape(-1, 1, 2)], 1)
+    return mask.astype(bool)
 
 
 def follicle_mask(shape, follicles, frac: float = FOLLICLE_MASK_FRAC) -> np.ndarray:
@@ -290,20 +223,20 @@ def follicle_mask(shape, follicles, frac: float = FOLLICLE_MASK_FRAC) -> np.ndar
     return mask
 
 
-def draw_follicle_panel(img: np.ndarray, follicles, removed: np.ndarray = None) -> np.ndarray:
+def draw_obb_panel(img: np.ndarray, boxes, shaded: np.ndarray = None, color=(0, 255, 255)) -> np.ndarray:
     panel = img.copy()
-    if removed is not None and removed.any():
+    if shaded is not None and shaded.any():
         shade = np.zeros_like(panel)
-        shade[removed] = (0, 255, 255)
-        panel[removed] = cv2.addWeighted(panel, 0.6, shade, 0.4, 0)[removed]
+        shade[shaded] = color
+        panel[shaded] = cv2.addWeighted(panel, 0.6, shade, 0.4, 0)[shaded]
     # composite downsizes panels to ~480px tall, so scale strokes to survive that
     s = max(1.0, max(panel.shape[:2]) / 1000)
     thickness, font_scale = max(2, int(round(3 * s))), 0.6 * s
-    for quad, c in follicles:
+    for quad, c in boxes:
         pts = np.round(quad).astype(np.int32)
-        cv2.polylines(panel, [pts.reshape(-1, 1, 2)], True, (0, 255, 255), thickness, cv2.LINE_AA)
+        cv2.polylines(panel, [pts.reshape(-1, 1, 2)], True, color, thickness, cv2.LINE_AA)
         x, y = pts[:, 0].min(), max(int(pts[:, 1].min()) - thickness, int(20 * s))
-        cv2.putText(panel, f"{c:.2f}", (int(x), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255),
+        cv2.putText(panel, f"{c:.2f}", (int(x), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color,
                     max(1, thickness // 2), cv2.LINE_AA)
     return panel
 
@@ -379,21 +312,19 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
                    class_index: dict, um_per_px: float, out_dir: Path, source_path: Path = None,
                    postprocess_config: dict = None, return_visuals: bool = False,
                    write_outputs: bool = True, seg_path: Path = None):
-    """Runs the full rotate -> close/ROI -> measure pipeline for one image,
-    writes the labeled composite QA image, and returns a CSV row dict (or
-    None if no SC/Epidermal pair reached the touch threshold).
+    """Runs the full rotate -> detect follicles/ROI -> mask -> morph -> measure
+    pipeline for one image, writes the labeled composite QA image, and returns
+    a CSV row dict (or None if SC or Epidermis is empty after masking).
     `source_path`, if given, is the original image file - its last-modified
     date is used for the CSV's 'date' column. `seg_path`, if given, receives
     the postprocessed segmentation as YOLO-seg polygons in the original frame."""
     settings = postprocess_config or {}
-    close_radii_um = tuple(settings.get("close_radii_um", CLOSE_RADII_UM))
-    touch_margin_um = settings.get("touch_margin_um", TOUCH_MARGIN_UM)
-    min_touch_frac = settings.get("min_touch_frac", MIN_TOUCH_FRAC)
-    sc_smooth_radius_um = settings.get("sc_smooth_radius_um", SC_SMOOTH_RADIUS_UM)
+    sc_kernel_um = settings.get("sc_erod_dil_kernel_size_um", SC_ERODE_DILATE_UM)
+    gl_kernel_um = settings.get("epidermal_erod_dil_kernel_size_um", EPIDERMAL_ERODE_DILATE_UM)
     lateral_clip_frac = settings.get("lateral_clip_frac", LATERAL_CLIP_FRAC)
-    bottom_crop_frac = settings.get("bottom_crop_frac", BOTTOM_CROP_FRAC)
     follicle_enabled = settings.get("follicle_enabled", FOLLICLE_ENABLED)
     follicle_mask_frac = settings.get("follicle_mask_frac", FOLLICLE_MASK_FRAC)
+    roi_enabled = settings.get("roi_enabled", ROI_ENABLED)
 
     sc_id = class_index["SC"]
     # 'Epidermal' / 'Granular Layer' are the names used by older checkpoints
@@ -404,63 +335,54 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     gland_full = pred_mask == gland_id if gland_id is not None else np.zeros(pred_mask.shape, bool)
 
     # Preserve raw-frame QA, but rotate the complete prediction before any
-    # grouping or ROI selection so all downstream postprocessing uses the
-    # canonical orientation.
+    # ROI selection so all downstream postprocessing uses the canonical orientation.
     rot_img, rot_sc_full, rot_gl_full, k = rotate_to_canonical(
         orig_bgr, pred_mask == sc_id, pred_mask == gl_id)
     rot_gland = rotate_k(gland_full, k)
     raw_overlay = overlay(orig_bgr, {"SC": pred_mask == sc_id, "Epidermal": pred_mask == gl_id, "gland": gland_full})
     rotated_overlay = overlay(rot_img, {"SC": rot_sc_full, "Epidermal": rot_gl_full, "gland": rot_gland})
 
-    # Detect on the full rotated frame (before the bottom crop): follicles reach deep into the dermis.
     follicles = None
     if follicle_enabled:
-        follicles = detect_follicles(
+        follicles = detect_obb(
             rot_img,
             weights_path=settings.get("follicle_weights", FOLLICLE_WEIGHTS),
             device_str=settings.get("follicle_device", FOLLICLE_DEVICE),
             conf=settings.get("follicle_conf", FOLLICLE_CONF),
             max_side=settings.get("follicle_max_side", FOLLICLE_MAX_SIDE),
-            imgsz=settings.get("follicle_imgsz", FOLLICLE_IMGSZ))
+            imgsz=settings.get("follicle_imgsz", FOLLICLE_IMGSZ), name="follicle")
     fol_removed = follicle_mask(rot_img.shape, follicles, follicle_mask_frac)
     follicle_panels = [] if follicles is None else [
-        (f"Follicles ({len(follicles)})", draw_follicle_panel(rotated_overlay, follicles, fol_removed))]
+        (f"Follicles ({len(follicles)})", draw_obb_panel(rotated_overlay, follicles, fol_removed))]
 
-    # Drop the bottom rows of the rotated frame (dermis/substrate side) so ROI
-    # selection and measurement only see the upper epidermal band.
-    keep_rows = max(1, int(round(rot_img.shape[0] * (1.0 - bottom_crop_frac))))
-    rot_img_full = rot_img
-    rot_img = rot_img[:keep_rows]
-    rot_sc_full = rot_sc_full[:keep_rows]
-    rot_gl_full = rot_gl_full[:keep_rows]
+    rois = None
+    if roi_enabled:
+        rois = detect_obb(
+            rot_img,
+            weights_path=settings.get("roi_weights", ROI_WEIGHTS),
+            device_str=settings.get("roi_device", ROI_DEVICE),
+            conf=settings.get("roi_conf", ROI_CONF),
+            max_side=settings.get("roi_max_side", ROI_MAX_SIDE),
+            imgsz=settings.get("roi_imgsz", ROI_IMGSZ), name="ROI")
+    roi_panels = [] if rois is None else [
+        (f"ROI Boxes ({len(rois)})", draw_obb_panel(rotated_overlay, rois, color=(255, 0, 255)))]
+    if rois:
+        keep = roi_mask(rot_img.shape, rois)
+    else:
+        if roi_enabled:
+            print(f"WARNING {stem}: no ROI detected; using full frame", flush=True)
+        keep = np.ones(rot_img.shape[:2], bool)
+    keep &= ~fol_removed
 
-    rot_pred_mask = np.zeros(rot_sc_full.shape, dtype=pred_mask.dtype)
-    rot_pred_mask[rot_sc_full] = sc_id
-    rot_pred_mask[rot_gl_full] = gl_id
-
-    roi = find_roi(rot_pred_mask, sc_id, gl_id, um_per_px=um_per_px,
-                   radii_um=close_radii_um, margin_um=touch_margin_um,
-                   min_frac=min_touch_frac)
-    if roi is None or not roi["ok"]:
-        reached = roi["best_frac"] if roi else 0.0
-        print(f"SKIP {stem}: no SC/Epidermal pair reached {min_touch_frac:.0%} mutual touch "
-              f"(best {reached:.0%} at max closing radius {close_radii_um[-1]}um)")
+    # re-mask after morphology so closing can't reintroduce pixels outside ROI / inside follicles
+    rot_sc = erode_dilate(rot_sc_full & keep, kernel_px(sc_kernel_um, um_per_px)) & keep
+    rot_gl = erode_dilate(rot_gl_full & keep, kernel_px(gl_kernel_um, um_per_px)) & keep
+    if not rot_sc.any() or not rot_gl.any():
+        print(f"SKIP {stem}: SC or Epidermis empty after ROI/follicle masking", flush=True)
         return (None, None) if return_visuals else None
-    print(f"{stem}: postprocess radius {roi['radius_um']:.2f}um ({roi['radius']}px), "
-          f"touch SC={roi['touch_frac_sc']:.1%} GL={roi['touch_frac_gl']:.1%}", flush=True)
-    roi["sc_mask"] = smooth_mask(roi["sc_mask"], max(1, round(sc_smooth_radius_um / um_per_px)))
-    if fol_removed.any():
-        keep = ~fol_removed[:keep_rows]
-        n_sc = int((roi["sc_mask"] & ~keep).sum())
-        n_gl = int((roi["gl_mask"] & ~keep).sum())
-        roi["sc_mask"] = roi["sc_mask"] & keep
-        roi["gl_mask"] = roi["gl_mask"] & keep
-        print(f"{stem}: follicle mask removed SC={n_sc}px GL={n_gl}px", flush=True)
 
-    roi_overlay = overlay(rot_img, {"SC": roi["sc_mask"], "Epidermal": roi["gl_mask"], "gland": rot_gland[:keep_rows]})
-    rot_sc, rot_gl = roi["sc_mask"], roi["gl_mask"]
+    roi_overlay = overlay(rot_img, {"SC": rot_sc, "Epidermal": rot_gl, "gland": rot_gland})
 
-    # after rotation, find the longest horizontal span of the SC la
     midline_panel = draw_gl_midline_panel(rot_img, rot_sc, rot_gl)
 
     # spines first, then clip: build each layer's medial-axis spine on the full
@@ -474,8 +396,7 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         rot_img, meas_sc, meas_gl, um_per_px, date=_file_date(source_path),
         spines={"SC": sc_spine, "Epidermal": gl_spine},
         lengths_px={"SC": sc_len, "Epidermal": gl_len},
-        gland_mask=rot_gland if gland_id is not None else None,
-        panel_img=rot_img_full if gland_id is not None else None)
+        gland_mask=rot_gland if gland_id is not None else None)
 
     sc_stats = {"mean_height": row_extra["SC mean height"], "area": row_extra["SC area"]}
     gl_stats = {"mean_height": row_extra["Epidermal mean height"], "area": row_extra["Epidermal area"]}
@@ -487,7 +408,8 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         ("Raw Prediction", raw_overlay),
         (f"Rotated Prediction ({k * 90} deg)", rotated_overlay),
         *follicle_panels,
-        ("ROI (closed)", roi_overlay),
+        *roi_panels,
+        ("ROI (masked + morph)", roi_overlay),
         ("Epidermal Midline", midline_panel),
         ("Height Spine", spine_panel),
     ])
@@ -498,11 +420,11 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
         cv2.imwrite(str(out_dir / f"{stem}_steps.jpg"), composite, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if write_outputs and seg_path is not None:
-        post_mask = np.zeros(rot_img_full.shape[:2], dtype=pred_mask.dtype)
+        post_mask = np.zeros(rot_img.shape[:2], dtype=pred_mask.dtype)
         if gland_id is not None:
             post_mask[rot_gland] = gland_id
-        post_mask[:keep_rows][rot_sc] = sc_id
-        post_mask[:keep_rows][rot_gl] = gl_id
+        post_mask[rot_sc] = sc_id
+        post_mask[rot_gl] = gl_id
         seg_path = Path(seg_path)
         seg_path.parent.mkdir(parents=True, exist_ok=True)
         write_yolo_labels(rotate_k(post_mask, -k), class_index, seg_path)

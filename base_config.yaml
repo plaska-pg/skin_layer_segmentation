@@ -16,12 +16,9 @@ postprocess:
   # um, not raw px: native pixel size varies with scan resolution (e.g. 0.26 vs
   # 0.645 um/px), so a fixed px count means a different physical distance on
   # different scans.
-  close_radii_um: [10, 36.6, 50, 103.2] # merges a segment until min_touch_frac (like 20%) of the segment is touching the other segment.  also extra dilation+erosion radius to bridge Epidermal gaps and smoothing
-  touch_margin_um: 10 # sets how close the two regions’ edges must be to count as “touching.”
-  min_touch_frac: 0.10
-  sc_smooth_radius_um: 2   # opening radius that knocks small jagged noise off the SC boundary
+  sc_erod_dil_kernel_size_um: 5          # elliptical kernel diameter for SC opening then closing (0 disables)
+  epidermal_erod_dil_kernel_size_um: 10  # same for Epidermis
   lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
-  bottom_crop_frac: 0.40      # fraction of the rotated image's bottom rows dropped before ROI/measurement
   rotation_weights: models/rotate_model.pt   # trained orientation classifier (see rotate.py)
   rotation_device: auto
   follicle_enabled: true                     # YOLO-OBB follicle detector on the rotated image (steps panel + follicle masking)
@@ -31,6 +28,12 @@ postprocess:
   follicle_mask_frac: 0.8   # SC/Epidermis pixels in the bottom fraction of each follicle box (cut parallel to its top edge) are removed before measurement (0 disables)
   follicle_max_side: 1024   # long side the image is downscaled to before detection; must match training
   follicle_imgsz: 1024
+  roi_enabled: true                     # YOLO-OBB ROI detector; SC/Epidermis outside the union of its boxes is removed (full frame if none detected)
+  roi_weights: models/roi_det.pt        # see pretrained_model/train_det.py
+  roi_device: auto
+  roi_conf: 0.25
+  roi_max_side: 1024   # must match training (pretrained_model/ROI/yolo_det/data.yaml)
+  roi_imgsz: 1024
 
 measurement:
   skeleton_method: lee   # 'zhang' (skimage's 2D default) or 'lee'
