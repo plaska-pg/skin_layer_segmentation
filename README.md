@@ -103,7 +103,8 @@ in base_config.yaml; if no ROI is detected (or `roi_enabled: false`) the full fr
 3. Detect ROI boxes
 4. Remove SC/Epidermis outside the union of ROI boxes and inside the bottom `follicle_mask_frac` of each follicle box
 5. Per-class elliptical opening then closing (`sc_erod_dil_kernel_size_um`, `epidermal_erod_dil_kernel_size_um`, `gland_erod_dil_kernel_size_um`)
-6. Trim `lateral_clip_frac` per side, then measure
+6. Drop SC/Epidermis components not within `sc_epidermis_contact_gap_um` of the other class (`sc_epidermis_contact_enabled`)
+7. Trim `lateral_clip_frac` per side, then measure
 
 # to do
 

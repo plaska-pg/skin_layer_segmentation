@@ -19,6 +19,8 @@ postprocess:
   sc_erod_dil_kernel_size_um: 5          # elliptical kernel diameter for SC opening then closing (0 disables)
   epidermal_erod_dil_kernel_size_um: 15  # same for Epidermis
   gland_erod_dil_kernel_size_um: 10      # same for gland (0 disables)
+  sc_epidermis_contact_enabled: true     # drop SC/Epidermis connected components that don't touch the other class (after morphology)
+  sc_epidermis_contact_gap_um: 5         # mostly to get rid of SC components not touching Epidermis (the ones separated from the main tissue)
   lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
   rotation_weights: models/rotate_model.pt   # trained orientation classifier (see rotate.py)
   rotation_device: auto
