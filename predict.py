@@ -38,6 +38,7 @@ from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
 from postprocess import (EPIDERMAL_ERODE_DILATE_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
                          FOLLICLE_PADDING_UM, FOLLICLE_WEIGHTS, GLAND_ERODE_DILATE_UM, LATERAL_CLIP_FRAC, ROI_CONF, ROI_ENABLED, ROI_WEIGHTS,
                          QUALITY_ENABLED, QUALITY_SECTIONS, QUALITY_WEIGHTS,
+                         SC_EPIDERMIS_CONTACT_ENABLED, SC_EPIDERMIS_CONTACT_GAP_UM,
                          SC_ERODE_DILATE_UM, imwrite_jpg, long_path, overlay, process_image,
                          write_yolo_labels)  # noqa: E402
 from measurement import CSV_COLUMNS, _rasterise  # noqa: E402
@@ -79,6 +80,8 @@ def write_run_config(path: Path, args, src: Path, out: Path, device, names, file
             "sc_erod_dil_kernel_size_um": SC_ERODE_DILATE_UM,
             "epidermal_erod_dil_kernel_size_um": EPIDERMAL_ERODE_DILATE_UM,
             "gland_erod_dil_kernel_size_um": GLAND_ERODE_DILATE_UM,
+            "sc_epidermis_contact_enabled": SC_EPIDERMIS_CONTACT_ENABLED,
+            "sc_epidermis_contact_gap_um": SC_EPIDERMIS_CONTACT_GAP_UM,
             "lateral_clip_frac": LATERAL_CLIP_FRAC,
             "follicle_enabled": FOLLICLE_ENABLED,
             "follicle_weights": str(Path(FOLLICLE_WEIGHTS).resolve()),
@@ -261,6 +264,8 @@ def main():
               f"sc_erod_dil_kernel_size_um={SC_ERODE_DILATE_UM}; "
               f"epidermal_erod_dil_kernel_size_um={EPIDERMAL_ERODE_DILATE_UM}; "
               f"gland_erod_dil_kernel_size_um={GLAND_ERODE_DILATE_UM}; "
+              f"sc_epidermis_contact_enabled={SC_EPIDERMIS_CONTACT_ENABLED}; "
+              f"sc_epidermis_contact_gap_um={SC_EPIDERMIS_CONTACT_GAP_UM}; "
               f"lateral_clip_frac={LATERAL_CLIP_FRAC}", flush=True)
     labels_dir = out_io / "raw_segmentations"
     post_labels_dir = out_io / "postprocessed_segmentations"

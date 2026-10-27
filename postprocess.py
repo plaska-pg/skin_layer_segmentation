@@ -13,7 +13,8 @@ Pipeline:
   4. keep only SC/Epidermal pixels inside the union of ROI boxes (full frame
       if none detected) and outside the bottom follicle_mask_frac of each
       follicle box (cut parallel to the box's top edge)
-  5. per-class elliptical opening then closing (sc_/epidermal_/gland_erod_dil_kernel_size_um)
+  5. per-class elliptical opening then closing (sc_/epidermal_/gland_erod_dil_kernel_size_um),
+      then drop SC/Epidermal components not within sc_epidermis_contact_gap_um of the other class
   6. measure each class - see measurement.py (perpendicular-to-tangent
       thickness on smoothed boundary curves, tortuosity)
   7. render a labeled composite: Original | Raw Prediction | Rotated
@@ -49,6 +50,8 @@ _PP_CFG = CONFIG.get("postprocess", {})
 SC_ERODE_DILATE_UM = _PP_CFG.get("sc_erod_dil_kernel_size_um", 5.0)
 EPIDERMAL_ERODE_DILATE_UM = _PP_CFG.get("epidermal_erod_dil_kernel_size_um", 10.0)
 GLAND_ERODE_DILATE_UM = _PP_CFG.get("gland_erod_dil_kernel_size_um", 0.0)
+SC_EPIDERMIS_CONTACT_ENABLED = _PP_CFG.get("sc_epidermis_contact_enabled", True)
+SC_EPIDERMIS_CONTACT_GAP_UM = _PP_CFG.get("sc_epidermis_contact_gap_um", 5.0)
 LATERAL_CLIP_FRAC = _PP_CFG.get("lateral_clip_frac", 0.10)  # fraction of the rotated ROI's horizontal extent trimmed per side
 ROTATION_WEIGHTS = _PP_CFG.get("rotation_weights", "runs/rotation/rotate_model.pt")
 ROTATION_DEVICE = _PP_CFG.get("rotation_device", "auto")
@@ -121,6 +124,22 @@ def erode_dilate(mask: np.ndarray, size_px: int) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size_px, size_px))
     out = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
     return cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel).astype(bool)
+
+
+def keep_touching_components(sc: np.ndarray, gl: np.ndarray, gap_px: int):
+    """Keeps only SC components within gap_px of Epidermis, and vice versa (8-connected)."""
+    if not sc.any() or not gl.any():
+        return sc, gl
+    size = 2 * max(int(gap_px), 0) + 3
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+    def _filter(mask, other):
+        near = cv2.dilate(other.astype(np.uint8), kernel).astype(bool)
+        _, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+        hit = np.unique(labels[near & mask])
+        return np.isin(labels, hit[hit > 0])
+
+    return _filter(sc, gl), _filter(gl, sc)
 
 
 # ----------------------------------------------------------------------------
@@ -435,6 +454,8 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     gl_kernel_um = settings.get("epidermal_erod_dil_kernel_size_um", EPIDERMAL_ERODE_DILATE_UM)
     gland_kernel_um = settings.get("gland_erod_dil_kernel_size_um", GLAND_ERODE_DILATE_UM)
     lateral_clip_frac = settings.get("lateral_clip_frac", LATERAL_CLIP_FRAC)
+    contact_enabled = settings.get("sc_epidermis_contact_enabled", SC_EPIDERMIS_CONTACT_ENABLED)
+    contact_gap_um = settings.get("sc_epidermis_contact_gap_um", SC_EPIDERMIS_CONTACT_GAP_UM)
     follicle_enabled = settings.get("follicle_enabled", FOLLICLE_ENABLED)
     follicle_padding_um = settings.get("follicle_padding_um", FOLLICLE_PADDING_UM)
     follicle_mask_frac = settings.get("follicle_mask_frac", FOLLICLE_MASK_FRAC)
@@ -506,6 +527,8 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     # re-mask after morphology so closing can't reintroduce pixels outside ROI / inside follicles
     rot_sc = erode_dilate(rot_sc_full & keep, kernel_px(sc_kernel_um, um_per_px)) & keep
     rot_gl = erode_dilate(rot_gl_full & keep, kernel_px(gl_kernel_um, um_per_px)) & keep
+    if contact_enabled:
+        rot_sc, rot_gl = keep_touching_components(rot_sc, rot_gl, round(contact_gap_um / um_per_px))
     if not rot_sc.any() or not rot_gl.any():
         print(f"SKIP {stem}: SC or Epidermis empty after ROI/follicle masking", flush=True)
         return (None, None) if return_visuals else None
