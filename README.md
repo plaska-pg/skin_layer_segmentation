@@ -119,8 +119,6 @@ adding more training examples as corrected pseudolabels
 ```
 python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
 
-python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX_4_25_D6_TIFF"
-
 
 ```
 .\.venv\Scripts\python.exe -u pretrained_model\3cls_hist_seg\train_semseg.py train `
@@ -137,3 +135,5 @@ Loads each image with its `predicted_MDE-TIFF\raw_segmentations` labels (`--labe
 
 
 quality scoring model? 
+
+

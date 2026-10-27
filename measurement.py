@@ -2,8 +2,7 @@
 """
 measure.py -- all SC/Epidermal measurement logic: per-class height
 stats (orientation-independent thickness via distance-transform + skeleton),
-Epidermal boundary tortuosity, per-class hole count (number of enclosed
-holes), and the Measurement panel image. postprocess.py calls
+Epidermal boundary tortuosity, and the Measurement panel image. postprocess.py calls
 measure_layers() as its single entry point into this module.
 
 
@@ -25,7 +24,7 @@ spine skeleton (skeleton_spine, per connected component, longest geodesic
 path through the skeleton, summed across components). layer_sides() still
 splits each layer's boundary into an SC-Epidermal_boundary side and a free-surface
 / dermal side, purely so the Measurement panel can draw those reference
-lines; only area, mean height, tortuosity, and hole count are reported.
+lines; only area, mean height, and tortuosity are reported.
 
 
 skeleton_spine is reused by _centerline_length_px for the mean-height
@@ -37,7 +36,6 @@ Area/Length denominator.
 
 import cv2
 import numpy as np
-from scipy.ndimage import binary_fill_holes
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.spatial import cKDTree
@@ -81,7 +79,7 @@ CSV_COLUMNS = [
    "SC mean height", "SC area",
    "Epidermal mean height", "Epidermal area",
    "EDJ tortuosity",
-    "SC_hole_num", "Epidermal_hole_num",
+    "quality",
     "num_glands", "total_sebocyte_um2", "total_tissue_um2",
 ]
 
@@ -449,17 +447,6 @@ def epidermis_tortuosity(edj_runs) -> float:
 
 
 
-def class_hole_count(mask: np.ndarray) -> int:
-   """Number of fully-enclosed holes in a layer - background regions trapped
-   inside the mask. Counted on the raw mask (no hole-filling) so segmentation
-   gaps are not hidden."""
-   if not mask.any():
-       return 0
-   m = mask.astype(bool)
-   holes = binary_fill_holes(m) & ~m
-   return int(label(holes, connectivity=1).max())
-
-
 def gland_stats(gland_mask: np.ndarray, um_per_px: float):
     """(number of glands, mean gland area, total gland area) in um^2."""
     n = int(label(gland_mask.astype(bool), connectivity=2).max())
@@ -587,7 +574,7 @@ def _fit_rows(mask: np.ndarray, h: int) -> np.ndarray:
 
 
 def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
-                           gl_tortuosity, sc_holes, gl_holes, um_per_px: float, sides=None,
+                           gl_tortuosity, um_per_px: float, sides=None,
                            spines: dict = None, gland_mask: np.ndarray = None,
                            gland_summary: tuple = None) -> np.ndarray:
    h_img = rotated_img.shape[0]
@@ -613,10 +600,10 @@ def draw_measurement_panel(rotated_img, sc_mask, gl_mask, sc_stats, gl_stats,
    if unit == "um":
        draw_scale_bar(vis, um_per_px)
 
-   def _fmt(name, stats, holes):
-       return f"{name}: mean height {stats['mean_height']:.1f} {unit}  area {stats['area']:.0f} {unit}  holes {holes}"
+   def _fmt(name, stats):
+       return f"{name}: mean height {stats['mean_height']:.1f} {unit}  area {stats['area']:.0f} {unit}"
 
-   lines = [_fmt("SC", sc_stats, sc_holes), _fmt("Epidermal", gl_stats, gl_holes)]
+   lines = [_fmt("SC", sc_stats), _fmt("Epidermal", gl_stats)]
    if gland_summary is not None:
        lines.append(f"Glands (green): {gland_summary[0]}  mean size {gland_summary[1]:.0f} {unit}^2")
    lines.append(f"EDJ tortuosity {gl_tortuosity:.2f}    "
@@ -718,7 +705,7 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     it may be taller than the masks (e.g. the uncropped frame) - they are zero-padded.
     `cut_mask` marks artificial cuts (ROI/follicle/lateral trim) excluded from the EDJ.
     Returns (row_dict, measurement_panel_image, spine_cache) - row_dict has every
-    CSV_COLUMNS key EXCEPT 'folder name'/'file name' (postprocess.py adds those);
+    CSV_COLUMNS key EXCEPT 'folder name'/'file name'/'quality' (postprocess.py adds those);
     spine_cache = {'spines': {...}, 'lengths_px': {...}, 'edj': mask} so a caller can draw the
     spine panel without recomputing the (expensive) skeleton/spine."""
     sc_bin, gl_bin = sc_mask.astype(bool), gl_mask.astype(bool)
@@ -738,12 +725,10 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
     sc_stats = layer_stats(sc_clean, um_per_px, centerline_px=sc_len)
     gl_stats = layer_stats(gl_clean, um_per_px, centerline_px=gl_len)
     gl_tortuosity = epidermis_tortuosity(sides["edj_runs"])
-    sc_holes = class_hole_count(sc_bin)   # on the original masks: hole-filling must not hide defects
-    gl_holes = class_hole_count(gl_bin)
     gland_summary = gland_stats(gland_mask, um_per_px) if gland_mask is not None else None
 
     panel = draw_measurement_panel(rotated_img if panel_img is None else panel_img, sc_clean, gl_clean,
-                                   sc_stats, gl_stats, gl_tortuosity, sc_holes, gl_holes, um_per_px, sides,
+                                   sc_stats, gl_stats, gl_tortuosity, um_per_px, sides,
                                    spines={"SC": sc_spine, "Epidermal": gl_spine},
                                    gland_mask=gland_mask, gland_summary=gland_summary)
 
@@ -752,8 +737,6 @@ def measure_layers(rotated_img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.nda
         row[f"{prefix} mean height"] = round(stats["mean_height"], 2)
         row[f"{prefix} area"] = round(stats["area"], 2)
     row["EDJ tortuosity"] = round(gl_tortuosity, 2)
-    row["SC_hole_num"] = sc_holes
-    row["Epidermal_hole_num"] = gl_holes
     if gland_summary is not None:
         row["num_glands"] = gland_summary[0]
         row["total_sebocyte_um2"] = round(gland_summary[2], 2)

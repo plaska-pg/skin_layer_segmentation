@@ -7,20 +7,24 @@ Pipeline:
   1. rotate the full image and prediction mask in 90-degree steps using the
       trained orientation classifier (see rotate.py)
   2. detect follicles (YOLO-OBB) on the rotated image
-  3. detect ROI boxes (YOLO-OBB roi_det) on the rotated image
+  3. detect ROI boxes (YOLO-OBB roi_det) on the rotated image and score
+      quality_sections even sections of each with the train_qual.py model
+      (CSV 'quality' = mean section score, 1 worst - 3 best)
   4. keep only SC/Epidermal pixels inside the union of ROI boxes (full frame
       if none detected) and outside the bottom follicle_mask_frac of each
       follicle box (cut parallel to the box's top edge)
   5. per-class elliptical opening then closing (sc_/epidermal_/gland_erod_dil_kernel_size_um)
   6. measure each class - see measurement.py (perpendicular-to-tangent
-      thickness on smoothed boundary curves, tortuosity, hole count)
+      thickness on smoothed boundary curves, tortuosity)
   7. render a labeled composite: Original | Raw Prediction | Rotated
-      Prediction | Follicles | ROI Boxes | ROI (masked + morph) |
+      Prediction | Follicles | ROI Boxes | Quality | ROI (masked + morph) |
       Epidermal Midline | Height Spine
 
 Gland predictions are rotated and smoothed - never ROI/follicle masked or clipped.
 """
 
+import os
+import sys
 import threading
 from pathlib import Path
 
@@ -32,6 +36,10 @@ from config import CONFIG
 from measurement import (CSV_COLUMNS, _file_date, _layer_spine, draw_gl_midline_panel, draw_spine_panel,
                          measure_layers, overlay, tissue_area_um2)
 from rotate import build_model, pick_device, predict_orientation, rotate_k
+
+sys.path.append(str(Path(__file__).resolve().parent / "pretrained_model"))
+from annotate_boxes import ROI_CLASS, even_sections, section_quad  # noqa: E402
+from train_qual import load_model, mode_of, predict_tiles, prepare, score_color, warp_section  # noqa: E402
 
 # um, not raw px: native pixel size varies with scan resolution (e.g. 0.26 vs
 # 0.645 um/px), so a fixed px count means a different physical distance on
@@ -58,6 +66,10 @@ ROI_DEVICE = _PP_CFG.get("roi_device", "auto")
 ROI_CONF = _PP_CFG.get("roi_conf", 0.25)
 ROI_MAX_SIDE = _PP_CFG.get("roi_max_side", 1024)
 ROI_IMGSZ = _PP_CFG.get("roi_imgsz", 1024)
+QUALITY_ENABLED = _PP_CFG.get("quality_enabled", True)
+QUALITY_WEIGHTS = _PP_CFG.get("quality_weights", "models/qual_v1.pt")
+QUALITY_DEVICE = _PP_CFG.get("quality_device", "auto")
+QUALITY_SECTIONS = _PP_CFG.get("quality_sections", 5)
 
 
 def lateral_clip_window(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LATERAL_CLIP_FRAC):
@@ -255,6 +267,73 @@ def draw_obb_panel(img: np.ndarray, boxes, shaded: np.ndarray = None, color=(0, 
 
 
 # ----------------------------------------------------------------------------
+# section quality (pretrained_model/train_qual.py)
+# ----------------------------------------------------------------------------
+
+_quality_model_cache = {}
+_quality_lock = threading.Lock()
+
+
+def _get_quality_model(weights_path: str, device_str: str):
+    """Lazily loads+caches the section quality model; (model, ckpt, device) or
+    None (warning printed once) if the weights are missing."""
+    key = (weights_path, device_str)
+    if key not in _quality_model_cache:
+        loaded = None
+        if not Path(weights_path).exists():
+            print(f"WARNING: quality weights not found at {weights_path}; skipping quality scoring", flush=True)
+        else:
+            device = pick_device(device_str)
+            model, ckpt = load_model(weights_path, device)
+            loaded = (model, ckpt, device)
+        _quality_model_cache[key] = loaded
+    return _quality_model_cache[key]
+
+
+def score_sections(img_bgr: np.ndarray, rois, n_sections: int, weights_path: str, device_str: str):
+    """Splits each ROI quad into n_sections even sections along its long axis and
+    scores each (expected rating, 1 worst - 3 best). Returns (scores, quads) with
+    quads in img_bgr's pixel coordinates, or None if no quality model is available."""
+    with _quality_lock:
+        loaded = _get_quality_model(weights_path, device_str)
+        if loaded is None:
+            return None
+        model, ckpt, device = loaded
+        # same downscale as annotate_boxes.load_scaled, which built the training crops
+        h, w = img_bgr.shape[:2]
+        f = min(1.0, ckpt["max_side"] / max(h, w))
+        small = cv2.resize(img_bgr, (round(w * f), round(h * f)), interpolation=cv2.INTER_AREA) if f < 1 else img_bgr
+        src = prepare(small, mode_of(ckpt))
+        cuts = even_sections(n_sections)["cuts"]
+        quads = [section_quad([ROI_CLASS, *np.asarray(quad, np.float32).ravel()], cuts[k], cuts[k + 1])
+                 for quad, _ in rois for k in range(n_sections)]
+        tiles = [warp_section(src, q * f, ckpt["imgsz"], letterbox=ckpt.get("letterbox", True)) for q in quads]
+        scores, _, _ = predict_tiles(model, tiles, device)
+    return scores, quads
+
+
+def draw_quality_panel(img: np.ndarray, scores, quads) -> np.ndarray:
+    """Sections filled red (1) -> yellow (2) -> green (3) by score, outlined and labelled."""
+    fill = img.copy()
+    for s, q in zip(scores, quads):
+        cv2.fillPoly(fill, [np.round(q).astype(np.int32).reshape(-1, 1, 2)], score_color(s))
+    panel = cv2.addWeighted(fill, 0.35, img, 0.65, 0)
+    # composite downsizes panels to ~480px tall, so scale strokes to survive that
+    sc = max(1.0, max(panel.shape[:2]) / 1000)
+    thickness, font_scale = max(2, int(round(2 * sc))), 0.6 * sc
+    for s, q in zip(scores, quads):
+        pts = np.round(q).astype(np.int32)
+        cv2.polylines(panel, [pts.reshape(-1, 1, 2)], True, (40, 40, 40), thickness, cv2.LINE_AA)
+        label = f"{s:.1f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        cx, cy = pts.mean(axis=0)
+        org = (int(cx) - tw // 2, int(cy) + th // 2)
+        cv2.putText(panel, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(panel, label, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return panel
+
+
+# ----------------------------------------------------------------------------
 # visualisation
 # ----------------------------------------------------------------------------
 
@@ -317,6 +396,26 @@ def write_yolo_labels(pred_mask: np.ndarray, class_index: dict, out_path: Path, 
     out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
+def long_path(p) -> Path:
+    """Extended-length (\\\\?\\) form of p on Windows so paths over MAX_PATH (260) still open."""
+    if os.name != "nt":
+        return Path(p)
+    s = os.path.abspath(str(p))  # not resolve(): don't follow OneDrive shortcut reparse points
+    if s.startswith("\\\\?\\"):
+        return Path(s)
+    if s.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + s[2:])
+    return Path("\\\\?\\" + s)
+
+
+def imwrite_jpg(path, img: np.ndarray, quality: int) -> None:
+    """cv2.imwrite can't open long or \\\\?\\ paths, so encode in memory and write via Python."""
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise RuntimeError(f"could not encode {path}")
+    Path(path).write_bytes(buf.tobytes())
+
+
 # ----------------------------------------------------------------------------
 # orchestration
 # ----------------------------------------------------------------------------
@@ -340,6 +439,7 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     follicle_padding_um = settings.get("follicle_padding_um", FOLLICLE_PADDING_UM)
     follicle_mask_frac = settings.get("follicle_mask_frac", FOLLICLE_MASK_FRAC)
     roi_enabled = settings.get("roi_enabled", ROI_ENABLED)
+    quality_enabled = settings.get("quality_enabled", QUALITY_ENABLED)
 
     sc_id = class_index["SC"]
     # 'Epidermal' / 'Granular Layer' are the names used by older checkpoints
@@ -385,6 +485,16 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
             imgsz=settings.get("roi_imgsz", ROI_IMGSZ), name="ROI")
     roi_panels = [] if rois is None else [
         (f"ROI Boxes ({len(rois)})", draw_obb_panel(rotated_overlay, rois, color=(255, 0, 255)))]
+    quality = ""
+    if rois and quality_enabled:
+        scored = score_sections(
+            rot_img, rois,
+            n_sections=settings.get("quality_sections", QUALITY_SECTIONS),
+            weights_path=settings.get("quality_weights", QUALITY_WEIGHTS),
+            device_str=settings.get("quality_device", QUALITY_DEVICE))
+        if scored is not None:
+            quality = round(float(np.mean(scored[0])), 3)
+            roi_panels.append((f"Quality ({quality:.2f})", draw_quality_panel(rot_img, *scored)))
     if rois:
         keep = roi_mask(rot_img.shape, rois)
     else:
@@ -440,9 +550,8 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     out_dir = Path(out_dir)
     if write_outputs:
         out_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_dir / f"{stem}_measurement.jpg"), measurement_panel,
-                    [cv2.IMWRITE_JPEG_QUALITY, 90])
-        cv2.imwrite(str(out_dir / f"{stem}_steps.jpg"), composite, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        imwrite_jpg(out_dir / f"{stem}_measurement.jpg", measurement_panel, 90)
+        imwrite_jpg(out_dir / f"{stem}_steps.jpg", composite, 90)
     if write_outputs and seg_path is not None:
         post_mask = np.zeros(rot_img.shape[:2], dtype=pred_mask.dtype)
         if gland_id is not None:
@@ -453,6 +562,6 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         seg_path.parent.mkdir(parents=True, exist_ok=True)
         write_yolo_labels(rotate_k(post_mask, -k), class_index, seg_path)
 
-    row = {"folder name": folder_name, "file name": stem, **row_extra,
+    row = {"folder name": folder_name, "file name": stem, **row_extra, "quality": quality,
            "total_tissue_um2": round(tissue_area_um2(orig_bgr, um_per_px), 2)}
     return (row, composite) if return_visuals else row
