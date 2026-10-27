@@ -37,7 +37,9 @@ from train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
 from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
 from postprocess import (EPIDERMAL_ERODE_DILATE_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
                          FOLLICLE_PADDING_UM, FOLLICLE_WEIGHTS, GLAND_ERODE_DILATE_UM, LATERAL_CLIP_FRAC, ROI_CONF, ROI_ENABLED, ROI_WEIGHTS,
-                         SC_ERODE_DILATE_UM, overlay, process_image, write_yolo_labels)  # noqa: E402
+                         QUALITY_ENABLED, QUALITY_SECTIONS, QUALITY_WEIGHTS,
+                         SC_ERODE_DILATE_UM, imwrite_jpg, long_path, overlay, process_image,
+                         write_yolo_labels)  # noqa: E402
 from measurement import CSV_COLUMNS, _rasterise  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs"}  # .svs (Aperio) is TIFF-based - cv2 reads its
@@ -86,6 +88,9 @@ def write_run_config(path: Path, args, src: Path, out: Path, device, names, file
             "roi_enabled": ROI_ENABLED,
             "roi_weights": str(Path(ROI_WEIGHTS).resolve()),
             "roi_conf": ROI_CONF,
+            "quality_enabled": QUALITY_ENABLED,
+            "quality_weights": str(Path(QUALITY_WEIGHTS).resolve()),
+            "quality_sections": QUALITY_SECTIONS,
             "input_files": [
                 {
                     "file": p.name,
@@ -246,17 +251,19 @@ def main():
         files = sorted(p for p in src.iterdir() if p.suffix.lower() in IMAGE_EXTS)
         default_out = src / f"predicted_{src.name}"
     out = Path(args.out) if args.out else default_out
-    out.mkdir(parents=True, exist_ok=True)
+    out_io = long_path(out)
+    out_io.mkdir(parents=True, exist_ok=True)
     if not args.no_postprocess:
         print("postprocess hyperparameters: "
               f"roi_enabled={ROI_ENABLED}; roi_conf={ROI_CONF}; "
+              f"quality_enabled={QUALITY_ENABLED}; quality_sections={QUALITY_SECTIONS}; "
               f"follicle_enabled={FOLLICLE_ENABLED}; follicle_mask_frac={FOLLICLE_MASK_FRAC}; "
               f"sc_erod_dil_kernel_size_um={SC_ERODE_DILATE_UM}; "
               f"epidermal_erod_dil_kernel_size_um={EPIDERMAL_ERODE_DILATE_UM}; "
               f"gland_erod_dil_kernel_size_um={GLAND_ERODE_DILATE_UM}; "
               f"lateral_clip_frac={LATERAL_CLIP_FRAC}", flush=True)
-    labels_dir = out / "raw_segmentations"
-    post_labels_dir = out / "postprocessed_segmentations"
+    labels_dir = out_io / "raw_segmentations"
+    post_labels_dir = out_io / "postprocessed_segmentations"
     if not args.no_labels:
         labels_dir.mkdir(parents=True, exist_ok=True)
         if not args.no_postprocess:
@@ -267,18 +274,19 @@ def main():
         files = files[:args.limit]
     effective_mpp = {p.name: svs_mpp(p) or args.um_per_px for p in files}
     run_config_path = out / "run_config.yaml"
-    write_run_config(run_config_path, args, src, out, device, names, files, effective_mpp)
+    write_run_config(long_path(run_config_path), args, src, out, device, names, files, effective_mpp)
     print(f"Wrote run configuration to {run_config_path}", flush=True)
 
     csv_path = Path(args.csv_out) if args.csv_out else out / "_results.csv"
+    csv_io = long_path(csv_path)
     prior_rows = {}
-    if args.resume and csv_path.exists():
-        with csv_path.open(newline="") as f:
+    if args.resume and csv_io.exists():
+        with csv_io.open(newline="") as f:
             prior_rows = {r["file name"]: r for r in csv.DictReader(f)}
 
     rows = []
     # prior rows are already in memory, so it's safe to truncate the CSV and rewrite it row by row
-    csv_file = csv_path.open("w", newline="")
+    csv_file = csv_io.open("w", newline="")
     writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     csv_file.flush()
@@ -301,7 +309,7 @@ def main():
         label_path = labels_dir / f"{p.stem}.txt"
         post_label_path = None if args.no_labels else post_labels_dir / f"{p.stem}.txt"
         if args.resume:
-            if args.no_postprocess and (out / f"{p.stem}_overlay.jpg").exists():
+            if args.no_postprocess and (out_io / f"{p.stem}_overlay.jpg").exists():
                 print(f"[{i}/{len(files)}] {p.name}: overlay already exists, skipping", flush=True)
                 continue
             if not args.no_postprocess and p.stem in prior_rows:
@@ -332,13 +340,13 @@ def main():
 
         if args.no_postprocess:
             masks = {n: pred_mask == (k + 1) for k, n in enumerate(names)}
-            cv2.imwrite(str(out / f"{p.stem}_overlay.jpg"), overlay(orig_bgr, masks), [cv2.IMWRITE_JPEG_QUALITY, 85])
+            imwrite_jpg(out_io / f"{p.stem}_overlay.jpg", overlay(orig_bgr, masks), 85)
             print(f"{p.name}: wrote raw overlay", flush=True)
             continue
 
         if executor is None:
             row = process_image(p.stem, src.name, orig_bgr, pred_mask, class_index,
-                                 um_per_px or 1.0, out, source_path=p, seg_path=post_label_path)
+                                 um_per_px or 1.0, out_io, source_path=p, seg_path=post_label_path)
             _collect(p.name, row)
             continue
 
@@ -347,7 +355,7 @@ def main():
             for fut in done:
                 _collect(pending.pop(fut), fut.result())
         fut = executor.submit(process_image, p.stem, src.name, orig_bgr, pred_mask, class_index,
-                               um_per_px or 1.0, out, source_path=p, seg_path=post_label_path)
+                               um_per_px or 1.0, out_io, source_path=p, seg_path=post_label_path)
         pending[fut] = p.name
 
     if pending:

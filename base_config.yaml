@@ -33,9 +33,13 @@ postprocess:
   roi_enabled: true                     # YOLO-OBB ROI detector; SC/Epidermis outside the union of its boxes is removed (full frame if none detected)
   roi_weights: models/roi_det_v2.pt
   roi_device: auto
-  roi_conf: 0.25
+  roi_conf: 0.3
   roi_max_side: 1024   # must match training (pretrained_model/ROI/yolo_det/data.yaml)
   roi_imgsz: 1024
+  quality_enabled: true     # score ROI sections (1 worst - 3 best) with the train_qual.py model; CSV 'quality' = mean section score
+  quality_weights: models/qual_v1.pt
+  quality_device: auto
+  quality_sections: 5       # even sections per ROI box (pipeline.yaml eval.sections)
 
 measurement:
   skeleton_method: lee   # 'zhang' (skimage's 2D default) or 'lee'

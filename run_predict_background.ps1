@@ -22,7 +22,8 @@ $ImageExtensions = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs")
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
-$SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF")
+# $SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF")
+$SourceDirs = @("C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S-EXP_Clobertasol_Pre-Treatment_03_25_D4_TIFF")
 
 $ExistingJobs = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
   Where-Object { $_.CommandLine -match '(?i)predict\.py' })

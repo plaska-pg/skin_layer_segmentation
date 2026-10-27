@@ -69,6 +69,10 @@ def list_images(folder: Path) -> list[Path]:
 
 
 def load_preview(path: Path) -> Image.Image:
+    if os.name == "nt":  # extended-length prefix so QA jpgs past MAX_PATH (260 chars) still open
+        s = os.path.abspath(str(path))
+        if not s.startswith("\\\\?\\"):
+            path = Path("\\\\?\\UNC\\" + s[2:] if s.startswith("\\\\") else "\\\\?\\" + s)
     with Image.open(path) as im:
         im.draft("RGB", (PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE))  # fast JPEG downscale on decode
         im = im.convert("RGB")
