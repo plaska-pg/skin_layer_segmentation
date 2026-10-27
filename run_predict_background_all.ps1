@@ -18,8 +18,6 @@ $RawImagesRoot = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Che
 $LogDir     = Join-Path $ProjectDir "runs\background_logs"
 $Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
 $Log        = Join-Path $LogDir "raw_images_all_$Timestamp.log"
-$MaxSide    = 3500  # caps the GPU input's longest edge - D5's ~13000px whole-slide images otherwise risk
-                     # CUDA out-of-memory on this machine's 4GB GPU; see predict.py --max-side
 $ImageExtensions = @(".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs")
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -53,7 +51,7 @@ $Commands = foreach ($SourceDir in $SourceDirs) {
   @"
 echo.>> "$Log"
 echo ===== %date% %time% - $Source ===== >> "$Log"
-"$Python" -u predict.py --source "$Source" --max-side $MaxSide --resume>> "$Log" 2>&1
+"$Python" -u predict.py --source "$Source" --resume>> "$Log" 2>&1
 echo [%date% %time%] Exit code: %errorlevel% >> "$Log"
 "@
 }

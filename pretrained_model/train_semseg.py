@@ -134,7 +134,7 @@ class TileDataset(Dataset):
         blur_p / downup_p / jpeg_p: per-sample probabilities of the resolution-degradation
         augmentations (see _degrade)."""
         img_dir = data_dir / "images" / split
-        self.images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png") for p in img_dir.glob(ext))
+        self.images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.tif", "*.tiff") for p in img_dir.glob(ext))
         self.labels = data_dir / "labels" / split
         self.crop, self.augment, self.downsample = crop, augment, downsample
         self.scale_aug, self.blur_p, self.downup_p, self.jpeg_p = tuple(scale_aug), blur_p, downup_p, jpeg_p
