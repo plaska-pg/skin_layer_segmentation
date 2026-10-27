@@ -44,6 +44,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs"}  # .svs (Aperio)
 # full-resolution page directly, ignoring the pyramid/thumbnail sub-IFDs and Aperio-specific tags
 
 _MPP_RE = re.compile(r"MPP\s*=\s*([\d.]+)")
+TILE_OVERLAP = 0.25
 _PREDICT_CFG = CONFIG.get("predict", {})
 _ORIGINAL_PRINT = builtins.print
 
@@ -116,42 +117,51 @@ def svs_mpp(path: Path):
 
 
 @torch.no_grad()
-def predict_mask(model, orig_bgr: np.ndarray, device, scale: float, max_side: int = None) -> np.ndarray:
-    """Class-index mask (0=bg, 1..N=names), at the ORIGINAL image's own
-    resolution - scale is only used to normalise the model's input to its
-    training resolution, not to change what gets returned. max_side (if
-    given) additionally caps the longest edge fed to the model on top of
-    that, purely to bound GPU memory on very large slides - the mask is
-    still resized back to the image's own full resolution afterward, so
-    measurement precision is unaffected; only the segmentation's own input
-    detail gets coarser."""
-    oh, ow = orig_bgr.shape[:2]
-    th, tw = (round(oh * scale), round(ow * scale)) if scale != 1.0 else (oh, ow)
-    if max_side and max(th, tw) > max_side:
-        extra = max_side / max(th, tw)
-        th, tw = round(th * extra), round(tw * extra)
-    resized = (th, tw) != (oh, ow)
-    bgr = cv2.resize(orig_bgr, (max(1, tw), max(1, th)),
-                      interpolation=cv2.INTER_AREA if (tw < ow or th < oh) else cv2.INTER_LINEAR) \
-        if resized else orig_bgr
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+def _tiled_argmax(model, rgb: np.ndarray, device, tile: int, overlap: float = TILE_OVERLAP) -> np.ndarray:
+    """Class indices (H, W) from overlapping tiles; each tile keeps only its centre
+    (plus image-border edges), so every pixel is predicted with surrounding context."""
     h, w = rgb.shape[:2]
-    ph, pw = (32 - h % 32) % 32, (32 - w % 32) % 32  # pad to a multiple of 32 for the encoder strides
-    rgb_p = cv2.copyMakeBorder(rgb, 0, ph, 0, pw, cv2.BORDER_REFLECT)
-    x = torch.from_numpy(((rgb_p.astype(np.float32) / 255 - MEAN) / STD).transpose(2, 0, 1))[None].to(device)
-    pred = model(x).argmax(1)[0].cpu().numpy().astype(np.uint8)[:h, :w]
+    m = int(tile * overlap / 2)
+    stride = tile - 2 * m
+    ys = sorted(set(range(0, max(1, h - tile), stride)) | {max(0, h - tile)})
+    xs = sorted(set(range(0, max(1, w - tile), stride)) | {max(0, w - tile)})
+    pred = np.zeros((h, w), np.uint8)
+    for y0 in ys:
+        for x0 in xs:
+            patch = rgb[y0:y0 + tile, x0:x0 + tile]
+            ph, pw = patch.shape[:2]
+            patch = cv2.copyMakeBorder(patch, 0, (32 - ph % 32) % 32, 0, (32 - pw % 32) % 32, cv2.BORDER_REFLECT)
+            x = torch.from_numpy(((patch.astype(np.float32) / 255 - MEAN) / STD).transpose(2, 0, 1))[None].to(device)
+            p = model(x).argmax(1)[0, :ph, :pw].cpu().numpy().astype(np.uint8)
+            ty0, tx0 = (m if y0 > 0 else 0), (m if x0 > 0 else 0)
+            ty1, tx1 = (ph - m if y0 + ph < h else ph), (pw - m if x0 + pw < w else pw)
+            pred[y0 + ty0:y0 + ty1, x0 + tx0:x0 + tx1] = p[ty0:ty1, tx0:tx1]
+    return pred
+
+
+def predict_mask(model, orig_bgr: np.ndarray, device, scale: float, tile: int = 1024) -> np.ndarray:
+    """Class-index mask (0=bg, 1..N=names), at the ORIGINAL image's own
+    resolution. The input is resized by `scale` to the model's training um/px
+    and run as overlapping `tile` px tiles, so GPU memory stays bounded without
+    ever downscaling a large slide below the training resolution."""
+    oh, ow = orig_bgr.shape[:2]
+    th, tw = (max(1, round(oh * scale)), max(1, round(ow * scale))) if scale != 1.0 else (oh, ow)
+    resized = (th, tw) != (oh, ow)
+    bgr = cv2.resize(orig_bgr, (tw, th), interpolation=cv2.INTER_AREA if (tw < ow or th < oh) else cv2.INTER_LINEAR) \
+        if resized else orig_bgr
+    pred = _tiled_argmax(model, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), device, tile)
     if resized:
         pred = cv2.resize(pred, (ow, oh), interpolation=cv2.INTER_NEAREST)
     return pred
 
 
 def predict_mask_safe(model, orig_bgr: np.ndarray, device, scale: float, name: str = "",
-                      max_side: int = None) -> np.ndarray:
+                      tile: int = 1024) -> np.ndarray:
     """predict_mask, falling back to CPU (moving the model there and back) on a CUDA
     out-of-memory error - whole-slide images vary enough in size that one image fitting
     on a small GPU (e.g. 4GB) doesn't guarantee the next one will."""
     try:
-        return predict_mask(model, orig_bgr, device, scale, max_side)
+        return predict_mask(model, orig_bgr, device, scale, tile)
     except (torch.OutOfMemoryError, torch.AcceleratorError) as e:
         if device.type != "cuda":
             raise
@@ -159,7 +169,7 @@ def predict_mask_safe(model, orig_bgr: np.ndarray, device, scale: float, name: s
         torch.cuda.empty_cache()
         model.to("cpu")
         try:
-            return predict_mask(model, orig_bgr, torch.device("cpu"), scale, max_side)
+            return predict_mask(model, orig_bgr, torch.device("cpu"), scale, tile)
         finally:
             model.to(device)
             torch.cuda.empty_cache()
@@ -192,12 +202,9 @@ def main():
                           "For .svs files, the scanner's own embedded MPP tag is used instead when present.")
     ap.add_argument("--reference-um-per-px", type=float, default=_PREDICT_CFG.get("reference_um_per_px", 0.645),
                      help="um/px the model was trained at (default matches dataset/scale_calibration.json)")
-    ap.add_argument("--max-side", type=int, default=_PREDICT_CFG.get("max_side", None),
-                     help="cap the longest edge fed to the model to at most this many px, on top of the "
-                          "--um-per-px normalisation - bounds GPU memory on very large slides. Masks are "
-                          "resized back to the image's full native resolution before measuring, so this only "
-                          "coarsens the segmentation's own input detail, not measurement precision. Try e.g. "
-                          "3000 if you hit CUDA out-of-memory errors.")
+    ap.add_argument("--tile", type=int, default=_PREDICT_CFG.get("tile", 1024),
+                     help="tile size (px, at the training um/px) for sliding-window inference; bounds GPU "
+                          "memory without downscaling. Lower it (e.g. 768) if you hit CUDA out-of-memory errors.")
     ap.add_argument("--no-postprocess", action="store_true",
                      help="skip close/ROI/rotate/measure - just write raw prediction overlays")
     ap.add_argument("--no-labels", action="store_true",
@@ -317,7 +324,7 @@ def main():
         else:
             print(f"[{i}/{len(files)}] {p.name}: running inference ({orig_bgr.shape[1]}x{orig_bgr.shape[0]})...",
                   flush=True)
-            pred_mask = predict_mask_safe(model, orig_bgr, device, scale, name=p.name, max_side=args.max_side)
+            pred_mask = predict_mask_safe(model, orig_bgr, device, scale, name=p.name, tile=args.tile)
             if device.type == "cuda":
                 torch.cuda.empty_cache()  # defragment cache between images so one large image doesn't starve the next
             if not args.no_labels:

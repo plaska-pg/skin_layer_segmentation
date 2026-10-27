@@ -4,12 +4,12 @@
 # --arg overrides passed on the predict.py command line.
 
 predict:
-  weights: models/3cls_best.pt
+  weights: models/3cls_best_v7.pt
   source: inference_images
   device: auto
   um_per_px: 0.2577          # native um/px of --source images (0 disables rescaling) (10x) (0.2577um/px = 40x)
   reference_um_per_px: 0.645  # um/px the model was trained at (10x)
-  max_side: 3500           # cap longest edge fed to the model (GPU memory guard); null = no cap
+  tile: 1024               # sliding-window tile (px at reference_um_per_px); lower if CUDA OOM
   workers: 1
 
 postprocess:
@@ -23,15 +23,15 @@ postprocess:
   rotation_weights: models/rotate_model.pt   # trained orientation classifier (see rotate.py)
   rotation_device: auto
   follicle_enabled: true                     # YOLO-OBB follicle detector on the rotated image (steps panel + follicle masking)
-  follicle_weights: models/follicle_det.pt   # see pretrained_model/train_follicle_det.py
+  follicle_weights: models/follicle_det_v3.pt   # see pretrained_model/train_follicle_det.py
   follicle_device: auto
   follicle_conf: 0.1 # confidence threshold for follicle detection
-  follicle_padding_um: 20    # expand each side of the oriented follicle box by this many um before masking (0 disables)
+  follicle_padding_um: 50    # expand each side of the oriented follicle box by this many um before masking (0 disables)
   follicle_mask_frac: 1.0   #bottom fraction of each follicle box (cut parallel to its top edge) are removed from SC and Epidermis before measurement (0 disables)
   follicle_max_side: 1024   # long side the image is downscaled to before detection; must match training
   follicle_imgsz: 1024
   roi_enabled: true                     # YOLO-OBB ROI detector; SC/Epidermis outside the union of its boxes is removed (full frame if none detected)
-  roi_weights: models/roi_det.pt        # see pretrained_model/train_det.py
+  roi_weights: models/roi_det_v2.pt
   roi_device: auto
   roi_conf: 0.25
   roi_max_side: 1024   # must match training (pretrained_model/ROI/yolo_det/data.yaml)

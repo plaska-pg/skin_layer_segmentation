@@ -7,6 +7,14 @@ add_segmentations.py -- draw SC / Epidermis / gland polygons into the existing Y
     python add_segmentations.py --cls SC                            # start with the SC class active
     python add_segmentations.py --add new_imgs --um-per-px 0.645    # copy new images in first (to --split)
     python add_segmentations.py --add a.png b.png --split val --start a
+    python add_segmentations.py --source MDE-TIFF                   # correct predict.py output, a = accept
+    python add_segmentations.py --source MDE-TIFF --labels postprocessed --preds runs/pred_mde
+
+Import mode (--source): images of --source with a predict.py segmentation in --preds and not yet in
+the dataset are opened with their predicted polygons. Nothing is written to --source / --preds; Accept
+(button / a) copies the image into images/<split>, writes its labels and um_per_px, and moves on.
+Without --split, a subject (name up to the first '.') keeps its split if already in the dataset,
+else ~--val-frac of subjects go to val. Edits of images that were not accepted are discarded.
 
 The active class is filled and editable; the other classes are shown as outlines. Lines of classes
 other than SC / Epidermis / gland are written back unchanged. A class missing from data.yaml names
@@ -14,18 +22,28 @@ is appended on the first save that contains one. An image present in both train 
 same polygons in both label files.
 
 Mouse: left-click = add vertex | left-drag = trace freehand | click first vertex = close polygon
+    (a closed polygon is added to the active class, merged with the active-class polygons it overlaps)
     right/middle-drag = pan | wheel = zoom at cursor | Pan toggle = left-drag to pan
 Edit mode (Edit button / e): left-drag a vertex of any SC / Epidermis / gland polygon to move it,
     left-click an edge to insert a vertex, right-click / Delete / Backspace a vertex to remove it
     (only the active class is editable while other outlines are hidden with h)
+Cut mode (Cut button / c): draw a polygon (click / drag, close as usual) around the part of the
+    active-class polygons to remove; a polygon cut in two becomes two polygons. Cuts must reach a
+    polygon's edge (holes are not supported).
+Nudge mode (Nudge button / m): left-drag pushes the outlines inside the brush circle along with the
+    cursor, strongest at the centre and fading to nothing at the rim (same classes as Edit mode);
+    [ / ] or Ctrl+wheel = brush size. Each drag is one undo step.
 Keys:  1 / 2 / 3 = SC / Epidermis / gland   Tab = next class
-       Enter = close polygon   Esc = cancel polygon / leave Edit mode (else quit)   u / Ctrl+Z = undo
-    g = toggle Pan mode   e = toggle Edit mode   x = delete active-class polygon under cursor
+       Enter = close polygon   Esc = cancel polygon / leave Edit or Cut mode (else quit)   u / Ctrl+Z = undo
+    g = toggle Pan mode   e = toggle Edit mode   c = toggle Cut mode   m = toggle Nudge mode
+    x = delete active-class polygon under cursor
     h = hide/show other outlines   f = fit   + / - = zoom
        n / space / Right = next image   p / Left = previous image   s = save   q = save and quit
+       a = accept (import mode)
 """
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -40,18 +58,21 @@ cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # scanner TIFF
 EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 SPLITS = ("train", "val")
 CLASSES = ("SC", "Epidermis", "gland")
+PRED_ALIASES = {"Granular Layer": "Epidermis"}  # legacy 2-class model name
 CLASS_COLORS = {"SC": (255, 200, 0), "Epidermis": (0, 200, 255), "gland": (0, 255, 0)}
 LAYER_COLORS = [(255, 200, 0), (0, 200, 255), (200, 120, 255), (0, 128, 255)]
 WIN = "add_segmentations"
 HUD = 44
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-BUTTONS = [("Class", "class", 150), ("Pan", "pan", 90), ("Edit", "edit", 90), ("< Prev", "prev", 90),
-           ("Undo", "undo", 90), ("Next >", "next", 90)]
+BUTTONS = [("Class", "class", 140), ("Pan", "pan", 70), ("Edit", "edit", 70), ("Cut", "cut", 70),
+           ("Nudge", "nudge", 90), ("< Prev", "prev", 80), ("Undo", "undo", 70), ("Next >", "next", 80)]
 KEY_LEFT, KEY_RIGHT, KEY_DEL, CTRL_Z, ENTER, TAB, BACKSPACE = 2424832, 2555904, 3014656, 26, 13, 9, 8  # cv2.waitKeyEx codes on Windows
 CLOSE_PX = 10  # display px from the first vertex within which a click/release closes the polygon
 TRACE_PX = 5  # display px between vertices added while left-dragging
 VERTEX_PX = 8  # display px within which a click grabs a vertex in Edit mode
 EDGE_PX = 6  # display px within which a click on an edge inserts a vertex in Edit mode
+MIN_PIECE_PX = 20  # image px^2; smaller fragments left by a cut are dropped
+NUDGE_R, NUDGE_R_MIN, NUDGE_R_MAX = 40, 5, 400  # Nudge brush radius in display px
 
 
 def read_names(data_yaml: Path):
@@ -128,6 +149,57 @@ def list_entries(root: Path):
     return entries
 
 
+def read_run_config(preds: Path):
+    """(class names, {stem: um_per_px}, default um_per_px, reference um_per_px) from predict.py's run_config.yaml."""
+    p = preds / "run_config.yaml"
+    if not p.exists():
+        print(f"warning: {p} not found; assuming classes {list(CLASSES)} and no scale")
+        return list(CLASSES), {}, None, None
+    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    run, params, res = cfg.get("run") or {}, cfg.get("parameters") or {}, cfg.get("resolved") or {}
+    names = [PRED_ALIASES.get(n, n) for n in run.get("model_class_names") or CLASSES]
+    um = {Path(f["file"]).stem: f.get("um_per_px") for f in res.get("input_files") or []}
+    return names, um, params.get("um_per_px"), res.get("reference_um_per_px") or params.get("reference_um_per_px")
+
+
+def list_import_entries(src: Path, preds: Path, kind: str, skip):
+    """{stem: {"img": source image, "labels": [], "pred": predicted label}} for images with a prediction."""
+    lbl_dir = preds / f"{kind}_segmentations"
+    if not lbl_dir.is_dir():
+        raise SystemExit(f"{lbl_dir} not found; run predict.py on {src} first or pass --preds")
+    entries, in_dataset, no_pred = {}, 0, 0
+    for p in sorted(src.iterdir()) if src.is_dir() else [src]:
+        if not p.is_file() or p.suffix.lower() not in EXTS:
+            continue
+        if p.stem in skip:
+            in_dataset += 1
+        elif (lbl_dir / f"{p.stem}.txt").exists():
+            entries[p.stem] = {"img": p, "labels": [], "pred": lbl_dir / f"{p.stem}.txt"}
+        else:
+            no_pred += 1
+    print(f"{len(entries)} images to correct from {src} ({in_dataset} already in dataset, "
+          f"{no_pred} without a {kind} prediction)", flush=True)
+    return entries
+
+
+def subject(stem):
+    """Slide/subject id shared by e.g. mde112f.svs and mde112f.svs_1, so they land in the same split."""
+    return stem.split(".")[0]
+
+
+def auto_split(subj, val_frac):
+    return "val" if int(hashlib.md5(subj.encode()).hexdigest(), 16) % 1000 < val_frac * 1000 else "train"
+
+
+def record_um_per_px(root: Path, stem, um, ref):
+    p = root / "scale_calibration.json"
+    calib = json.loads(p.read_text()) if p.exists() else {}
+    if ref:
+        calib.setdefault("reference_um_per_px", ref)
+    calib.setdefault("images", {})[stem] = um
+    p.write_text(json.dumps(calib, indent=2) + "\n")
+
+
 def line_class(line):
     return int(line.split(maxsplit=1)[0])
 
@@ -144,18 +216,35 @@ def poly_line(cls_id, poly):
 class Annotator:
     def __init__(self, args, root: Path):
         self.root = root
-        self.entries = list_entries(root)
-        self.stems = sorted(self.entries)
-        if not self.stems:
-            raise SystemExit(f"no images found in {root / 'images'}")
+        self.imported = getattr(args, "source", None) is not None
         self.ids = class_ids(root / "data.yaml")
         self.names = {v: k for k, v in self.ids.items()}
+        if self.imported:
+            dataset = list_entries(root)
+            self.subject_split = {}
+            for stem, e in dataset.items():
+                self.subject_split.setdefault(subject(stem), e["labels"][0].parent.name)
+            self.split, self.val_frac = args.split, args.val_frac
+            pred_names, self.pred_um, self.um_default, self.ref_um = read_run_config(args.preds)
+            self.um_override = args.um_per_px
+            self.entries = list_import_entries(args.source, args.preds, args.labels, set(dataset))
+        else:
+            self.entries = list_entries(root)
+        self.stems = sorted(self.entries)
+        if not self.stems:
+            raise SystemExit("no images to correct" if self.imported else f"no images found in {root / 'images'}")
         self.active = args.cls
         self.W, self.H = (int(v) for v in args.win.lower().split("x"))
         self.polys = {}  # stem -> {class id: [normalised (N, 2) polygons]}
         self.other = {}  # label path -> lines of non-editable classes, written back verbatim
         for stem, e in self.entries.items():
             self.polys[stem] = {k: [] for k in self.names}
+            if self.imported:
+                for l in e["pred"].read_text().splitlines():
+                    c = line_class(l) if l.strip() else None
+                    name = pred_names[c] if c is not None and c < len(pred_names) else None
+                    if name in CLASSES:
+                        self.polys[stem][self.ids[name]].append(parse_poly(l))
             for lbl in e["labels"]:
                 lines = [l for l in (lbl.read_text().splitlines() if lbl.exists() else []) if l.strip()]
                 self.other[lbl] = [l for l in lines if line_class(l) not in self.names]
@@ -168,7 +257,7 @@ class Annotator:
         self.changed = set()
         gap, x = 8, self.W
         self.buttons = []
-        for label, action, bw in reversed(BUTTONS):
+        for label, action, bw in reversed(BUTTONS + ([("Accept", "accept", 90)] if self.imported else [])):
             x -= bw + gap
             self.buttons.insert(0, (label, action, (x, 6, bw, HUD - 12)))
         self.show_layers = True
@@ -176,6 +265,11 @@ class Annotator:
         self.pan = None
         self.pan_mode = False
         self.edit_mode = False
+        self.cut_mode = False
+        self.nudge_mode = False
+        self.nudge_r = NUDGE_R
+        self.nudge_last = None  # image-px cursor position of the Nudge drag in progress
+        self.nudged = False
         self.drag = None  # (class id, polygon index, vertex index) being dragged in Edit mode
         self.mouse = (0, 0)
         self.dirty = True
@@ -183,6 +277,8 @@ class Annotator:
             if args.start not in self.entries:
                 raise SystemExit(f"--start {args.start!r} not found; images: {self.stems}")
             self.i = self.stems.index(args.start)
+        elif self.imported:
+            self.i = 0
         else:
             self.i = next((k for k, s in enumerate(self.stems) if not self.polys[s][self.aid]), 0)
 
@@ -212,10 +308,12 @@ class Annotator:
         if img is None:
             raise SystemExit(f"could not read {p}")
         self.ih, self.iw = img.shape[:2]
-        self.layers = [(line_class(l), parse_poly(l)) for l in self.other[self.entries[stem]["labels"][0]]]
+        labels = self.entries[stem]["labels"]
+        self.layers = [(line_class(l), parse_poly(l)) for l in self.other[labels[0]]] if labels else []
         self.points, self.strokes, self.tracing = [], [], False
         self.pan = None
         self.drag = None
+        self.nudge_last = None
         # pyramid so zoomed-out views don't resize the full-resolution image every frame
         self.pyr = [img]
         while max(self.pyr[-1].shape[:2]) > 1024:
@@ -264,7 +362,8 @@ class Annotator:
             cv2.polylines(canvas, active, True, self.color(self.aid), 2, cv2.LINE_AA)
         if self.points:
             pts = [self.to_disp(px, py) for px, py in self.points] + [self.mouse]
-            cv2.polylines(canvas, [np.array(pts, np.int32)], False, (255, 255, 255), 1, cv2.LINE_AA)
+            pen = (0, 0, 255) if self.cut_mode else (255, 255, 255)
+            cv2.polylines(canvas, [np.array(pts, np.int32)], False, pen, 2 if self.cut_mode else 1, cv2.LINE_AA)
             cv2.circle(canvas, pts[0], CLOSE_PX, (0, 0, 255), 1, cv2.LINE_AA)
         if self.edit_mode:
             for cls, _, poly in self.editable():
@@ -276,16 +375,28 @@ class Annotator:
                 cls, k, vi = hit
                 px, py = self.disp_poly(polys[cls][k])[vi]
                 cv2.circle(canvas, (int(px), int(py)), 6, (255, 255, 255), 2, cv2.LINE_AA)
+        if self.nudge_mode and self.mouse[1] >= HUD:
+            cv2.circle(canvas, self.mouse, int(self.nudge_r), (255, 255, 255), 1, cv2.LINE_AA)
 
         ix, iy = self.to_img(*self.mouse)
         cv2.rectangle(canvas, (0, 0), (self.W, HUD), (0, 0, 0), -1)
         drawing = f"   drawing: {len(self.points)} pts (Enter closes, Esc cancels)" if self.points else ""
         counts = "  ".join(f"{c}: {len(polys[self.ids[c]])}" for c in CLASSES)
-        line1 = f"[{self.i + 1}/{len(self.stems)}] {self.stems[self.i]}   {counts}{drawing}"
+        status = ""
+        if self.imported:
+            labels = self.entries[self.stems[self.i]]["labels"]
+            status = f"  [accepted -> {labels[0].parent.name}]" if labels else "  [pending: a]"
+        line1 = f"[{self.i + 1}/{len(self.stems)}] {self.stems[self.i]}{status}   {counts}{drawing}"
         if self.edit_mode:
             hint = "EDIT: drag vertex, click edge = add, R-click/Del = remove, Esc exit"
+        elif self.cut_mode:
+            hint = f"CUT: outline the part of {self.active} to remove, Esc exit"
+        elif self.nudge_mode:
+            hint = "NUDGE: drag to push outlines, [ / ] or Ctrl+wheel = brush size, Esc exit"
         else:
-            hint = "1/2/3 class, drag draw, R-drag pan, g pan, e edit, x del, h, f fit"
+            hint = "1/2/3 class, draw = add, R-drag pan, g pan, e edit, c cut, m nudge, x del, h, f fit"
+            if self.imported:
+                hint += ", a accept"
         line2 = f"zoom {self.s:.2f} x={int(ix)} y={int(iy)} | {hint}"
         cv2.putText(canvas, line1, (8, 17), FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(canvas, line2, (8, 36), FONT, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
@@ -299,6 +410,16 @@ class Annotator:
             elif action == "edit":
                 label = "Edit ON" if self.edit_mode else "Edit"
                 bg = (40, 100, 130) if self.edit_mode else (90, 90, 90)
+            elif action == "cut":
+                label = "Cut ON" if self.cut_mode else "Cut"
+                bg = (40, 40, 150) if self.cut_mode else (90, 90, 90)
+            elif action == "nudge":
+                label = "Nudge ON" if self.nudge_mode else "Nudge"
+                bg = (130, 40, 130) if self.nudge_mode else (90, 90, 90)
+            elif action == "accept":
+                done = bool(self.entries[self.stems[self.i]]["labels"])
+                label = "Accepted" if done else "Accept"
+                bg = (60, 90, 60) if done else (40, 160, 40)
             else:
                 bg = (60, 140, 60) if action == "next" else (90, 90, 90)
             cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), bg, -1)
@@ -329,8 +450,102 @@ class Annotator:
         if len(pts) < 3 or cv2.contourArea(pts) * self.s ** 2 < 25:
             print("polygon too small, discarded", flush=True)
             return
-        self.cur().append(pts / np.array([self.iw, self.ih], np.float32))
-        self.hist().append(("add", None, len(self.cur()) - 1, self.aid))
+        if self.cut_mode:
+            self.cut(pts)
+        else:
+            self.merge(pts)
+
+    @staticmethod
+    def _bbox(*pxs):
+        """Integer (x0, y0, x1, y1) around image-px polygons, with a 1 px margin."""
+        pts = np.concatenate(pxs)
+        (x0, y0), (x1, y1) = np.floor(pts.min(0)).astype(int) - 1, np.ceil(pts.max(0)).astype(int) + 1
+        return x0, y0, x1, y1
+
+    @staticmethod
+    def _overlap(a, b):
+        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+    def _pieces(self, contours, x0, y0):
+        wh = np.array([self.iw, self.ih], np.float32)
+        out = []
+        for c in contours:
+            if cv2.contourArea(c) < MIN_PIECE_PX:
+                continue
+            c = cv2.approxPolyDP(c, 1.0, True).reshape(-1, 2)
+            if len(c) >= 3:
+                out.append(((c + (x0, y0)) / wh).astype(np.float32))
+        return out
+
+    def merge(self, lasso):
+        """Add the image-px polygon `lasso` to the active class, unioned with the polygons it overlaps."""
+        wh = np.array([self.iw, self.ih], np.float32)
+        lb = self._bbox(lasso)
+        old, keep, hit = list(self.cur()), [], []
+        for poly in old:
+            px = poly * wh
+            b = self._bbox(px)
+            if self._overlap(b, lb):
+                x0, y0, x1, y1 = self._bbox(px, lasso)
+                a = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
+                m = a.copy()
+                cv2.fillPoly(a, [np.round(px - (x0, y0)).astype(np.int32)], 1)
+                cv2.fillPoly(m, [np.round(lasso - (x0, y0)).astype(np.int32)], 1)
+                if cv2.countNonZero(a & m):
+                    hit.append(px)
+                    continue
+            keep.append(poly)
+        if not hit:
+            self.cur().append(lasso / wh)
+            self.hist().append(("add", None, len(self.cur()) - 1, self.aid))
+            self.changed.add(self.stems[self.i])
+            return
+        x0, y0, x1, y1 = self._bbox(lasso, *hit)
+        mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
+        for p in hit + [lasso]:  # one call per polygon: a single fillPoly leaves their overlaps unfilled
+            cv2.fillPoly(mask, [np.round(p - (x0, y0)).astype(np.int32)], 1)
+        # RETR_EXTERNAL: gaps enclosed by the union are filled, as labels cannot hold holes
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.hist().append(("replace", [p.copy() for p in old], None, self.aid))
+        self.cur()[:] = keep + self._pieces(contours, x0, y0)
+        self.changed.add(self.stems[self.i])
+        print(f"merged into {len(hit)} overlapping {self.active} polygon(s)", flush=True)
+
+    def cut(self, lasso):
+        """Subtract the image-px polygon `lasso` from every active-class polygon it overlaps."""
+        wh = np.array([self.iw, self.ih], np.float32)
+        lb = self._bbox(lasso)
+        old, new, n_cut, n_hole = list(self.cur()), [], 0, 0
+        for poly in old:
+            px = poly * wh
+            x0, y0, x1, y1 = b = self._bbox(px)
+            if not self._overlap(b, lb):
+                new.append(poly)
+                continue
+            # rasterise in the polygon's own bounding box at full image resolution
+            mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
+            cv2.fillPoly(mask, [np.round(px - (x0, y0)).astype(np.int32)], 1)
+            area = cv2.countNonZero(mask)
+            cv2.fillPoly(mask, [np.round(lasso - (x0, y0)).astype(np.int32)], 0)
+            if cv2.countNonZero(mask) == area:
+                new.append(poly)
+                continue
+            contours, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if hier is not None and (hier[0][:, 3] >= 0).any():
+                n_hole += 1
+                new.append(poly)
+                continue
+            n_cut += 1
+            new += self._pieces(contours, x0, y0)
+        if n_hole:
+            print(f"cut lies inside {n_hole} {self.active} polygon(s) and was ignored there; "
+                  "holes are not supported, cut from the edge", flush=True)
+        if not n_cut:
+            if not n_hole:
+                print(f"cut does not overlap any {self.active} polygon", flush=True)
+            return
+        self.hist().append(("replace", [p.copy() for p in old], None, self.aid))
+        self.cur()[:] = new
         self.changed.add(self.stems[self.i])
 
     def delete_under_cursor(self):
@@ -403,6 +618,47 @@ class Annotator:
         lst[k] = np.delete(lst[k], vi, axis=0)
         self.changed.add(self.stems[self.i])
 
+    def start_nudge(self, ix, iy):
+        polys = self.polys[self.stems[self.i]]
+        self.hist().append(("nudge", {c: [p.copy() for p in lst] for c, lst in polys.items()}, None, None))
+        self.nudge_last, self.nudged = (ix, iy), False
+
+    def nudge(self, ix, iy):
+        """Move the editable outlines near the previous cursor position by the cursor's displacement."""
+        (lx, ly), self.nudge_last = self.nudge_last, (ix, iy)
+        delta = np.array([ix - lx, iy - ly], np.float32)
+        if not delta.any():
+            return
+        r = self.nudge_r / self.s
+        c = np.array([lx, ly], np.float32)
+        wh = np.array([self.iw, self.ih], np.float32)
+        polys = self.polys[self.stems[self.i]]
+        for cls, k, poly in self.editable():
+            a = poly * wh
+            if (a.min(0) - r > c).any() or (a.max(0) + r < c).any():
+                continue
+            # subdivide edges passing through the brush so the outline bends smoothly instead of kinking
+            ab = np.roll(a, -1, axis=0) - a
+            t = np.clip(((c - a) * ab).sum(1) / np.maximum((ab ** 2).sum(1), 1e-9), 0, 1)
+            near = np.hypot(*(a + t[:, None] * ab - c).T) < r
+            n = np.where(near, np.ceil(np.hypot(*ab.T) / max(r / 4, 1.0)), 1).astype(int).clip(1)
+            rep = np.repeat(np.arange(len(a)), n)
+            frac = (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)) / n[rep]
+            px = (a[rep] + ab[rep] * frac[:, None]).astype(np.float32)
+            w = np.clip(1 - ((px - c) ** 2).sum(1) / r ** 2, 0, None) ** 2
+            if not w.any():
+                continue
+            px += w[:, None] * delta
+            polys[cls][k] = np.clip(px, 0, wh) / wh
+            self.nudged = True
+        if self.nudged:
+            self.changed.add(self.stems[self.i])
+
+    def end_nudge(self):
+        self.nudge_last = None
+        if not self.nudged:
+            self.hist().pop()
+
     def undo(self):
         if self.points:
             del self.points[self.strokes.pop():]
@@ -410,11 +666,17 @@ class Annotator:
         self.drag = None
         if self.hist():
             op, g, k, cls_id = self.hist().pop()
-            lst = self.polys[self.stems[self.i]][cls_id]
-            if op == "add":
+            polys = self.polys[self.stems[self.i]]
+            lst = polys.get(cls_id)
+            if op == "nudge":
+                for c, saved in g.items():
+                    polys[c][:] = saved
+            elif op == "add":
                 lst.pop(k)
             elif op == "edit":
                 lst[k] = g
+            elif op == "replace":
+                lst[:] = g
             else:
                 lst.insert(k, g)
         elif self.cur():
@@ -425,7 +687,9 @@ class Annotator:
         self.changed.add(self.stems[self.i])
 
     def save(self):
-        for stem in sorted(self.changed):
+        # imported images have no label path until accepted; their edits stay in memory
+        for stem in sorted(s for s in self.changed if self.entries[s]["labels"]):
+            self.changed.discard(stem)
             polys = self.polys[stem]
             register_classes(self.root / "data.yaml", self.ids, [c for c in CLASSES if polys[self.ids[c]]])
             lines = [poly_line(self.ids[c], p) for c in CLASSES for p in polys[self.ids[c]]]
@@ -435,7 +699,31 @@ class Annotator:
                     f.writelines(l + "\n" for l in self.other[lbl] + lines)
             counts = ", ".join(f"{len(polys[self.ids[c]])} {c}" for c in CLASSES)
             print(f"saved {counts} for {stem}", flush=True)
-        self.changed.clear()
+
+    def accept(self):
+        """Copy the current imported image + its polygons into the dataset, then go to the next image."""
+        stem = self.stems[self.i]
+        e = self.entries[stem]
+        if not e["labels"]:
+            subj = subject(stem)
+            split = self.split or self.subject_split.get(subj) or auto_split(subj, self.val_frac)
+            self.subject_split.setdefault(subj, split)
+            dst = self.root / "images" / split / e["img"].name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                shutil.copy2(e["img"], dst)
+            lbl = self.root / "labels" / split / f"{stem}.txt"
+            e["labels"] = [lbl]
+            self.other[lbl] = []
+            um = self.um_override or self.pred_um.get(stem) or self.um_default
+            if um:
+                record_um_per_px(self.root, stem, um, self.ref_um)
+            else:
+                print(f"  warning: no um_per_px known for {stem}; pass --um-per-px", flush=True)
+            print(f"accepted {stem} -> {split}", flush=True)
+        self.changed.add(stem)
+        self.save()
+        self.go(1)
 
     def go(self, step):
         j = min(max(self.i + step, 0), len(self.stems) - 1)
@@ -457,16 +745,28 @@ class Annotator:
             self.go(-1)
         elif action == "undo":
             self.undo()
+        elif action == "accept":
+            self.accept()
         elif action == "class":
             self.active = CLASSES[(CLASSES.index(self.active) + 1) % len(CLASSES)]
         elif action == "pan":
             self.pan_mode = not self.pan_mode
-            self.edit_mode = False
+            self.edit_mode = self.cut_mode = self.nudge_mode = False
             self.pan = self.drag = None
             self.tracing = False
         elif action == "edit":
             self.edit_mode = not self.edit_mode
-            self.pan_mode = False
+            self.pan_mode = self.cut_mode = self.nudge_mode = False
+            self.pan = self.drag = None
+            self.points, self.strokes, self.tracing = [], [], False
+        elif action == "cut":
+            self.cut_mode = not self.cut_mode
+            self.pan_mode = self.edit_mode = self.nudge_mode = False
+            self.pan = self.drag = None
+            self.points, self.strokes, self.tracing = [], [], False
+        elif action == "nudge":
+            self.nudge_mode = not self.nudge_mode
+            self.pan_mode = self.edit_mode = self.cut_mode = False
             self.pan = self.drag = None
             self.points, self.strokes, self.tracing = [], [], False
         self.dirty = True
@@ -485,6 +785,8 @@ class Annotator:
                 self.tracing = False
             elif self.edit_mode:
                 self.start_drag(x, y, ix, iy)
+            elif self.nudge_mode:
+                self.start_nudge(*self.to_img(x, y))
             elif self.near_first(x, y):
                 self.close_poly()
             else:
@@ -496,6 +798,8 @@ class Annotator:
                 self.pan = None
             if self.drag:
                 self.end_drag()
+            if self.nudge_last:
+                self.end_nudge()
             # a freehand stroke released near the first vertex closes the polygon
             if self.tracing and len(self.points) - self.strokes[-1] > 1 and self.near_first(x, y):
                 self.close_poly()
@@ -523,6 +827,11 @@ class Annotator:
                     self.polys[self.stems[self.i]][c][k][vi] = (ix / self.iw, iy / self.ih)
                 else:
                     self.end_drag()
+            elif self.nudge_last:
+                if flags & cv2.EVENT_FLAG_LBUTTON:
+                    self.nudge(*self.to_img(x, y))
+                else:
+                    self.end_nudge()
             elif self.tracing and flags & cv2.EVENT_FLAG_LBUTTON:
                 lx, ly = self.to_disp(*self.points[-1])
                 if math.hypot(x - lx, y - ly) >= TRACE_PX:
@@ -532,8 +841,14 @@ class Annotator:
             if self.pan and self.pan[0] == button:
                 self.pan = None
         elif ev == cv2.EVENT_MOUSEWHEEL:
-            self.zoom(1.25 if flags > 0 else 0.8, x, y)
+            if self.nudge_mode and flags & (cv2.EVENT_FLAG_CTRLKEY | cv2.EVENT_FLAG_SHIFTKEY):
+                self.resize_brush(1.2 if flags > 0 else 1 / 1.2)
+            else:
+                self.zoom(1.25 if flags > 0 else 0.8, x, y)
         self.dirty = True
+
+    def resize_brush(self, factor):
+        self.nudge_r = float(np.clip(self.nudge_r * factor, NUDGE_R_MIN, NUDGE_R_MAX))
 
     def run(self):
         cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
@@ -554,6 +869,10 @@ class Annotator:
                 self.close_poly()
             elif k == 27 and self.edit_mode:
                 self.act("edit")
+            elif k == 27 and self.cut_mode:
+                self.act("cut")
+            elif k == 27 and self.nudge_mode:
+                self.act("nudge")
             elif k in (ord("q"), 27):
                 break
             elif k in (ord("n"), 32, KEY_RIGHT):
@@ -570,6 +889,12 @@ class Annotator:
                 self.act("pan")
             elif k == ord("e"):
                 self.act("edit")
+            elif k == ord("c"):
+                self.act("cut")
+            elif k == ord("m"):
+                self.act("nudge")
+            elif k in (ord("["), ord("]")):
+                self.resize_brush(1.2 if k == ord("]") else 1 / 1.2)
             elif k in (KEY_DEL, BACKSPACE) and self.edit_mode:
                 self.delete_vertex(self.vertex_at(*self.mouse))
             elif k == ord("x"):
@@ -584,8 +909,13 @@ class Annotator:
                 self.zoom(0.8, self.W / 2, self.H / 2)
             elif k == ord("s"):
                 self.save()
+            elif k == ord("a") and self.imported:
+                self.act("accept")
             self.dirty = True
         self.save()
+        if self.changed:
+            print(f"discarded edits of {len(self.changed)} image(s) that were not accepted: "
+                  f"{', '.join(sorted(self.changed))}", flush=True)
         cv2.destroyAllWindows()
 
 
@@ -594,8 +924,18 @@ def main():
     ap.add_argument("--dataset", default=str(Path(__file__).resolve().parent / "dataset_for_finetuning"),
                     help="YOLO-seg dataset (data.yaml, images/{train,val}, labels/{train,val}) edited in place")
     ap.add_argument("--add", nargs="+", default=[], help="image files or folders to copy into the dataset first")
-    ap.add_argument("--split", choices=SPLITS, default="train", help="split that --add images go to")
-    ap.add_argument("--um-per-px", type=float, help="scale of the --add images, recorded in scale_calibration.json")
+    ap.add_argument("--split", choices=SPLITS,
+                    help="split that --add images (default train) / accepted --source images (default auto) go to")
+    ap.add_argument("--um-per-px", type=float, help="scale of the --add / --source images, recorded in "
+                    "scale_calibration.json (--source default: from the predictions' run_config.yaml)")
+    ap.add_argument("--source", help="image folder (or image) whose predict.py segmentations to correct; "
+                    "accepted images are copied into --dataset")
+    ap.add_argument("--preds", help="predict.py output folder for --source "
+                    "(default: '<source>/predicted_<source name>', as predict.py writes it)")
+    ap.add_argument("--labels", choices=("raw", "postprocessed"), default="raw",
+                    help="which predict.py segmentations to start from")
+    ap.add_argument("--val-frac", type=float, default=0.2,
+                    help="fraction of new subjects auto-assigned to val when --split is not given")
     ap.add_argument("--cls", choices=CLASSES, default="gland", help="class active at startup (switch with 1/2/3/Tab)")
     ap.add_argument("--start", help="image stem to open first (default: first image without --cls polygons)")
     ap.add_argument("--win", default="1400x850", help="window size WxH; lower it for small screens")
@@ -603,7 +943,17 @@ def main():
     root = Path(args.dataset)
     if not (root / "data.yaml").exists():
         raise SystemExit(f"{root / 'data.yaml'} not found")
+    if args.source:
+        if args.add:
+            ap.error("--add and --source cannot be combined")
+        args.source = Path(args.source)
+        if not args.source.exists():
+            raise SystemExit(f"{args.source} not found")
+        default = (args.source / f"predicted_{args.source.name}" if args.source.is_dir()
+                   else args.source.parent / f"predicted_{args.source.stem}")
+        args.preds = Path(args.preds) if args.preds else default
     if args.add:
+        args.split = args.split or "train"
         add_images(args, root)
     Annotator(args, root).run()
 

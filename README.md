@@ -52,11 +52,12 @@ python add_segmentations.py --dataset "dataset_for_finetuning"
   --init-weights pretrained_model\3cls_hist_seg\best.pt `
   --pretrained-classes "SC,Epidermis,glands" `
   --encoder resnet34 --epochs 200 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
-  --class-weights "SC=3" --oversample "gland=1.5" `
+  --class-weights "SC=3" `
    --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
    --val-every 5 --patience 15 --workers 0 --device auto `
-  --project runs\semseg --name dataset_3cls_gland_v3
+  --project runs\semseg --name dataset_3cls_gland_v7
 ```
+
 
 
 ### then pseudolabeling on nicely segmented images
@@ -66,7 +67,7 @@ python add_segmentations.py --dataset "dataset_for_finetuning"
 
 python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX 8_24 TIFF_H_E"
 
-python predict.py --source "runs\predict_sample_src" --limit 5
+python predict.py --source "difficult_test_images" --limit 5
 
 python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "difficult_test_images" --limit 2
 
@@ -105,12 +106,34 @@ in base_config.yaml; if no ROI is detected (or `roi_enabled: false`) the full fr
 6. Trim `lateral_clip_frac` per side, then measure
 
 # to do
- make better at different image sizes and resolutions
 
 Validate epidermal thickness on "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\Results-Learnings\Makio Analysis\AntiAging\MDE credentialling\Histology\Epi_Thickness_CA_face.csv"
 
+  python predict.py --source "difficult_test_images"
+
+just take tortuosity measure over 200um window sections of EDJ line. Like the length of the black EDJ line/ the euclidean distance between the two ends of the black line in the window.. then average. 
 
 
- python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF" --limit 5
+adding more training examples as corrected pseudolabels
 
-  python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "C:\Users\plas.ka\skin_layer_segmentation\difficult_test_images" --limit 3
+```
+python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
+
+python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_EX_4_25_D6_TIFF"
+
+
+```
+.\.venv\Scripts\python.exe -u pretrained_model\3cls_hist_seg\train_semseg.py train `
+   --data dataset_for_finetuning `
+  --init-weights models\3cls_best_v6.pt `
+  --encoder resnet34 --epochs 200 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
+  --class-weights "SC=3" `
+   --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
+   --val-every 5 --patience 15 --workers 0 --device auto `
+  --project runs\semseg --name dataset_3cls_gland_v7
+
+  
+Loads each image with its `predicted_MDE-TIFF\raw_segmentations` labels (`--labels postprocessed` for the postprocessed ones, `--preds` for another predict.py output folder). Correct any class (1/2/3; draw to add, merged with overlapping polygons of that class; Edit mode; `c` / Cut mode to outline and remove a large part of the active class's polygons), then press `a` / Accept: the TIFF, its labels and um_per_px are added to dataset_for_finetuning (train, or val for ~20% of subjects). Images already in the dataset are skipped. The trainer now reads .tif/.tiff too.
+
+
+quality scoring model? 
