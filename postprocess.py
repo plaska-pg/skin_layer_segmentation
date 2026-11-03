@@ -9,7 +9,7 @@ Pipeline:
   2. detect follicles (YOLO-OBB) on the rotated image
   3. detect ROI boxes (YOLO-OBB roi_det) on the rotated image and score
       quality_sections even sections of each with the train_qual.py model
-      (CSV 'quality' = mean section score, 1 worst - 3 best)
+      (CSV 'quality' = mean section score, 1 worst - 3 best; 0 if no ROI detected)
   4. keep only SC/Epidermal pixels inside the union of ROI boxes (full frame
       if none detected) and outside the bottom follicle_mask_frac of each
       follicle box (cut parallel to the box's top edge)
@@ -507,6 +507,9 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     roi_panels = [] if rois is None else [
         (f"ROI Boxes ({len(rois)})", draw_obb_panel(rotated_overlay, rois, color=(255, 0, 255)))]
     quality = ""
+    # rois is None when detection didn't run (disabled / no weights) -> leave blank
+    if rois == [] and quality_enabled:
+        quality = 0
     if rois and quality_enabled:
         scored = score_sections(
             rot_img, rois,

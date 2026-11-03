@@ -48,14 +48,14 @@ python add_segmentations.py --dataset "dataset_for_finetuning"
 
 ```
 .\.venv\Scripts\python.exe -u pretrained_model\3cls_hist_seg\train_semseg.py train `
-   --data dataset_for_finetuning `
-  --init-weights pretrained_model\3cls_hist_seg\best.pt `
-  --pretrained-classes "SC,Epidermis,glands" `
-  --encoder resnet34 --epochs 200 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
+  --data dataset_for_finetuning `
+  --init-weights models\3cls_best_v7.pt `
+  --encoder resnet34 --epochs 100 --batch 2 --accumulate 1 --crop 512 --lr 2e-4 `
   --class-weights "SC=3" `
-   --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
-   --val-every 5 --patience 15 --workers 0 --device auto `
-  --project runs\semseg --name dataset_3cls_gland_v7
+  --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 `
+  --edge-weight 2 --edge-width 3 `
+  --val-every 5 --patience 10 --workers 0 --device auto `
+  --project runs\semseg --name v8_edge_2
 ```
 
 
@@ -106,6 +106,17 @@ in base_config.yaml; if no ROI is detected (or `roi_enabled: false`) the full fr
 6. Drop SC/Epidermis components not within `sc_epidermis_contact_gap_um` of the other class (`sc_epidermis_contact_enabled`)
 7. Trim `lateral_clip_frac` per side, then measure
 
+
+# adding more training examples as corrected pseudolabels
+
+```
+python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images\S_Exp_SEP_2024_D3_H_E"
+
+python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
+
+# review and modify current training segmentations? like using interface in add_segmentations.py
+python add_segmentations.py 
+
 # to do
 
 Validate epidermal thickness on "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\Results-Learnings\Makio Analysis\AntiAging\MDE credentialling\Histology\Epi_Thickness_CA_face.csv"
@@ -113,12 +124,6 @@ Validate epidermal thickness on "C:\Users\plas.ka\OneDrive - Procter and Gamble\
   python predict.py --source "difficult_test_images"
 
 just take tortuosity measure over 200um window sections of EDJ line. Like the length of the black EDJ line/ the euclidean distance between the two ends of the black line in the window.. then average. 
-
-
-adding more training examples as corrected pseudolabels
-
-```
-python add_segmentations.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
 
 
 ```

@@ -262,8 +262,11 @@ class ConvBlock(nn.Sequential):
 
 
 class ResUNet(nn.Module):
-    def __init__(self, n_classes: int, encoder: str = "resnet34", pretrained=True):
+    def __init__(self, n_classes: int, encoder: str = "resnet34", pretrained=True, full_res: bool = False):
+        """full_res: add a stride-1 decoder stage (skip from a shallow conv on the input) so
+        logits are predicted at input resolution instead of bilinearly upsampled from /2."""
         super().__init__()
+        self.full_res = full_res
         import torchvision
         weights = "DEFAULT" if pretrained else None
         r = getattr(torchvision.models, encoder)(weights=weights)
@@ -281,7 +284,10 @@ class ResUNet(nn.Module):
         self.d3 = ConvBlock(256 + c2, 128)
         self.d2 = ConvBlock(128 + c1, 64)
         self.d1 = ConvBlock(64 + c0, 32)
-        self.head = nn.Conv2d(32, n_classes, 1)
+        if full_res:
+            self.s0 = nn.Sequential(nn.Conv2d(3, 16, 3, padding=1, bias=False), nn.BatchNorm2d(16), nn.ReLU(inplace=True))
+            self.d0 = ConvBlock(32 + 16, 16)
+        self.head = nn.Conv2d(16 if full_res else 32, n_classes, 1)
 
 
     def _encode(self, x):
@@ -304,6 +310,8 @@ class ResUNet(nn.Module):
         d = self.d3(torch.cat([self._up(d, e2), e2], 1))
         d = self.d2(torch.cat([self._up(d, e1), e1], 1))
         d = self.d1(torch.cat([self._up(d, s), s], 1))
+        if self.full_res:
+            return self.head(self.d0(torch.cat([self._up(d, x), self.s0(x)], 1)))
         return self._up(self.head(d), x)
 
 

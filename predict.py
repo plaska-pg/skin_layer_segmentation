@@ -124,52 +124,100 @@ def svs_mpp(path: Path):
     return float(m.group(1)) if m else None
 
 
+# (quarter turns, horizontal flip) applied to each tile; predictions are mapped back and averaged
+TTA_OPS = {
+    "none": [(0, False)],
+    "flip": [(0, False), (0, True), (2, False), (2, True)],
+    "d4": [(k, f) for k in range(4) for f in (False, True)],
+}
+
+
+def _tile_probs(model, x: torch.Tensor, tta: str) -> torch.Tensor:
+    ops = TTA_OPS[tta]
+    acc = 0
+    for k, flip in ops:
+        xt = torch.rot90(x, k, (2, 3))
+        p = model(xt.flip(3) if flip else xt).softmax(1)
+        acc = acc + torch.rot90(p.flip(3) if flip else p, -k, (2, 3))
+    return acc / len(ops)
+
+
+def _ramp(n: int, ramp: int) -> np.ndarray:
+    i = np.arange(n, dtype=np.float32)
+    return np.clip(np.minimum(i + 0.5, n - i - 0.5) / max(ramp, 1), 1e-3, 1.0)
+
+
 @torch.no_grad()
-def _tiled_argmax(model, rgb: np.ndarray, device, tile: int, overlap: float = TILE_OVERLAP) -> np.ndarray:
-    """Class indices (H, W) from overlapping tiles; each tile keeps only its centre
-    (plus image-border edges), so every pixel is predicted with surrounding context."""
+def _tiled_probs(model, rgb: np.ndarray, device, tile: int, overlap: float = TILE_OVERLAP,
+                 tta: str = "none") -> np.ndarray:
+    """Softmax probabilities (C, H, W) from overlapping tiles, cross-faded with a
+    linear ramp across each overlap so tile edges (poor context) carry ~no weight."""
     h, w = rgb.shape[:2]
     m = int(tile * overlap / 2)
     stride = tile - 2 * m
     ys = sorted(set(range(0, max(1, h - tile), stride)) | {max(0, h - tile)})
     xs = sorted(set(range(0, max(1, w - tile), stride)) | {max(0, w - tile)})
-    pred = np.zeros((h, w), np.uint8)
+    probs, wsum = None, np.zeros((h, w), np.float32)
     for y0 in ys:
         for x0 in xs:
             patch = rgb[y0:y0 + tile, x0:x0 + tile]
             ph, pw = patch.shape[:2]
             patch = cv2.copyMakeBorder(patch, 0, (32 - ph % 32) % 32, 0, (32 - pw % 32) % 32, cv2.BORDER_REFLECT)
             x = torch.from_numpy(((patch.astype(np.float32) / 255 - MEAN) / STD).transpose(2, 0, 1))[None].to(device)
-            p = model(x).argmax(1)[0, :ph, :pw].cpu().numpy().astype(np.uint8)
-            ty0, tx0 = (m if y0 > 0 else 0), (m if x0 > 0 else 0)
-            ty1, tx1 = (ph - m if y0 + ph < h else ph), (pw - m if x0 + pw < w else pw)
-            pred[y0 + ty0:y0 + ty1, x0 + tx0:x0 + tx1] = p[ty0:ty1, tx0:tx1]
-    return pred
+            p = _tile_probs(model, x, tta)[0, :, :ph, :pw].float().cpu().numpy()
+            if probs is None:
+                probs = np.zeros((p.shape[0], h, w), np.float32)
+            wt = np.outer(_ramp(ph, 2 * m), _ramp(pw, 2 * m))
+            probs[:, y0:y0 + ph, x0:x0 + pw] += p * wt
+            wsum[y0:y0 + ph, x0:x0 + pw] += wt
+    return probs / wsum
 
 
-def predict_mask(model, orig_bgr: np.ndarray, device, scale: float, tile: int = 1024) -> np.ndarray:
+def _upsample_argmax(probs: np.ndarray, oh: int, ow: int, band: int = 512) -> np.ndarray:
+    """argmax of probs bilinearly resampled to (oh, ow), in row bands to bound memory.
+    Uses cv2.resize's pixel-centre convention, so it inverts the input resize exactly."""
+    _, h, w = probs.shape
+    map_x = np.broadcast_to(((np.arange(ow, dtype=np.float32) + 0.5) * (w / ow) - 0.5)[None], (band, ow))
+    out = np.empty((oh, ow), np.uint8)
+    for r0 in range(0, oh, band):
+        r1 = min(oh, r0 + band)
+        sy = ((np.arange(r0, r1, dtype=np.float32) + 0.5) * (h / oh) - 0.5)[:, None]
+        map_y = np.broadcast_to(sy, (r1 - r0, ow)).astype(np.float32)
+        mx = np.ascontiguousarray(map_x[:r1 - r0])
+        best = np.full((r1 - r0, ow), -1.0, np.float32)
+        for c in range(probs.shape[0]):
+            pc = cv2.remap(probs[c], mx, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            better = pc > best
+            best[better] = pc[better]
+            out[r0:r1][better] = c
+    return out
+
+
+def predict_mask(model, orig_bgr: np.ndarray, device, scale: float, tile: int = 1024,
+                 tta: str = "none") -> np.ndarray:
     """Class-index mask (0=bg, 1..N=names), at the ORIGINAL image's own
     resolution. The input is resized by `scale` to the model's training um/px
     and run as overlapping `tile` px tiles, so GPU memory stays bounded without
-    ever downscaling a large slide below the training resolution."""
+    ever downscaling a large slide below the training resolution. Class
+    probabilities (not labels) are resampled back, so edges are sub-pixel smooth."""
     oh, ow = orig_bgr.shape[:2]
     th, tw = (max(1, round(oh * scale)), max(1, round(ow * scale))) if scale != 1.0 else (oh, ow)
     resized = (th, tw) != (oh, ow)
     bgr = cv2.resize(orig_bgr, (tw, th), interpolation=cv2.INTER_AREA if (tw < ow or th < oh) else cv2.INTER_LINEAR) \
         if resized else orig_bgr
-    pred = _tiled_argmax(model, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), device, tile)
+    probs = _tiled_probs(model, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), device, tile, tta=tta)
     if resized:
-        pred = cv2.resize(pred, (ow, oh), interpolation=cv2.INTER_NEAREST)
-    return pred
+        return _upsample_argmax(probs, oh, ow)
+    return probs.argmax(0).astype(np.uint8)
 
 
 def predict_mask_safe(model, orig_bgr: np.ndarray, device, scale: float, name: str = "",
-                      tile: int = 1024) -> np.ndarray:
+                      tile: int = 1024, tta: str = "none") -> np.ndarray:
     """predict_mask, falling back to CPU (moving the model there and back) on a CUDA
     out-of-memory error - whole-slide images vary enough in size that one image fitting
     on a small GPU (e.g. 4GB) doesn't guarantee the next one will."""
     try:
-        return predict_mask(model, orig_bgr, device, scale, tile)
+        return predict_mask(model, orig_bgr, device, scale, tile, tta)
     except (torch.OutOfMemoryError, torch.AcceleratorError) as e:
         if device.type != "cuda":
             raise
@@ -177,7 +225,7 @@ def predict_mask_safe(model, orig_bgr: np.ndarray, device, scale: float, name: s
         torch.cuda.empty_cache()
         model.to("cpu")
         try:
-            return predict_mask(model, orig_bgr, torch.device("cpu"), scale, tile)
+            return predict_mask(model, orig_bgr, torch.device("cpu"), scale, tile, tta)
         finally:
             model.to(device)
             torch.cuda.empty_cache()
@@ -187,7 +235,7 @@ def load_model(weights: str, device):
     ckpt = torch.load(weights, map_location=device, weights_only=False)
     names = ckpt["names"]
     class_index = {n: k + 1 for k, n in enumerate(names)}
-    model = ResUNet(len(names) + 1, ckpt["encoder"], pretrained=False).to(device)
+    model = ResUNet(len(names) + 1, ckpt["encoder"], pretrained=False, full_res=ckpt.get("full_res", False)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, names, class_index
@@ -213,6 +261,8 @@ def main():
     ap.add_argument("--tile", type=int, default=_PREDICT_CFG.get("tile", 1024),
                      help="tile size (px, at the training um/px) for sliding-window inference; bounds GPU "
                           "memory without downscaling. Lower it (e.g. 768) if you hit CUDA out-of-memory errors.")
+    ap.add_argument("--tta", choices=list(TTA_OPS), default=_PREDICT_CFG.get("tta", "none"),
+                     help="test-time augmentation per tile: none, flip (4 passes) or d4 (flips + rot90, 8 passes)")
     ap.add_argument("--no-postprocess", action="store_true",
                      help="skip close/ROI/rotate/measure - just write raw prediction overlays")
     ap.add_argument("--no-labels", action="store_true",
@@ -337,7 +387,7 @@ def main():
         else:
             print(f"[{i}/{len(files)}] {p.name}: running inference ({orig_bgr.shape[1]}x{orig_bgr.shape[0]})...",
                   flush=True)
-            pred_mask = predict_mask_safe(model, orig_bgr, device, scale, name=p.name, tile=args.tile)
+            pred_mask = predict_mask_safe(model, orig_bgr, device, scale, name=p.name, tile=args.tile, tta=args.tta)
             if device.type == "cuda":
                 torch.cuda.empty_cache()  # defragment cache between images so one large image doesn't starve the next
             if not args.no_labels:

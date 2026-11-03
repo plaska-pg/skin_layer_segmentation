@@ -56,6 +56,7 @@ import yaml
 cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # scanner TIFF tags spam warnings
 
 EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+SOURCE_EXTS = EXTS | {".svs"}  # cv2 reads an .svs's full-resolution page, as predict.py does
 SPLITS = ("train", "val")
 CLASSES = ("SC", "Epidermis", "gland")
 PRED_ALIASES = {"Granular Layer": "Epidermis"}  # legacy 2-class model name
@@ -167,16 +168,23 @@ def list_import_entries(src: Path, preds: Path, kind: str, skip):
     lbl_dir = preds / f"{kind}_segmentations"
     if not lbl_dir.is_dir():
         raise SystemExit(f"{lbl_dir} not found; run predict.py on {src} first or pass --preds")
-    entries, in_dataset, no_pred = {}, 0, 0
+    entries, in_dataset, no_pred, unreadable = {}, 0, 0, []
     for p in sorted(src.iterdir()) if src.is_dir() else [src]:
-        if not p.is_file() or p.suffix.lower() not in EXTS:
+        if not p.is_file() or p.suffix.lower() not in SOURCE_EXTS:
             continue
+        pred = lbl_dir / f"{p.stem}.txt"
         if p.stem in skip:
             in_dataset += 1
-        elif (lbl_dir / f"{p.stem}.txt").exists():
-            entries[p.stem] = {"img": p, "labels": [], "pred": lbl_dir / f"{p.stem}.txt"}
+        elif pred.exists():
+            try:
+                entries[p.stem] = {"img": p, "labels": [], "pred": pred.read_text().splitlines()}
+            except OSError:
+                unreadable.append(pred.name)
         else:
             no_pred += 1
+    if unreadable:
+        print(f"warning: skipping {len(unreadable)} unreadable predictions in {lbl_dir} (OneDrive files that "
+              f"failed to download?): {', '.join(unreadable)}", flush=True)
     print(f"{len(entries)} images to correct from {src} ({in_dataset} already in dataset, "
           f"{no_pred} without a {kind} prediction)", flush=True)
     return entries
@@ -240,7 +248,7 @@ class Annotator:
         for stem, e in self.entries.items():
             self.polys[stem] = {k: [] for k in self.names}
             if self.imported:
-                for l in e["pred"].read_text().splitlines():
+                for l in e["pred"]:
                     c = line_class(l) if l.strip() else None
                     name = pred_names[c] if c is not None and c < len(pred_names) else None
                     if name in CLASSES:
@@ -708,10 +716,15 @@ class Annotator:
             subj = subject(stem)
             split = self.split or self.subject_split.get(subj) or auto_split(subj, self.val_frac)
             self.subject_split.setdefault(subj, split)
-            dst = self.root / "images" / split / e["img"].name
+            svs = e["img"].suffix.lower() == ".svs"
+            # the trainer doesn't read .svs, so store it as a lossless .tif
+            dst = self.root / "images" / split / (f"{stem}.tif" if svs else e["img"].name)
             dst.parent.mkdir(parents=True, exist_ok=True)
             if not dst.exists():
-                shutil.copy2(e["img"], dst)
+                if svs:
+                    cv2.imwrite(str(dst), self.pyr[0])
+                else:
+                    shutil.copy2(e["img"], dst)
             lbl = self.root / "labels" / split / f"{stem}.txt"
             e["labels"] = [lbl]
             self.other[lbl] = []
