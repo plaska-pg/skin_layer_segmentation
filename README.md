@@ -142,4 +142,3 @@ Loads each image with its `predicted_MDE-TIFF\raw_segmentations` labels (`--labe
 
 quality scoring model? 
 
-

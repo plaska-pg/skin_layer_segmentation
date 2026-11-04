@@ -124,6 +124,25 @@ def svs_mpp(path: Path):
     return float(m.group(1)) if m else None
 
 
+def _save_svs_tiff(p: Path, tiff_dir: Path, bgr: np.ndarray = None) -> None:
+    """Write .svs input p as a lossless full-resolution <tiff_dir>/<stem>.tif, unless it already exists."""
+    if p.suffix.lower() != ".svs":
+        return
+    dst = tiff_dir / f"{p.stem}.tif"
+    if long_path(dst).exists():
+        return
+    if bgr is None:
+        bgr = cv2.imread(str(p))
+        if bgr is None:
+            print(f"WARNING: could not read {p}, no TIFF written", flush=True)
+            return
+    ok, buf = cv2.imencode(".tif", bgr)
+    if not ok:
+        raise RuntimeError(f"could not encode {dst}")
+    long_path(dst).write_bytes(buf.tobytes())
+    print(f"{p.name}: wrote TIFF {dst}", flush=True)
+
+
 # (quarter turns, horizontal flip) applied to each tile; predictions are mapped back and averaged
 TTA_OPS = {
     "none": [(0, False)],
@@ -327,6 +346,10 @@ def main():
         raise SystemExit(f"no images found in {src}")
     if args.limit:
         files = files[:args.limit]
+    src_dir = src.parent if src.is_file() else src
+    tiff_dir = src_dir / f"TIFF_{src_dir.name}"
+    if any(p.suffix.lower() == ".svs" for p in files):
+        long_path(tiff_dir).mkdir(parents=True, exist_ok=True)
     effective_mpp = {p.name: svs_mpp(p) or args.um_per_px for p in files}
     run_config_path = out / "run_config.yaml"
     write_run_config(long_path(run_config_path), args, src, out, device, names, files, effective_mpp)
@@ -366,16 +389,19 @@ def main():
         if args.resume:
             if args.no_postprocess and (out_io / f"{p.stem}_overlay.jpg").exists():
                 print(f"[{i}/{len(files)}] {p.name}: overlay already exists, skipping", flush=True)
+                _save_svs_tiff(p, tiff_dir)
                 continue
             if not args.no_postprocess and p.stem in prior_rows:
                 print(f"[{i}/{len(files)}] {p.name}: already processed, reusing its CSV row", flush=True)
                 _write_row(prior_rows[p.stem])
+                _save_svs_tiff(p, tiff_dir)
                 continue
         print(f"[{i}/{len(files)}] {p.name}: reading...", flush=True)
         orig_bgr = cv2.imread(str(p))
         if orig_bgr is None:
             print(f"WARNING: could not read {p}, skipping", flush=True)
             continue
+        _save_svs_tiff(p, tiff_dir, orig_bgr)
         um_per_px = effective_mpp[p.name]
         if um_per_px != args.um_per_px:
             print(f"{p.name}: using embedded MPP {um_per_px:.4g} um/px (overrides --um-per-px {args.um_per_px})",
