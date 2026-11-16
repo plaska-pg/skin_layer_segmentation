@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 predict.py -- run the trained SC/Epidermis ResUNet model (see
-pretrained_model/train_semseg.py) on a folder of images and, by default,
+training/semseg/train_semseg.py) on a folder of images and, by default,
 postprocess each prediction (postprocess.py: close -> identify ROI -> rotate
 -> measure) into a labeled composite QA image plus a dataset-wide CSV.
 
@@ -19,7 +19,6 @@ import argparse
 import builtins
 import csv
 import re
-import sys
 from datetime import datetime
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -31,8 +30,7 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = None  # these whole-slide TIFFs/SVS are far bigger than PIL's default decompression-bomb cap
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "pretrained_model"))
-from train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
+from training.semseg.train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
 
 from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
 from postprocess import (EPIDERMAL_ERODE_DILATE_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
@@ -263,7 +261,7 @@ def load_model(weights: str, device):
 def main():
     builtins.print = _timestamped_print
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "models/best.pt"),
+    ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "models/3cls_best_v8_e.pt"),
                      help="ResUNet checkpoint trained on SC/Epidermis (dataset/dataset.yaml)")
     ap.add_argument("--source", default=_PREDICT_CFG.get("source", "inference_images"),
                      help="a single image file OR a folder of images to predict on")

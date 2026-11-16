@@ -6,13 +6,14 @@
 # to predict which rotation was applied. At inference time the predicted
 # rotation is undone, auto-correcting a mis-rotated scan back to upright.
 #
-#   python rotate.py train --dataset dataset_rotate --output runs/rotation/rotate_model.pt --pretrained --device cuda
-#   python rotate.py predict --weights runs/rotation/rotate_model.pt --source inference_images --out runs/rotation/predictions
+#   python training/rotation/rotate.py train                 # rotate.yaml -> runs/rotation/rotate_model.pt
+#   python training/rotation/rotate.py predict --source inference_images --out runs/rotation/predictions
 
 import argparse
 import csv
 import math
 import random
+import sys
 from pathlib import Path
 
 import cv2
@@ -21,6 +22,9 @@ import torch
 import torch.nn as nn
 import torchvision
 from torch.utils.data import DataLoader, Dataset
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for running this file as a script
+from training.config_utils import apply_config  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 ANGLES = (0, 90, 180, 270)  # class index k means "rotated k*90 deg clockwise from upright"
@@ -175,7 +179,7 @@ def train(args):
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[rotate] train images: {len(train_files)}, val images: {len(val_files)}, device={device}")
-    # NOTE: dataset_rotate's images/train and images/val largely overlap (same
+    # NOTE: datasets/rotate's images/train and images/val largely overlap (same
     # source scans) - val accuracy here mainly tracks augmentation-robustness,
     # not held-out generalization to unseen slides.
 
@@ -284,13 +288,14 @@ def main():
     p_train.set_defaults(func=train)
 
     p_predict = sub.add_parser("predict", help="Predict + correct orientation for a folder of images.")
-    p_predict.add_argument("--weights", default="runs/rotation/rotate_model.pt")
+    p_predict.add_argument("--weights", default="models/rotate_model.pt")
     p_predict.add_argument("--source", required=True)
     p_predict.add_argument("--out", default="runs/rotation/predictions")
     p_predict.add_argument("--device", default="auto")
     p_predict.add_argument("--size", type=int, default=224, help="Fallback resize size if not stored in the checkpoint.")
     p_predict.set_defaults(func=predict)
 
+    apply_config(parser, default=str(Path(__file__).with_name("rotate.yaml")))
     args = parser.parse_args()
     args.func(args)
 

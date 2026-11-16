@@ -4,9 +4,9 @@ show_train_samples.py -- montage of augmented training crops (image | label
 overlay) from a train_semseg.py dataset, so you can eyeball what the model
 actually trains on (augmentations + rasterised labels, pseudolabels included).
 
-    python show_train_samples.py                       # all train images
-    python show_train_samples.py --pseudo-only         # only S_EX_9_24_D2_* pseudolabels
-    python show_train_samples.py --count 40 --cols 5
+    python training/semseg/show_train_samples.py                       # all train images
+    python training/semseg/show_train_samples.py --pseudo-only         # only S_EX_9_24_D2_* pseudolabels
+    python training/semseg/show_train_samples.py --count 40 --cols 5
 
 Writes a single montage JPG (default runs/train_samples_preview.jpg). Each panel
 is one augmented crop on the left and the same crop with its SC/Epidermis
@@ -20,8 +20,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "pretrained_model"))
-from train_semseg import MEAN, STD, PALETTE, TileDataset, colourise  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for running this file as a script
+from training.semseg.train_semseg import MEAN, STD, PALETTE, TileDataset, colourise  # noqa: E402
 
 PSEUDO_PREFIX = "S_EX_9_24_D2_"  # pseudolabeled D2_H_E images added by build_pseudolabel_finetune.py
 
@@ -42,7 +42,7 @@ def caption(panel: np.ndarray, text: str, is_pseudo: bool) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default="dataset_pseudolabel_finetune")
+    ap.add_argument("--data", default="datasets/seg_finetune")
     ap.add_argument("--crop", type=int, default=512)
     ap.add_argument("--count", type=int, default=40, help="number of augmented sample panels")
     ap.add_argument("--cols", type=int, default=5)

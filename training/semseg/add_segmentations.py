@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 add_segmentations.py -- draw SC / Epidermis / gland polygons into the existing YOLO-seg dataset
-(dataset_for_finetuning).
+(datasets/seg_finetune).
 
-    python add_segmentations.py                                     # annotate glands in the dataset
-    python add_segmentations.py --cls SC                            # start with the SC class active
-    python add_segmentations.py --add new_imgs --um-per-px 0.645    # copy new images in first (to --split)
-    python add_segmentations.py --add a.png b.png --split val --start a
-    python add_segmentations.py --source MDE-TIFF                   # correct predict.py output, a = accept
-    python add_segmentations.py --source MDE-TIFF --labels postprocessed --preds runs/pred_mde
+    python training/semseg/add_segmentations.py                     # annotate glands in the dataset
+    python training/semseg/add_segmentations.py --cls SC            # start with the SC class active
+    python training/semseg/add_segmentations.py --add new_imgs --um-per-px 0.645    # copy new images in first (to --split)
+    python training/semseg/add_segmentations.py --add a.png b.png --split val --start a
+    python training/semseg/add_segmentations.py --source MDE-TIFF   # correct predict.py output, a = accept
+    python training/semseg/add_segmentations.py --source MDE-TIFF --labels postprocessed --preds runs/pred_mde
 
 Import mode (--source): images of --source with a predict.py segmentation in --preds and not yet in
 the dataset are opened with their predicted polygons. Nothing is written to --source / --preds; Accept
@@ -219,6 +219,89 @@ def parse_poly(line):
 
 def poly_line(cls_id, poly):
     return f"{cls_id} " + " ".join(f"{min(max(v, 0), 1):.6f}" for v in poly.ravel())
+
+
+def _bbox(*pxs):
+    """Integer (x0, y0, x1, y1) around image-px polygons, with a 1 px margin."""
+    pts = np.concatenate(pxs)
+    (x0, y0), (x1, y1) = np.floor(pts.min(0)).astype(int) - 1, np.ceil(pts.max(0)).astype(int) + 1
+    return x0, y0, x1, y1
+
+
+def _overlap(a, b):
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _pieces(contours, x0, y0, iw, ih):
+    wh = np.array([iw, ih], np.float32)
+    out = []
+    for c in contours:
+        if cv2.contourArea(c) < MIN_PIECE_PX:
+            continue
+        c = cv2.approxPolyDP(c, 1.0, True).reshape(-1, 2)
+        if len(c) >= 3:
+            out.append(((c + (x0, y0)) / wh).astype(np.float32))
+    return out
+
+
+def merge_polys(polys, lasso, iw, ih):
+    """Union the image-px polygon `lasso` with the normalised `polys` it overlaps.
+    Returns (new polygon list, number of polygons merged into); 0 = lasso appended as is."""
+    wh = np.array([iw, ih], np.float32)
+    lb = _bbox(lasso)
+    keep, hit = [], []
+    for poly in polys:
+        px = poly * wh
+        b = _bbox(px)
+        if _overlap(b, lb):
+            x0, y0, x1, y1 = _bbox(px, lasso)
+            a = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
+            m = a.copy()
+            cv2.fillPoly(a, [np.round(px - (x0, y0)).astype(np.int32)], 1)
+            cv2.fillPoly(m, [np.round(lasso - (x0, y0)).astype(np.int32)], 1)
+            if cv2.countNonZero(a & m):
+                hit.append(px)
+                continue
+        keep.append(poly)
+    if not hit:
+        return list(polys) + [(lasso / wh).astype(np.float32)], 0
+    x0, y0, x1, y1 = _bbox(lasso, *hit)
+    mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
+    for p in hit + [lasso]:  # one call per polygon: a single fillPoly leaves their overlaps unfilled
+        cv2.fillPoly(mask, [np.round(p - (x0, y0)).astype(np.int32)], 1)
+    # RETR_EXTERNAL: gaps enclosed by the union are filled, as labels cannot hold holes
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return keep + _pieces(contours, x0, y0, iw, ih), len(hit)
+
+
+def cut_polys(polys, lasso, iw, ih):
+    """Subtract the image-px polygon `lasso` from the normalised `polys` it overlaps.
+    Returns (new polygon list, polygons cut, polygons skipped because the cut would leave a hole)."""
+    wh = np.array([iw, ih], np.float32)
+    lb = _bbox(lasso)
+    new, n_cut, n_hole = [], 0, 0
+    for poly in polys:
+        px = poly * wh
+        x0, y0, x1, y1 = b = _bbox(px)
+        if not _overlap(b, lb):
+            new.append(poly)
+            continue
+        # rasterise in the polygon's own bounding box at full image resolution
+        mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
+        cv2.fillPoly(mask, [np.round(px - (x0, y0)).astype(np.int32)], 1)
+        area = cv2.countNonZero(mask)
+        cv2.fillPoly(mask, [np.round(lasso - (x0, y0)).astype(np.int32)], 0)
+        if cv2.countNonZero(mask) == area:
+            new.append(poly)
+            continue
+        contours, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hier is not None and (hier[0][:, 3] >= 0).any():
+            n_hole += 1
+            new.append(poly)
+            continue
+        n_cut += 1
+        new += _pieces(contours, x0, y0, iw, ih)
+    return new, n_cut, n_hole
 
 
 class Annotator:
@@ -463,88 +546,24 @@ class Annotator:
         else:
             self.merge(pts)
 
-    @staticmethod
-    def _bbox(*pxs):
-        """Integer (x0, y0, x1, y1) around image-px polygons, with a 1 px margin."""
-        pts = np.concatenate(pxs)
-        (x0, y0), (x1, y1) = np.floor(pts.min(0)).astype(int) - 1, np.ceil(pts.max(0)).astype(int) + 1
-        return x0, y0, x1, y1
-
-    @staticmethod
-    def _overlap(a, b):
-        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
-
-    def _pieces(self, contours, x0, y0):
-        wh = np.array([self.iw, self.ih], np.float32)
-        out = []
-        for c in contours:
-            if cv2.contourArea(c) < MIN_PIECE_PX:
-                continue
-            c = cv2.approxPolyDP(c, 1.0, True).reshape(-1, 2)
-            if len(c) >= 3:
-                out.append(((c + (x0, y0)) / wh).astype(np.float32))
-        return out
-
     def merge(self, lasso):
         """Add the image-px polygon `lasso` to the active class, unioned with the polygons it overlaps."""
-        wh = np.array([self.iw, self.ih], np.float32)
-        lb = self._bbox(lasso)
-        old, keep, hit = list(self.cur()), [], []
-        for poly in old:
-            px = poly * wh
-            b = self._bbox(px)
-            if self._overlap(b, lb):
-                x0, y0, x1, y1 = self._bbox(px, lasso)
-                a = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
-                m = a.copy()
-                cv2.fillPoly(a, [np.round(px - (x0, y0)).astype(np.int32)], 1)
-                cv2.fillPoly(m, [np.round(lasso - (x0, y0)).astype(np.int32)], 1)
-                if cv2.countNonZero(a & m):
-                    hit.append(px)
-                    continue
-            keep.append(poly)
-        if not hit:
-            self.cur().append(lasso / wh)
+        old = list(self.cur())
+        new, n_hit = merge_polys(old, lasso, self.iw, self.ih)
+        if not n_hit:
+            self.cur().append(new[-1])
             self.hist().append(("add", None, len(self.cur()) - 1, self.aid))
             self.changed.add(self.stems[self.i])
             return
-        x0, y0, x1, y1 = self._bbox(lasso, *hit)
-        mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
-        for p in hit + [lasso]:  # one call per polygon: a single fillPoly leaves their overlaps unfilled
-            cv2.fillPoly(mask, [np.round(p - (x0, y0)).astype(np.int32)], 1)
-        # RETR_EXTERNAL: gaps enclosed by the union are filled, as labels cannot hold holes
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         self.hist().append(("replace", [p.copy() for p in old], None, self.aid))
-        self.cur()[:] = keep + self._pieces(contours, x0, y0)
+        self.cur()[:] = new
         self.changed.add(self.stems[self.i])
-        print(f"merged into {len(hit)} overlapping {self.active} polygon(s)", flush=True)
+        print(f"merged into {n_hit} overlapping {self.active} polygon(s)", flush=True)
 
     def cut(self, lasso):
         """Subtract the image-px polygon `lasso` from every active-class polygon it overlaps."""
-        wh = np.array([self.iw, self.ih], np.float32)
-        lb = self._bbox(lasso)
-        old, new, n_cut, n_hole = list(self.cur()), [], 0, 0
-        for poly in old:
-            px = poly * wh
-            x0, y0, x1, y1 = b = self._bbox(px)
-            if not self._overlap(b, lb):
-                new.append(poly)
-                continue
-            # rasterise in the polygon's own bounding box at full image resolution
-            mask = np.zeros((y1 - y0 + 1, x1 - x0 + 1), np.uint8)
-            cv2.fillPoly(mask, [np.round(px - (x0, y0)).astype(np.int32)], 1)
-            area = cv2.countNonZero(mask)
-            cv2.fillPoly(mask, [np.round(lasso - (x0, y0)).astype(np.int32)], 0)
-            if cv2.countNonZero(mask) == area:
-                new.append(poly)
-                continue
-            contours, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-            if hier is not None and (hier[0][:, 3] >= 0).any():
-                n_hole += 1
-                new.append(poly)
-                continue
-            n_cut += 1
-            new += self._pieces(contours, x0, y0)
+        old = list(self.cur())
+        new, n_cut, n_hole = cut_polys(old, lasso, self.iw, self.ih)
         if n_hole:
             print(f"cut lies inside {n_hole} {self.active} polygon(s) and was ignored there; "
                   "holes are not supported, cut from the edge", flush=True)
@@ -934,7 +953,7 @@ class Annotator:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dataset", default=str(Path(__file__).resolve().parent / "dataset_for_finetuning"),
+    ap.add_argument("--dataset", default=str(Path(__file__).resolve().parents[2] / "datasets" / "seg_finetune"),
                     help="YOLO-seg dataset (data.yaml, images/{train,val}, labels/{train,val}) edited in place")
     ap.add_argument("--add", nargs="+", default=[], help="image files or folders to copy into the dataset first")
     ap.add_argument("--split", choices=SPLITS,

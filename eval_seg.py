@@ -82,8 +82,8 @@ def summarise(acc: dict) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "models/best.pt"))
-    ap.add_argument("--data", default="dataset_for_finetuning")
+    ap.add_argument("--weights", default=_PREDICT_CFG.get("weights", "models/3cls_best_v8_e.pt"))
+    ap.add_argument("--data", default="datasets/seg_finetune")
     ap.add_argument("--split", default="val")
     ap.add_argument("--device", default=_PREDICT_CFG.get("device", "auto"))
     ap.add_argument("--reference-um-per-px", type=float, default=_PREDICT_CFG.get("reference_um_per_px", 0.645))

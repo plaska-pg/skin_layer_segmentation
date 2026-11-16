@@ -1,0 +1,27 @@
+# train_qual.py defaults (ordinal ResNet section-quality scorer, ratings 1-3). Keys = option names, dashes -> underscores.
+# Command-line flags override these; each run's args.json records what was used.
+# Inference: base_config.yaml quality_weights / quality_sections (= predict.sections here).
+
+train:
+  sections_csv: datasets/roi_follicle/sections.csv   # rated with training/annotate_boxes.py (key r)
+  source: datasets/roi_follicle/images
+  exclude: datasets/roi_follicle/excluded.txt
+  max_side: 1024
+  arch: resnet18
+  init: imagenet
+  imgsz: 224
+  mode: color
+  epochs: 60
+  batch: 16
+  folds: 5          # qc_pipeline needs > 0: its eval scores each val slide with the fold model that did not train on it
+  project: runs/qual
+  name: train          # set per run: --name cv3
+
+predict:
+  weights: models/qual_v2.pt
+  source: datasets/roi_follicle/images
+  roi_weights: models/roi_det_v3.pt
+  roi_imgsz: 1024
+  roi_max_side: 1024
+  sections: 5
+  out: runs/qual/predict

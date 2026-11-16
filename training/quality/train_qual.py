@@ -2,12 +2,12 @@
 """
 train_qual.py -- score the quality of ROI sections (1 worst - 3 best) with an ordinal ResNet.
 
-    python annotate_boxes.py                   # rate sections (r = rate mode) -> roi_follicle_bb_data/sections.csv
-    python train_qual.py train --name cv1      # 5-fold CV grouped by slide + final fit -> runs/qual_cls/cv1/
-    python train_qual.py predict --weights runs/qual_cls/cv1/final/best.pt \\
-           --source roi_follicle_bb_data/images --rois roi_follicle_bb_data/boxes.csv
-    python train_qual.py predict --weights runs/qual_cls/cv1/final/best.pt \\
-           --source <slides> --rois runs/roi_det/predict/detections.csv --min-conf 0.25
+    python training/annotate_boxes.py                  # rate sections (r = rate mode) -> datasets/roi_follicle/sections.csv
+    python training/quality/train_qual.py train --name cv1      # qual.yaml; 5-fold CV by slide + final fit -> runs/qual/cv1/
+    python training/quality/train_qual.py predict --weights runs/qual/cv1/final/best.pt \\
+           --source datasets/roi_follicle/images --rois datasets/roi_follicle/boxes.csv
+    python training/quality/train_qual.py predict --weights runs/qual/cv1/final/best.pt \\
+           --source <slides> --rois runs/det/roi/predict/detections.csv --min-conf 0.25
 
 Training reads the rated rows of sections.csv and cuts each section out of its --source image on the
 fly (perspective warp stretched to fill an imgsz x imgsz tile, so every pixel comes from the section;
@@ -24,7 +24,7 @@ detections.csv from train_det.py predict (also filtered by --min-conf), or secti
 annotated dividers). Coordinates are in the pixel space of the --source images. Images with no ROIs
 there (or no --rois file at all) get ROIs from the train_det.py model in --roi-weights (saved to
 <out>/detections.csv); images where it finds none are skipped:
-    python train_qual.py predict --weights runs/qual_cls/cv1/final/best.pt --source <slides>
+    python training/quality/train_qual.py predict --weights runs/qual/cv1/final/best.pt --source <slides>
 """
 
 import argparse
@@ -32,6 +32,7 @@ import csv
 import json
 import random
 import statistics
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -43,8 +44,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from annotate_boxes import (CSV_HEADER, RATING_COLORS, ROI_CLASS, even_sections, list_images, load_excluded,
-                            load_scaled, section_quad, slide_key)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for running this file as a script
+from training.annotate_qc_boxes import (CSV_HEADER, RATING_COLORS, ROI_CLASS, even_sections,  # noqa: E402
+                                     list_images, load_excluded, load_scaled, section_quad, slide_key)
+from training.config_utils import apply_config  # noqa: E402
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -131,7 +134,7 @@ def load_rated(a):
         samples.append({"image": name, "roi_idx": int(r["roi_idx"]), "section": int(r["section"]),
                         "rating": int(r["rating"]), "quad": quad, "group": slide_key(Path(name).stem)})
     if not samples:
-        raise SystemExit(f"no rated sections in {a.sections_csv}; rate some with: python annotate_boxes.py (key r)")
+        raise SystemExit(f"no rated sections in {a.sections_csv}; rate some with: python training/annotate_boxes.py (key r)")
     return samples, {k: v for k, v in images.items() if v is not None}
 
 
@@ -417,7 +420,7 @@ def cmd_train(a):
         print(f"\n=== final model on all {len(samples)} sections for {epochs} epochs", flush=True)
         torch.manual_seed(a.seed)
         fit(samples, [], images, a, out / "final", epochs, device)
-        print(f"final weights: {out / 'final' / 'best.pt'}  ->  python train_qual.py predict --weights "
+        print(f"final weights: {out / 'final' / 'best.pt'}  ->  python training/quality/train_qual.py predict --weights "
               f"{(out / 'final' / 'best.pt').as_posix()}")
 
 
@@ -564,7 +567,7 @@ def score_image(model, ckpt, p: Path, rs, out: Path, device, batch, cache):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    root = Path("roi_follicle_bb_data")
+    root = Path("datasets/roi_follicle")
 
     t = sub.add_parser("train", help="cross-validate and train the section quality model on sections.csv")
     t.add_argument("--sections-csv", default=str(root / "sections.csv"))
@@ -573,8 +576,8 @@ def build_parser():
     t.add_argument("--max-side", type=int, default=1024, help="images are downscaled to this long side")
     t.add_argument("--arch", default="resnet18", help="torchvision resnet18 | resnet34 | resnet50")
     t.add_argument("--init", choices=["imagenet", "hist", "none"], default="imagenet",
-                   help="hist = encoder of the 3cls_hist_seg U-Net (needs --arch resnet34)")
-    t.add_argument("--hist-weights", default="3cls_hist_seg/best.pt")
+                   help="hist = encoder of the hist_seg_3cls U-Net (needs --arch resnet34)")
+    t.add_argument("--hist-weights", default="models/init/hist_seg_3cls.pt")
     t.add_argument("--imgsz", type=int, default=224)
     t.add_argument("--mode", choices=["color", "gray"], default="color")
     t.add_argument("--epochs", type=int, default=60)
@@ -594,7 +597,7 @@ def build_parser():
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--workers", type=int, default=0)
     t.add_argument("--device", default=None)
-    t.add_argument("--project", default="runs/qual_cls")
+    t.add_argument("--project", default="runs/qual")
     t.add_argument("--name", default="train")
     t.set_defaults(func=cmd_train)
 
@@ -603,13 +606,13 @@ def build_parser():
     d.add_argument("--source", default=str(root / "images"))
     d.add_argument("--rois", help="boxes.csv | detections.csv | sections.csv; images without ROIs there "
                                   "(or no file) are detected with --roi-weights, and skipped if none are found")
-    d.add_argument("--roi-weights", default="runs/roi_det/train-roi-2/weights/best.pt",
+    d.add_argument("--roi-weights", default="models/roi_det_v3.pt",
                    help="train_det.py ROI model used when --rois is not given")
     d.add_argument("--roi-imgsz", type=int, default=1024)
     d.add_argument("--roi-max-side", type=int, default=1024, help="must match the ROI model's dataset --max-side")
     d.add_argument("--sections", type=int, default=5, help="even sections per ROI (not used for sections.csv)")
     d.add_argument("--min-conf", type=float, default=0.25, help="minimum ROI confidence for detections.csv")
-    d.add_argument("--out", default="runs/qual_cls/predict")
+    d.add_argument("--out", default="runs/qual/predict")
     d.add_argument("--batch", type=int, default=32)
     d.add_argument("--device", default=None)
     d.set_defaults(func=cmd_predict)
@@ -617,7 +620,9 @@ def build_parser():
 
 
 def main():
-    a = build_parser().parse_args()
+    ap = build_parser()
+    apply_config(ap, default=str(Path(__file__).with_name("qual.yaml")))
+    a = ap.parse_args()
     a.func(a)
 
 

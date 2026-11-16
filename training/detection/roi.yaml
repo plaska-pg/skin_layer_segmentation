@@ -1,0 +1,20 @@
+# train_det.py --target roi defaults (YOLO-OBB ROI detector). Keys = option names, dashes -> underscores.
+# Command-line flags override these; each run's args.yaml records what was used.
+# Inference settings live in base_config.yaml (roi_*): roi_max_side / roi_imgsz must match max_side / imgsz here.
+
+train:
+  data: datasets/roi_follicle/yolo_det   # built by training/annotate_boxes.py (long side 1024)
+  model: models/init/yolo11n-obb.pt
+  classes: roi
+  imgsz: 1024
+  epochs: 150
+  batch: 4
+  patience: 50
+  project: runs/det/roi
+  name: train
+
+predict:
+  weights: models/roi_det_v3.pt
+  max_side: 1024
+  imgsz: 1024
+  out: runs/det/roi/predict

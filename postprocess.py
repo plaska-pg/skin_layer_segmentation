@@ -25,7 +25,6 @@ Gland predictions are rotated and smoothed - never ROI/follicle masked or clippe
 """
 
 import os
-import sys
 import threading
 from pathlib import Path
 
@@ -36,11 +35,10 @@ import torch
 from config import CONFIG
 from measurement import (CSV_COLUMNS, _file_date, _layer_spine, draw_gl_midline_panel, draw_spine_panel,
                          measure_layers, overlay, tissue_area_um2)
-from rotate import build_model, pick_device, predict_orientation, rotate_k
-
-sys.path.append(str(Path(__file__).resolve().parent / "pretrained_model"))
-from annotate_boxes import ROI_CLASS, even_sections, section_quad  # noqa: E402
-from train_qual import load_model, mode_of, predict_tiles, prepare, score_color, warp_section  # noqa: E402
+from training.annotate_qc_boxes import ROI_CLASS, even_sections, section_quad
+from training.detection.follicle_tiles import detect_tiled, tile_scale
+from training.quality.train_qual import load_model, mode_of, predict_tiles, prepare, score_color, warp_section
+from training.rotation.rotate import build_model, pick_device, predict_orientation, rotate_k
 
 # um, not raw px: native pixel size varies with scan resolution (e.g. 0.26 vs
 # 0.645 um/px), so a fixed px count means a different physical distance on
@@ -53,10 +51,10 @@ GLAND_ERODE_DILATE_UM = _PP_CFG.get("gland_erod_dil_kernel_size_um", 0.0)
 SC_EPIDERMIS_CONTACT_ENABLED = _PP_CFG.get("sc_epidermis_contact_enabled", True)
 SC_EPIDERMIS_CONTACT_GAP_UM = _PP_CFG.get("sc_epidermis_contact_gap_um", 5.0)
 LATERAL_CLIP_FRAC = _PP_CFG.get("lateral_clip_frac", 0.10)  # fraction of the rotated ROI's horizontal extent trimmed per side
-ROTATION_WEIGHTS = _PP_CFG.get("rotation_weights", "runs/rotation/rotate_model.pt")
+ROTATION_WEIGHTS = _PP_CFG.get("rotation_weights", "models/rotate_model.pt")
 ROTATION_DEVICE = _PP_CFG.get("rotation_device", "auto")
 FOLLICLE_ENABLED = _PP_CFG.get("follicle_enabled", True)
-FOLLICLE_WEIGHTS = _PP_CFG.get("follicle_weights", "models/follicle_det.pt")
+FOLLICLE_WEIGHTS = _PP_CFG.get("follicle_weights", "models/follicle_det_v4.pt")
 FOLLICLE_DEVICE = _PP_CFG.get("follicle_device", "auto")
 FOLLICLE_CONF = _PP_CFG.get("follicle_conf", 0.25)
 FOLLICLE_MAX_SIDE = _PP_CFG.get("follicle_max_side", 1024)
@@ -64,13 +62,13 @@ FOLLICLE_IMGSZ = _PP_CFG.get("follicle_imgsz", 1024)
 FOLLICLE_PADDING_UM = _PP_CFG.get("follicle_padding_um", 0.0)
 FOLLICLE_MASK_FRAC = _PP_CFG.get("follicle_mask_frac", 0.8)
 ROI_ENABLED = _PP_CFG.get("roi_enabled", True)
-ROI_WEIGHTS = _PP_CFG.get("roi_weights", "models/roi_det.pt")
+ROI_WEIGHTS = _PP_CFG.get("roi_weights", "models/roi_det_v3.pt")
 ROI_DEVICE = _PP_CFG.get("roi_device", "auto")
 ROI_CONF = _PP_CFG.get("roi_conf", 0.25)
 ROI_MAX_SIDE = _PP_CFG.get("roi_max_side", 1024)
 ROI_IMGSZ = _PP_CFG.get("roi_imgsz", 1024)
 QUALITY_ENABLED = _PP_CFG.get("quality_enabled", True)
-QUALITY_WEIGHTS = _PP_CFG.get("quality_weights", "models/qual_v1.pt")
+QUALITY_WEIGHTS = _PP_CFG.get("quality_weights", "models/qual_v2.pt")
 QUALITY_DEVICE = _PP_CFG.get("quality_device", "auto")
 QUALITY_SECTIONS = _PP_CFG.get("quality_sections", 5)
 
@@ -220,6 +218,20 @@ def detect_obb(img_bgr: np.ndarray, weights_path: str, device_str: str, conf: fl
     return list(zip(quads, r.obb.conf.cpu().numpy().tolist()))
 
 
+def detect_follicles(img_bgr: np.ndarray, um_per_px: float, weights_path: str, device_str: str, conf: float,
+                     max_side: int, imgsz: int):
+    """detect_obb, except weights trained on fixed-um/px tiles run on tiles of img_bgr at that scale."""
+    with _obb_lock:
+        loaded = _get_obb_model(weights_path, device_str, "follicle")
+        if loaded is None:
+            return None
+        model, device = loaded
+        scale = tile_scale(model)
+        if scale:
+            return detect_tiled(model, img_bgr, um_per_px, scale, conf, device)
+    return detect_obb(img_bgr, weights_path, device_str, conf, max_side, imgsz, name="follicle")
+
+
 def roi_mask(shape, boxes) -> np.ndarray:
     """Bool mask of the union of all ROI oriented boxes."""
     mask = np.zeros(shape[:2], np.uint8)
@@ -286,7 +298,7 @@ def draw_obb_panel(img: np.ndarray, boxes, shaded: np.ndarray = None, color=(0, 
 
 
 # ----------------------------------------------------------------------------
-# section quality (pretrained_model/train_qual.py)
+# section quality (training/quality/train_qual.py)
 # ----------------------------------------------------------------------------
 
 _quality_model_cache = {}
@@ -439,6 +451,53 @@ def imwrite_jpg(path, img: np.ndarray, quality: int) -> None:
 # orchestration
 # ----------------------------------------------------------------------------
 
+def measure_rotated(rot_img: np.ndarray, rot_sc: np.ndarray, rot_gl: np.ndarray, rot_gland, keep: np.ndarray,
+                    um_per_px: float, lateral_clip_frac: float, source_path: Path = None):
+    """Lateral clip + measure_layers on canonically rotated masks; `keep` = False where the
+    tissue was cut artificially (ROI / follicles). Returns (row_extra, measurement_panel, spine_panel)."""
+    # spines first, then clip: build each layer's medial-axis spine on the full
+    # rotated mask so the lateral clip can't carve cut-edges into the skeleton,
+    # then keep only the clip-window portion as the mean-height denominator.
+    lo, hi = lateral_clip_window(rot_sc, rot_gl, lateral_clip_frac)
+    sc_spine, sc_len = _layer_spine(rot_sc.astype(bool), col_window=(lo, hi))
+    gl_spine, gl_len = _layer_spine(rot_gl.astype(bool), col_window=(lo, hi))
+    meas_sc, meas_gl = clip_lateral_margins(rot_sc, rot_gl, lateral_clip_frac)
+    cut_mask = ~keep
+    cut_mask[:, :lo] = True
+    cut_mask[:, hi:] = True
+    row_extra, measurement_panel, spine_cache = measure_layers(
+        rot_img, meas_sc, meas_gl, um_per_px, date=_file_date(source_path),
+        spines={"SC": sc_spine, "Epidermal": gl_spine},
+        lengths_px={"SC": sc_len, "Epidermal": gl_len},
+        gland_mask=rot_gland, cut_mask=cut_mask)
+
+    sc_stats = {"mean_height": row_extra["SC mean height"], "area": row_extra["SC area"]}
+    gl_stats = {"mean_height": row_extra["Epidermal mean height"], "area": row_extra["Epidermal area"]}
+    spine_panel = draw_spine_panel(rot_img, meas_sc, meas_gl, sc_stats, gl_stats, um_per_px,
+                                   spines=spine_cache["spines"], lengths_px=spine_cache["lengths_px"],
+                                   edj=spine_cache["edj"])
+    return row_extra, measurement_panel, spine_panel
+
+
+def remeasure_labels(orig_bgr: np.ndarray, label_mask: np.ndarray, class_index: dict, um_per_px: float,
+                     lateral_clip_frac: float = LATERAL_CLIP_FRAC, source_path: Path = None):
+    """Measures user-edited segmentations as they are: no ROI / follicle masking or morphology.
+    `label_mask` holds class_index values. Returns (row_extra, measurement_panel), or None if SC or
+    Epidermis is empty."""
+    sc_id = class_index["SC"]
+    gl_id = class_index.get("Epidermis", class_index.get("Epidermal", class_index.get("Granular Layer")))
+    gland_id = class_index.get("gland", class_index.get("glands"))
+    sc, gl = label_mask == sc_id, label_mask == gl_id
+    if not sc.any() or not gl.any():
+        return None
+    rot_img, rot_sc, rot_gl, k = rotate_to_canonical(orig_bgr, sc, gl)
+    rot_gland = rotate_k(label_mask == gland_id, k) if gland_id is not None else None
+    keep = np.ones(rot_img.shape[:2], bool)
+    row_extra, measurement_panel, _ = measure_rotated(rot_img, rot_sc, rot_gl, rot_gland, keep, um_per_px,
+                                                      lateral_clip_frac, source_path)
+    return row_extra, measurement_panel
+
+
 def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: np.ndarray,
                    class_index: dict, um_per_px: float, out_dir: Path, source_path: Path = None,
                    postprocess_config: dict = None, return_visuals: bool = False,
@@ -481,13 +540,13 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
 
     follicles = None
     if follicle_enabled:
-        follicles = detect_obb(
-            rot_img,
+        follicles = detect_follicles(
+            rot_img, um_per_px,
             weights_path=settings.get("follicle_weights", FOLLICLE_WEIGHTS),
             device_str=settings.get("follicle_device", FOLLICLE_DEVICE),
             conf=settings.get("follicle_conf", FOLLICLE_CONF),
             max_side=settings.get("follicle_max_side", FOLLICLE_MAX_SIDE),
-            imgsz=settings.get("follicle_imgsz", FOLLICLE_IMGSZ), name="follicle")
+            imgsz=settings.get("follicle_imgsz", FOLLICLE_IMGSZ))
         if follicles and follicle_padding_um > 0:
             follicles = [(pad_obb(quad, follicle_padding_um / um_per_px), confidence)
                          for quad, confidence in follicles]
@@ -540,28 +599,9 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
 
     midline_panel = draw_gl_midline_panel(rot_img, rot_sc, rot_gl)
 
-    # spines first, then clip: build each layer's medial-axis spine on the full
-    # rotated mask so the lateral clip can't carve cut-edges into the skeleton,
-    # then keep only the clip-window portion as the mean-height denominator.
-    lo, hi = lateral_clip_window(rot_sc, rot_gl, lateral_clip_frac)
-    sc_spine, sc_len = _layer_spine(rot_sc.astype(bool), col_window=(lo, hi))
-    gl_spine, gl_len = _layer_spine(rot_gl.astype(bool), col_window=(lo, hi))
-    meas_sc, meas_gl = clip_lateral_margins(rot_sc, rot_gl, lateral_clip_frac)
-    cut_mask = ~keep
-    cut_mask[:, :lo] = True
-    cut_mask[:, hi:] = True
-    row_extra, measurement_panel, spine_cache = measure_layers(
-        rot_img, meas_sc, meas_gl, um_per_px, date=_file_date(source_path),
-        spines={"SC": sc_spine, "Epidermal": gl_spine},
-        lengths_px={"SC": sc_len, "Epidermal": gl_len},
-        gland_mask=rot_gland if gland_id is not None else None,
-        cut_mask=cut_mask)
-
-    sc_stats = {"mean_height": row_extra["SC mean height"], "area": row_extra["SC area"]}
-    gl_stats = {"mean_height": row_extra["Epidermal mean height"], "area": row_extra["Epidermal area"]}
-    spine_panel = draw_spine_panel(rot_img, meas_sc, meas_gl, sc_stats, gl_stats, um_per_px,
-                                   spines=spine_cache["spines"], lengths_px=spine_cache["lengths_px"],
-                                   edj=spine_cache["edj"])
+    row_extra, measurement_panel, spine_panel = measure_rotated(
+        rot_img, rot_sc, rot_gl, rot_gland if gland_id is not None else None, keep, um_per_px,
+        lateral_clip_frac, source_path)
 
     composite = make_composite([
         ("Original", orig_bgr),

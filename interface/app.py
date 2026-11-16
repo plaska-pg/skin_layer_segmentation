@@ -16,6 +16,7 @@ import streamlit as st
 import yaml
 from PIL import Image
 
+import seg_editor
 Image.MAX_IMAGE_PIXELS = None  # QA jpgs of whole-slide images exceed PIL's decompression-bomb cap
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -122,6 +123,45 @@ def config_editor(cfg: dict) -> dict:
     return edited
 
 
+# Run in a subprocess: tkinter is unreliable on Streamlit's script thread.
+_DIALOG_SCRIPT = r"""
+import sys, tkinter as tk
+from tkinter import filedialog
+root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+kind, init = sys.argv[1], sys.argv[2] or None
+if kind == "file":
+    p = filedialog.askopenfilename(initialdir=init, filetypes=[
+        ("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.svs"), ("All files", "*.*")])
+else:
+    p = filedialog.askdirectory(initialdir=init)
+print(p or "")
+"""
+
+
+def _browse_into(key: str, kind: str):
+    current = Path(st.session_state.get(key, "").strip().strip('"') or ".")
+    init = current if current.is_dir() else current.parent if current.parent.is_dir() else Path.home()
+    picked = subprocess.run([sys.executable, "-c", _DIALOG_SCRIPT, kind, str(init)],
+                            capture_output=True, text=True).stdout.strip()
+    if picked:
+        st.session_state[key] = str(Path(picked))
+
+
+def path_input(label: str, key: str, kind: str = "dir") -> str:
+    """Text input with a Browse... button that opens a native file/folder dialog."""
+    c_text, c_btn = st.columns([8, 1], vertical_alignment="bottom")
+    value = c_text.text_input(label, key=key)
+    c_btn.button("Browse...", key=f"{key}_browse", on_click=_browse_into, args=(key, kind), width="stretch")
+    return value.strip().strip('"')
+
+
+def default_output(source: str, single: bool) -> str:
+    if not source:
+        return ""
+    p = Path(source).resolve()
+    return str(p.parent / f"predicted_{p.stem}" if single else p / f"predicted_{p.name}")
+
+
 def newest_measurement(out_dirs: list[Path]):
     found = [p for d in out_dirs if d.exists() for p in d.glob("*_measurement.jpg")]
     return max(found, key=lambda p: p.stat().st_mtime) if found else None
@@ -134,10 +174,17 @@ def newest_measurement(out_dirs: list[Path]):
 def process_tab():
     mode = st.radio("Input", ["Single image", "Folder (its own images only)", "Folder (recursive)"],
                     horizontal=True)
-    source = st.text_input("Image path" if mode == "Single image" else "Folder path", key="source"
-                           ).strip().strip('"')
-    out_root = st.text_input("Output folder (optional - default is 'predicted_<name>' inside the source folder)"
-                             ).strip().strip('"')
+    single = mode == "Single image"
+    source = path_input("Image path" if single else "Folder path", key="source", kind="file" if single else "dir")
+    auto_out = default_output(source, single)
+    # follow the source until the user types their own output folder
+    if st.session_state.get("out_root", "") in ("", st.session_state.get("out_auto")):
+        st.session_state["out_root"] = auto_out
+    st.session_state["out_auto"] = auto_out
+    out_root = path_input("Output folder" + (" (subfolders are mirrored beneath it; leave as the default to put "
+                                              "'predicted_<name>' inside each subfolder)"
+                                              if mode == "Folder (recursive)" else ""),
+                          key="out_root")
     c1, c2 = st.columns(2)
     resume = c1.checkbox("Resume (reuse already-processed images)", value=True)
     limit = int(c2.number_input("Limit images per folder (0 = all)", min_value=0, value=0, step=1))
@@ -153,9 +200,11 @@ def process_tab():
         st.error(f"Path not found: {source}")
         return
     out_base = Path(out_root).resolve() if out_root else None
+    if out_base == Path(auto_out):
+        out_base = None
 
     # one predict.py call per (source, out) job
-    if mode == "Single image":
+    if single:
         if not src.is_file() or src.suffix.lower() not in IMAGE_EXTS:
             st.error(f"Not a supported image: {src}")
             return
@@ -170,8 +219,7 @@ def process_tab():
             n = len(list_images(d))
             n = min(n, limit) if limit else n
             if out_base:
-                rel = d.relative_to(src)
-                out = out_base / rel / f"predicted_{d.name}"
+                out = out_base / d.relative_to(src)
             else:
                 out = d / f"predicted_{d.name}"
             jobs.append((d, out, n))
@@ -254,6 +302,82 @@ def process_tab():
 
 
 # ----------------------------------------------------------------------------
+# Edit and review
+# ----------------------------------------------------------------------------
+
+@st.cache_data(show_spinner="Searching for prediction folders...")
+def prediction_folders(root: str) -> list[str]:
+    """root and every folder below it holding predict.py output."""
+    root_p = Path(root)
+    found = {p.parent for name in ("run_config.yaml", "_results.csv") for p in root_p.rglob(name)}
+    found |= {p.parent for p in root_p.rglob("*_segmentations") if p.is_dir()}
+    return sorted(str(p) for p in found)
+
+
+def _set_reviewed(pred_dir: Path, stem: str, key: str):
+    seg_editor.update_row(pred_dir, stem, {"reviewed": "yes" if st.session_state[key] else ""})
+    load_results.clear()
+
+
+@st.fragment
+def editor_fragment(pred_dir: Path, stem: str):
+    if seg_editor.editor(pred_dir, stem):
+        load_results.clear()
+        st.rerun()  # refresh the measurement image and CSV row outside the fragment
+
+
+def edit_tab():
+    root = path_input("Predictions folder (a predicted_* folder or any folder above it)", key="edit_root")
+    if not root:
+        st.info("Choose a folder to review.")
+        return
+    if st.button("Refresh", key="edit_refresh"):
+        prediction_folders.clear()
+    if not Path(root).is_dir():
+        st.error(f"Folder not found: {root}")
+        return
+    folders = prediction_folders(root)
+    if not folders:
+        st.info("No predict.py output found.")
+        return
+    pred_dir = Path(st.selectbox("Prediction folder", folders,
+                                 format_func=lambda p: str(Path(p).relative_to(root))))
+    stems = seg_editor.list_stems(pred_dir)
+    if not stems:
+        st.info("No images in this prediction folder.")
+        return
+    rows = {r.get("file name"): r for r in seg_editor.read_rows(pred_dir)[0]}
+    stem = st.selectbox("Image", stems,
+                        format_func=lambda s: s + ("  (reviewed)" if (rows.get(s) or {}).get("reviewed") else ""))
+    row = rows.get(stem)
+
+    col_img, col_row = st.columns([3, 2])
+    meas = pred_dir / f"{stem}_measurement.jpg"
+    try:
+        col_img.image(load_preview(meas), caption=meas.name, width="stretch")
+    except OSError:
+        col_img.info(f"No measurement image for {stem}")
+    with col_row:
+        rev_key = f"reviewed|{pred_dir}|{stem}"
+        st.checkbox("Reviewed", value=bool(row and row.get("reviewed")), key=rev_key,
+                    on_change=_set_reviewed, args=(pred_dir, stem, rev_key))
+        if row:
+            st.dataframe(pd.DataFrame({"value": row}), width="stretch")
+        else:
+            st.caption("No CSV row for this image (it may have been skipped during postprocessing).")
+    steps = pred_dir / f"{stem}_steps.jpg"
+    with st.expander("Postprocessing steps (from the original run)"):
+        if st.checkbox("Show", key="edit_show_steps"):
+            try:
+                st.image(load_preview(steps), caption=steps.name, width="stretch")
+            except OSError:
+                st.info(f"No steps image for {stem}")
+
+    if st.toggle("Edit segmentation", key="edit_open"):
+        editor_fragment(pred_dir, stem)
+
+
+# ----------------------------------------------------------------------------
 # Explore data
 # ----------------------------------------------------------------------------
 
@@ -275,7 +399,8 @@ def load_results(root: str) -> pd.DataFrame:
 
 
 def explore_tab():
-    root = st.text_input("Results folder", value=DEFAULT_EXPLORE_DIR).strip().strip('"')
+    st.session_state.setdefault("explore_root", DEFAULT_EXPLORE_DIR)
+    root = path_input("Results folder", key="explore_root")
     if st.button("Refresh"):
         load_results.clear()
     if not Path(root).is_dir():
@@ -319,8 +444,10 @@ def explore_tab():
         st.info(f"No measurement/steps images found for {name} in {out_dir}")
 
 
-tab_process, tab_explore = st.tabs(["Process new", "Explore data"])
+tab_process, tab_edit, tab_explore = st.tabs(["Process new", "Edit and review", "Explore data"])
 with tab_process:
     process_tab()
+with tab_edit:
+    edit_tab()
 with tab_explore:
     explore_tab()

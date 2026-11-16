@@ -9,10 +9,10 @@ Reuses a dataset produced by histoseg_to_yolo.py: the polygon labels are
 rasterised to a class-per-pixel mask on the fly, so no reconversion is needed.
 
 
-    python train_semseg.py train --data yolo_dataset_4cls_v2 --epochs 60
-    python train_semseg.py train --data yolo_dataset_4cls_v2 --encoder resnet50 --crop 768
-    python train_semseg.py predict --weights runs/semseg/train/best.pt \\
-           --source yolo_dataset_4cls_v2/images/val --out preds
+    python training/semseg/train_semseg.py train --name v9          # recipe from semseg.yaml
+    python training/semseg/train_semseg.py train --name v9b --lr 1e-4   # flags override the YAML
+    python training/semseg/train_semseg.py predict --weights runs/semseg/v9/best.pt \\
+           --source datasets/seg_finetune/images/val --out preds
 
 
 Physical scale is tracked end to end: data.yaml carries the tiles' um/px (from
@@ -22,9 +22,9 @@ degradation; the checkpoint stores um_per_px (reference = validation scale) and
 train_um_range; --val-scales reports Dice per scale; predict resamples inputs
 from --um-per-px to the reference and writes scale.json next to the masks.
 
-    python train_semseg.py train --data yolo_dataset_4cls_1x --train-um-range 0.7,2.8 \\
+    python train_semseg.py train --data <dataset> --train-um-range 0.7,2.8 \\
            --blur-p 0.3 --downup-p 0.3 --jpeg-p 0.3 --val-scales 0.7,1.0,1.4,2.0,2.8
-    python train_semseg.py sweep --weights runs/unet/07/best.pt --data yolo_dataset_4cls_1x
+    python train_semseg.py sweep --weights runs/semseg/v8_edge_2/best.pt
     python train_semseg.py predict --weights ... --source new_scans --um-per-px 0.28
 
 Model: U-Net with an ImageNet-pretrained torchvision ResNet encoder.
@@ -40,11 +40,13 @@ ultralytics environment). TensorBoard logging works if tensorboard is installed.
 
 
 import argparse
+import copy
 import csv
 import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -55,7 +57,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for running this file as a script
+from training.config_utils import apply_config  # noqa: E402
 
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -134,11 +139,19 @@ class TileDataset(Dataset):
         blur_p / downup_p / jpeg_p: per-sample probabilities of the resolution-degradation
         augmentations (see _degrade)."""
         img_dir = data_dir / "images" / split
-        self.images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.tif", "*.tiff") for p in img_dir.glob(ext))
         self.labels = data_dir / "labels" / split
+        images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.tif", "*.tiff") for p in img_dir.glob(ext))
+        # an image with no label file would teach its whole tissue section as background
+        unlabeled = [p.name for p in images if not (self.labels / (p.stem + ".txt")).exists()]
+        if unlabeled:
+            print(f"WARNING: {split}: skipping {len(unlabeled)} image(s) with no label file: {unlabeled}")
+        self.images = [p for p in images if p.name not in unlabeled]
         self.crop, self.augment, self.downsample = crop, augment, downsample
         self.scale_aug, self.blur_p, self.downup_p, self.jpeg_p = tuple(scale_aug), blur_p, downup_p, jpeg_p
         self.ref_um_per_px, self.scale_map = read_scale_calibration(data_dir)
+        uncal = [p.name for p in self.images if self.ref_um_per_px and p.stem not in self.scale_map]
+        if uncal:
+            print(f"WARNING: {split}: no um_per_px in scale_calibration.json (used unscaled): {uncal}")
 
 
     def __len__(self):
@@ -149,17 +162,17 @@ class TileDataset(Dataset):
         ip = self.images[i]
         img = cv2.cvtColor(cv2.imread(str(ip)), cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
+        # rasterised at native res: fillPoly includes edge pixels, which at training scale fattens classes ~0.3 px
         mask = rasterise(self.labels / (ip.stem + ".txt"), h, w)
-
 
         # normalise to a common um/pixel first (if calibrated), then apply --downsample
         native_um_per_px = self.scale_map.get(ip.stem) if self.ref_um_per_px else None
         scale = (native_um_per_px / self.ref_um_per_px) if native_um_per_px else 1.0
         total = scale / self.downsample
         if total != 1:
-            nh, nw = max(1, round(h * total)), max(1, round(w * total))
-            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if total < 1 else cv2.INTER_LINEAR)
-            mask = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+            h, w = max(1, round(h * total)), max(1, round(w * total))
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA if total < 1 else cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST_EXACT)
 
 
         if self.augment:
@@ -226,7 +239,7 @@ class TileDataset(Dataset):
         img, mask = img[y0:y0 + c, x0:x0 + c], mask[y0:y0 + c, x0:x0 + c]
         if c != self.crop:
             img = cv2.resize(img, (self.crop, self.crop), interpolation=cv2.INTER_AREA if c > self.crop else cv2.INTER_LINEAR)
-            mask = cv2.resize(mask, (self.crop, self.crop), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize(mask, (self.crop, self.crop), interpolation=cv2.INTER_NEAREST_EXACT)
         # histology has no canonical orientation
         k = random.randint(0, 3)
         img, mask = np.rot90(img, k), np.rot90(mask, k)
@@ -322,6 +335,15 @@ class ResUNet(nn.Module):
 # ----------------------------------------------------------------------------
 
 
+def edge_weight_map(target, width: int, gain: float):
+    """1 + gain on pixels within `width` px of a class change in the label, else 1."""
+    t = target.float()[:, None]
+    k = 2 * width + 1
+    hi = F.max_pool2d(t, k, 1, width)
+    lo = -F.max_pool2d(-t, k, 1, width)
+    return 1 + gain * (hi != lo)[:, 0].float()
+
+
 def dice_loss(logits, target, n_classes, eps=1.0):
     prob = logits.softmax(1)
     onehot = F.one_hot(target, n_classes).permute(0, 3, 1, 2).float()
@@ -403,43 +425,33 @@ def save_train_samples(loader, out_dir: Path, max_samples=8):
 
 
 
-VAL_MAX_SIDE = 2048  # cap the val forward-pass resolution: a whole-slide val image
-# run at full res allocates tens of GB of activations, which OOMs a small GPU and, on
-# the CPU fallback, can exhaust system RAM and hard-crash the machine. Scoring is still
-# done at full resolution (the prediction is upsampled back).
+VAL_TILE = 1024  # val runs tiled at training scale; downscaling whole slides erased thin SC
 
 
 
 
 @torch.no_grad()
-def _val_predict(model, x, device, max_side=VAL_MAX_SIDE):
-    """Predict class indices for one whole val image at a memory-bounded
-    resolution, upsampled back to the input's own (H, W) so IoU is scored at
-    full res. The forward pass runs on a copy downscaled so its longest side is
-    <= max_side (on GPU, falling back to CPU only for the already-downscaled
-    input if VRAM still doesn't fit) - this is what keeps validation from
-    OOM-crashing the GPU or the whole machine on these large slides."""
+def _val_predict(model, x, device, tile=VAL_TILE, overlap=0.25):
+    """Class indices (1, H, W) for one val image at its own (training) scale, run as
+    overlapping tiles; each tile keeps only its centre so edges get full context."""
     _, _, h, w = x.shape
-    xin = x
-    if max_side and max(h, w) > max_side:
-        s = max_side / max(h, w)
-        xin = F.interpolate(x, size=(max(1, round(h * s)), max(1, round(w * s))),
-                            mode="bilinear", align_corners=False)
-    try:
-        pred = model(xin.to(device)).argmax(1)
-    except (torch.OutOfMemoryError, RuntimeError) as e:
-        if device.type != "cuda" or "out of memory" not in str(e).lower():
-            raise
-        torch.cuda.empty_cache()
-        model.to("cpu")
-        try:
-            pred = model(xin.to("cpu")).argmax(1)
-        finally:
-            model.to(device)
-    pred = pred.to(torch.uint8)
-    if pred.shape[-2:] != (h, w):
-        pred = F.interpolate(pred[:, None].float(), size=(h, w), mode="nearest")[:, 0].to(torch.uint8)
-    return pred.cpu().numpy()
+    m = int(tile * overlap / 2)
+    stride = tile - 2 * m
+    ys = sorted(set(list(range(0, max(1, h - tile), stride)) + [max(0, h - tile)]))
+    xs = sorted(set(list(range(0, max(1, w - tile), stride)) + [max(0, w - tile)]))
+    pred = np.zeros((1, h, w), np.uint8)
+    for y0 in ys:
+        for x0 in xs:
+            patch = x[:, :, y0:y0 + tile, x0:x0 + tile]
+            ph, pw = patch.shape[-2:]
+            patch = F.pad(patch, (0, (32 - pw % 32) % 32, 0, (32 - ph % 32) % 32), mode="replicate")
+            p = model(patch.to(device)).argmax(1)[:, :ph, :pw].to(torch.uint8).cpu().numpy()
+            ty0 = m if y0 > 0 else 0
+            tx0 = m if x0 > 0 else 0
+            ty1 = ph - m if y0 + ph < h else ph
+            tx1 = pw - m if x0 + pw < w else pw
+            pred[:, y0 + ty0:y0 + ty1, x0 + tx0:x0 + tx1] = p[:, ty0:ty1, tx0:tx1]
+    return pred
 
 
 
@@ -477,8 +489,12 @@ def load_pretrained(model: nn.Module, ckpt_path: str, old_class_map: list, devic
     old_sd, old_names = ckpt["model"], ckpt["names"]
     trunk_sd = {k: v for k, v in old_sd.items() if k not in ("head.weight", "head.bias")}
     missing, unexpected = model.load_state_dict(trunk_sd, strict=False)
-    assert unexpected == [] and set(missing) <= {"head.weight", "head.bias"}, \
+    new_layers = {k for k in missing if k.split(".")[0] in ("s0", "d0")}  # full_res stage on a /2 checkpoint
+    assert unexpected == [] and set(missing) - new_layers <= {"head.weight", "head.bias"}, \
         f"unexpected trunk mismatch: missing={missing} unexpected={unexpected}"
+    if model.head.weight.shape[1] != old_sd["head.weight"].shape[1]:
+        print(f"loaded pretrained trunk from {ckpt_path}; new full-res stage + head start from scratch")
+        return
     rows = [0] + [old_names.index(n) + 1 for n in old_class_map]  # background + mapped classes
     with torch.no_grad():
         model.head.weight.copy_(old_sd["head.weight"][rows])
@@ -514,16 +530,64 @@ def safe_torch_save(obj, path: Path, retries: int = 15, delay: float = 2.0):
 
 
 
-def scale_sweep(model, data_dir: Path, u_yaml: float, scales, device, names, out_csv: Path):
+class EMA:
+    """Exponential moving average of the weights (and BatchNorm buffers). Validation and
+    checkpoints use the averaged model, which smooths the epoch-to-epoch swings seen with
+    small batches without changing the optimisation itself."""
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        msd = model.state_dict()
+        for k, v in self.module.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(msd[k].detach(), alpha=1 - self.decay)
+            else:
+                v.copy_(msd[k])
+
+
+def class_weighted_sampler(ds: "TileDataset", names, spec: str):
+    """--oversample 'glands=3,follicles=2': a tile is drawn k times as often as a plain tile
+    when it contains that class (max over the classes present). Returns the sampler and the
+    resulting share of draws per class."""
+    factors = {k: float(v) for k, v in (item.split("=") for item in spec.split(","))}
+    for k in factors:
+        if k not in names:
+            raise SystemExit(f"--oversample: unknown class {k!r} (have {names})")
+    weights, present_all = [], []
+    for ip in ds.images:
+        lp = ds.labels / (ip.stem + ".txt")
+        present = set()
+        if lp.exists():
+            for line in lp.read_text().splitlines():
+                if line.strip():
+                    present.add(names[int(line.split()[0])])
+        present_all.append(present)
+        weights.append(max([factors.get(n, 1.0) for n in present], default=1.0))
+    total = sum(weights)
+    share = {n: round(sum(w for w, pr in zip(weights, present_all) if n in pr) / total, 3) for n in names}
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True), share
+
+
+def scale_sweep(model, data_dir: Path, u_yaml: float, scales, device, names, out_csv: Path, only_slides=None):
     """Validate at several physical scales. The val tiles (u_yaml um/px) are resampled
     to each target um/px before prediction, so the table shows how Dice holds up as
     resolution moves away from the training reference - the headline robustness result."""
     n_classes = len(names) + 1
     rows = []
-    print(f"\nscale sweep (val tiles are {u_yaml:.3f} um/px):")
+    print(f"\nscale sweep (val tiles are {u_yaml:.3f} um/px{', slides ' + ','.join(only_slides) if only_slides else ''}):")
     print(f"{'um/px':>7s} {'mean_fg':>8s} " + " ".join(f"{n:>10s}" for n in names))
     for t in scales:
         ds = TileDataset(data_dir, "val", downsample=t / u_yaml)
+        if only_slides:
+            ds.images = [ip for ip in ds.images if any(ip.stem.startswith(pfx) for pfx in only_slides)]
+            if not ds.images:
+                raise SystemExit(f"--only-slides matched no val tiles: {only_slides}")
         dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
         iou, dice = evaluate(model, dl, device, n_classes)
         rows.append([t, round(float(dice[1:].mean()), 4)] + [round(float(v), 4) for v in dice[1:]]
@@ -591,7 +655,14 @@ def cmd_train(args):
                            scale_aug=scale_aug, blur_p=args.blur_p, downup_p=args.downup_p, jpeg_p=args.jpeg_p)
     val_ds = TileDataset(data_dir, "val", downsample=val_down)
     print(f"train tiles={len(train_ds)}  val tiles={len(val_ds)}")
-    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+    leaked = {p.stem for p in train_ds.images} & {p.stem for p in val_ds.images}
+    if leaked:
+        raise SystemExit(f"images in both train and val (validation would be meaningless): {sorted(leaked)}")
+    sampler = None
+    if args.oversample:
+        sampler, share = class_weighted_sampler(train_ds, names, args.oversample)
+        print(f"oversampling {args.oversample}: share of draws containing each class = {share}")
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=sampler is None, sampler=sampler,
                           num_workers=args.workers, drop_last=True, persistent_workers=args.workers > 0)
     val_dl = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
@@ -601,13 +672,17 @@ def cmd_train(args):
     print(f"wrote example train image|label panels to {samples_dir}")
 
 
-    model = ResUNet(n_classes, args.encoder, pretrained=not args.no_pretrained).to(device)
+    model = ResUNet(n_classes, args.encoder, pretrained=not args.no_pretrained, full_res=args.full_res).to(device)
     if args.init_weights:
         old_class_map = args.pretrained_classes.split(",") if args.pretrained_classes else names
         assert len(old_class_map) == len(names), \
             f"--pretrained-classes must list {len(names)} names (one per {names}), got {old_class_map}"
         load_pretrained(model, args.init_weights, old_class_map, device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    ema = EMA(model, args.ema) if args.ema else None
+    eval_model = ema.module if ema else model  # what gets validated and saved
+    if ema:
+        print(f"EMA of weights with decay {args.ema} (validation and checkpoints use the average)")
     steps = args.epochs * math.ceil(len(train_dl) / args.accumulate)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.1)
     weights = torch.ones(n_classes)
@@ -618,7 +693,14 @@ def cmd_train(args):
         weights[names.index(cls) + 1] = float(w)
     if args.class_weights:
         print(f"class weights: {dict(zip(['background'] + names, weights.tolist()))}")
-    ce = nn.CrossEntropyLoss(weight=weights.to(device))
+    weights = weights.to(device)
+    if args.edge_weight:
+        print(f"edge-weighted CE: x{1 + args.edge_weight:g} within {args.edge_width} px of label boundaries")
+
+    def ce(logits, y):
+        px = F.cross_entropy(logits, y, weight=weights, reduction="none")
+        ew = edge_weight_map(y, args.edge_width, args.edge_weight) if args.edge_weight else torch.ones_like(px)
+        return (px * ew).sum() / (weights[y] * ew).sum()
 
 
     writer = None
@@ -649,12 +731,15 @@ def cmd_train(args):
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
+                if ema:
+                    ema.update(model)
             tot += loss.item()
             nb += 1
         train_loss = tot / max(nb, 1)
 
 
-        ckpt = {"model": model.state_dict(), "names": names, "encoder": args.encoder, "epoch": epoch, **scale_meta}
+        ckpt = {"model": eval_model.state_dict(), "names": names, "encoder": args.encoder, "epoch": epoch,
+                "full_res": args.full_res, **scale_meta}
         safe_torch_save(ckpt, out / "last.pt")
 
 
@@ -665,7 +750,7 @@ def cmd_train(args):
             continue
 
 
-        iou, dice = evaluate(model, val_dl, device, n_classes)
+        iou, dice = evaluate(eval_model, val_dl, device, n_classes)
         fg_dice, fg_iou = dice[1:].mean(), iou[1:].mean()
         row = [epoch, round(time.time() - t0), round(train_loss, 4), round(fg_dice, 4), round(fg_iou, 4)] \
             + [round(v, 4) for v in dice[1:]] + [round(v, 4) for v in iou[1:]]
@@ -724,7 +809,7 @@ def cmd_sweep(args):
     device = pick_device(args.device)
     ckpt = torch.load(args.weights, map_location=device)
     names = ckpt["names"]
-    model = ResUNet(len(names) + 1, ckpt["encoder"], pretrained=False).to(device)
+    model = ResUNet(len(names) + 1, ckpt["encoder"], pretrained=False, full_res=ckpt.get("full_res", False)).to(device)
     model.load_state_dict(ckpt["model"])
     data_dir = Path(args.data)
     assert read_names(data_dir) == names, f"dataset classes {read_names(data_dir)} != checkpoint {names}"
@@ -734,7 +819,8 @@ def cmd_sweep(args):
     ref = ckpt.get("um_per_px")
     print(f"checkpoint reference {ref} um/px, train band {ckpt.get('train_um_range')}")
     out_csv = Path(args.out) if args.out else Path(args.weights).with_name("scale_sweep.csv")
-    scale_sweep(model, data_dir, u_yaml, [float(v) for v in args.scales.split(",")], device, names, out_csv)
+    scale_sweep(model, data_dir, u_yaml, [float(v) for v in args.scales.split(",")], device, names, out_csv,
+                only_slides=args.only_slides)
 
 
 
@@ -792,7 +878,7 @@ def cmd_predict(args):
     device = pick_device(args.device)
     ckpt = torch.load(args.weights, map_location=device)
     names = ckpt["names"]
-    model = ResUNet(len(names) + 1, ckpt["encoder"], pretrained=False).to(device)
+    model = ResUNet(len(names) + 1, ckpt["encoder"], pretrained=False, full_res=ckpt.get("full_res", False)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -863,39 +949,6 @@ def cmd_predict(args):
 
 
 
-def apply_config(parsers_sections: dict, argv=None):
-    """--config config.yaml: use the file's values as argparse defaults for each
-    sub-command. parsers_sections maps a subparser to the config sections that feed it;
-    only keys matching the subparser's own option names are used, lists become
-    comma-separated strings for single-value options, and mappings become k=v lists.
-    Explicit command-line flags still override everything."""
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", default=None)
-    known, _ = pre.parse_known_args(argv)
-    for sp in parsers_sections:
-        sp.add_argument("--config", default=None, help="YAML file whose sections provide option defaults")
-    if not known.config:
-        return
-    cfg = yaml.safe_load(Path(known.config).read_text()) or {}
-    for sp, sections in parsers_sections.items():
-        actions = {a.dest: a for a in sp._actions}
-        merged = {}
-        for sec in sections:
-            merged.update(cfg.get(sec) or {})
-        defaults = {}
-        for k, v in merged.items():
-            a = actions.get(k)
-            if a is None or k == "config":
-                continue
-            if isinstance(v, dict):
-                v = ",".join(f"{kk}={vv}" for kk, vv in v.items())
-            elif isinstance(v, list) and a.nargs is None:
-                v = ",".join(str(x) for x in v)
-            defaults[k] = v
-            a.required = False  # a value from the config satisfies a required option
-        sp.set_defaults(**defaults)
-
-
 # ----------------------------------------------------------------------------
 
 
@@ -905,7 +958,7 @@ def main():
 
 
     t = sub.add_parser("train", help="train a U-Net on a histoseg_to_yolo.py dataset")
-    t.add_argument("--data", default="yolo_dataset_4cls_v2", help="dataset folder with data.yaml")
+    t.add_argument("--data", default="datasets/seg_finetune", help="dataset folder with data.yaml")
     t.add_argument("--encoder", default="resnet34", help="resnet18 | resnet34 | resnet50")
     t.add_argument("--no-pretrained", action="store_true", help="skip ImageNet encoder weights")
     t.add_argument("--epochs", type=int, default=60)
@@ -921,8 +974,19 @@ def main():
                         "speeds up dev iteration on large whole-slide images")
     t.add_argument("--workers", type=int, default=2)
     t.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
+    t.add_argument("--ema", type=float, default=0.0,
+                   help="decay of an exponential moving average of the weights, e.g. 0.995; 0 = off. "
+                        "Validation and checkpoints use the averaged weights")
+    t.add_argument("--oversample", default=None,
+                   help="draw tiles containing rare classes more often, e.g. 'glands=3,follicles=2'")
     t.add_argument("--accumulate", type=int, default=1,
                    help="gradient accumulation steps (effective batch = --batch x this)")
+    t.add_argument("--full-res", action="store_true",
+                   help="add a stride-1 decoder stage so logits are predicted at input resolution")
+    t.add_argument("--edge-weight", type=float, default=0.0,
+                   help="extra cross-entropy weight on pixels near label boundaries (e.g. 2 -> x3); 0 = off")
+    t.add_argument("--edge-width", type=int, default=3,
+                   help="half-width (px, at training scale) of the boundary band for --edge-weight")
     t.add_argument("--class-weights", default=None,
                    help="cross-entropy class weights, e.g. 'SC=2' or 'SC=2,glands=1.5' (others 1)")
     t.add_argument("--train-um-range", default=None,
@@ -940,7 +1004,7 @@ def main():
     t.add_argument("--val-scales", default=None,
                    help="comma-separated um/px values; after training, validate best.pt at each and write "
                         "scale_sweep.csv (e.g. 0.7,1.0,1.4,2.0,2.8)")
-    t.add_argument("--project", default="runs/unet")
+    t.add_argument("--project", default="runs/semseg")
     t.add_argument("--name", default="train")
     t.add_argument("--init-weights", default=None,
                     help="warm-start trunk+matching head rows from another train_semseg.py best.pt "
@@ -980,16 +1044,13 @@ def main():
     sw.add_argument("--scales", default="0.7,1.0,1.4,2.0,2.8", help="comma-separated um/px values")
     sw.add_argument("--device", default="auto")
     sw.add_argument("--out", default=None, help="csv path (default: scale_sweep.csv next to the weights)")
+    sw.add_argument("--only-slides", nargs="*", default=None, metavar="PREFIX",
+                    help="score only val tiles whose name starts with one of these (e.g. a specimen id)")
     sw.set_defaults(func=cmd_sweep)
 
 
-    apply_config({t: ("training", "augmentation", "evaluation"), p: ("inference",), sw: ("evaluation",)})
+    apply_config(ap, default=str(Path(__file__).with_name("semseg.yaml")))
     args = ap.parse_args()
-    if args.cmd == "sweep" and getattr(args, "config", None) and args.scales == sw.get_default("scales"):
-        cfg = yaml.safe_load(Path(args.config).read_text()) or {}
-        vs = (cfg.get("evaluation") or {}).get("val_scales")
-        if vs:
-            args.scales = ",".join(str(x) for x in vs)
     random.seed(0)
     torch.manual_seed(0)
     args.func(args)

@@ -81,6 +81,8 @@ CSV_COLUMNS = [
    "EDJ tortuosity",
     "quality",
     "num_glands", "total_sebocyte_um2", "total_tissue_um2",
+    # set by the interface's Edit and review tab; kept here so predict.py --resume preserves them
+    "reviewed", "edited",
 ]
 
 

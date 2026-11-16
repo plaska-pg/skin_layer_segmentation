@@ -18,6 +18,8 @@ def load_config(path: Path = None) -> dict:
     """Parsed YAML config dict, or {} if the file doesn't exist."""
     p = Path(path) if path else BASE_CONFIG_PATH
     if not p.exists():
+        if not path and os.environ.get("SKIN_SEG_CONFIG"):
+            raise FileNotFoundError(f"SKIN_SEG_CONFIG points to a missing file: {p}")
         return {}
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 

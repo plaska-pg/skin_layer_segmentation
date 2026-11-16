@@ -9,6 +9,16 @@ the pipeline should have tabs where I select either process new or explore data
   preview: 
   While processing, should show a progress bar and a preview of the most recent measurement image with a spinning wheel to show the segmentations and measurements are still being computed. IN in the processing tab, WHile there is no measurment image, the preview of the first (or only)raw  image should appear.  Once it is done, the preview raw image should be replaced with a preview of the measurement image (like test_euler_measurement.jpg.)
  
+ # Edit and Review tab:
+ Allow as user to adjust the predicted segmentations like in training\semseg\add_segmentations.py
 
 # explore data tab:
  should pull all results.csv in a selected folder recursively. Default should be C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Raw images
+
+
+updates:
+- enable selecting a folder from the computer filesystem
+
+
+
+

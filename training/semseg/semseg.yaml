@@ -1,0 +1,33 @@
+# train_semseg.py defaults (SC / Epidermis / gland ResUNet). Keys = option names, dashes -> underscores.
+# Command-line flags override these; each run's args.json records what was used.
+# Recipe of v8_edge (models/3cls_best_v8_e.pt): v7 fine-tune with edge-weighted CE.
+
+train:
+  data: datasets/seg_finetune
+  init_weights: models/3cls_best_v7.pt
+  encoder: resnet34
+  epochs: 100
+  batch: 2
+  accumulate: 1
+  crop: 512
+  lr: 2.0e-4
+  class_weights: SC=3
+  blur_p: 0.3
+  downup_p: 0.3
+  jpeg_p: 0.3
+  edge_weight: 2
+  edge_width: 3
+  val_every: 5
+  patience: 10
+  workers: 0
+  device: auto
+  project: runs/semseg
+  name: train          # set per run: --name v9
+
+predict:
+  device: auto
+  tile: 1024
+
+sweep:
+  data: datasets/seg_finetune
+  device: auto

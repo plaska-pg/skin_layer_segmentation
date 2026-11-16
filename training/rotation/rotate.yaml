@@ -1,0 +1,15 @@
+# rotate.py defaults (RotNet-style 0/90/180/270 orientation classifier). Keys = option names, dashes -> underscores.
+# Command-line flags override these. Inference: base_config.yaml rotation_weights.
+
+train:
+  dataset: datasets/rotate
+  output: runs/rotation/rotate_model.pt
+  pretrained: true
+  epochs: 50
+  samples_per_image: 4
+  batch_size: 4
+  device: cuda
+
+predict:
+  weights: models/rotate_model.pt
+  out: runs/rotation/predictions

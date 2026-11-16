@@ -1,0 +1,22 @@
+# train_det.py --target follicle defaults (YOLO-OBB follicle detector). Keys = option names, dashes -> underscores.
+# Command-line flags override these; each run's args.yaml records what was used.
+# Training on yolo_follicle (fixed-um/px tiles) stamps the tile scale into the weights; postprocess.py and
+# predict then tile slides the same way. Older whole-slide weights (follicle_det_v4) use max_side instead.
+
+train:
+  data: datasets/roi_follicle/yolo_follicle   # tiles at 2.5 um/px built by training/annotate_qc_boxes.py; or a fold<k>.yaml in it
+  model: models/init/yolo11n-obb.pt
+  classes: follicle
+  imgsz: 1024     # = the dataset's tile size
+  epochs: 150
+  batch: 4
+  patience: 50
+  project: runs/det/follicle
+  name: train
+
+predict:
+  weights: models/follicle_det_v4.pt
+  max_side: 1024    # whole-slide weights: must match their training; tiled weights: overlay size
+  imgsz: 1024
+  um_per_px: 0.2577 # native um/px of --source slides (tiled weights)
+  out: runs/det/follicle/predict

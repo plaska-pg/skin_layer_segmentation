@@ -1,0 +1,25 @@
+# qc_pipeline.py parameters: shared data paths and eval thresholds for the QC models
+# (ROI + follicle detection, section quality scoring). Training options of each model come from its own
+# config's train: section (training/detection/roi.yaml, follicle.yaml, training/quality/qual.yaml);
+# roi: / follicle: / qual: sections added here would override those for the pipeline only.
+# Override from the CLI: --set roi.epochs=2 --set qual.folds=2
+project: runs/qc_pipeline
+
+data:
+  images: datasets/roi_follicle/images
+  boxes: datasets/roi_follicle/boxes.csv
+  sections: datasets/roi_follicle/sections.csv
+  exclude: datasets/roi_follicle/excluded.txt
+  dataset: datasets/roi_follicle/yolo_det       # built by training/annotate_qc_boxes.py; its val slides are used by eval
+  follicle_dataset: datasets/roi_follicle/yolo_follicle   # fixed-um/px follicle tiles + fold<k>.yaml (same val slides)
+  calibration: datasets/roi_follicle/scale_calibration.json  # um/px of each image in images/
+  max_side: 1024
+
+eval:
+  min_conf: 0.25    # ROI detection confidence threshold for matching / scoring
+  iou: 0.5          # detected vs annotated ROI overlap needed to count as a match
+  sections: 5       # even sections per detected ROI
+  follicle_conf: 0.25   # follicle detection confidence threshold (eval matching and predict)
+  follicle_iou: 0.5     # detected vs annotated follicle overlap needed to count as a match
+  follicle_padding_um: 50   # = base_config.yaml follicle_padding_um; boxes are padded before comparing masked areas
+  mask_um_per_px: 5         # raster resolution of the mask-area comparison

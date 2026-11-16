@@ -2,7 +2,7 @@
 """
 annotate_boxes.py -- draw oriented (4-point) bounding boxes on large images (whole-slide exports).
 
-    python annotate_boxes.py                 # edit follicle + roi boxes in roi_follicle_bb_data/ (default)
+    python training/annotate_boxes.py        # edit follicle + roi boxes in datasets/roi_follicle/ (default)
     python annotate_boxes.py --merge-from ROI/boxes.csv,follicles/boxes.csv   # one-time merge into combined/
     python annotate_boxes.py --follicles     # old follicle-only workflow in follicles/
     python annotate_boxes.py --roi           # old ROI-only workflow in ROI/
@@ -32,17 +32,32 @@ Re-running resumes from the CSV, starting at the first image missing a class.
 On quit, combined/yolo_det is rebuilt: one dataset with classes follicle=0 and roi=1, using every
 image with at least one box. Slides are downscaled to --max-side px and split train/val by
 slide. --follicles / --roi rebuild follicles/yolo_det or ROI/yolo_det instead. train_det.py
-trains on them.
+trains on them. The combined mode also rebuilds yolo_follicle: follicle-only tiles cut from slides
+resampled to --follicle-um-per-px (um/px of each image from --calibration), with the same val slides
+and --folds slide-level cross-validation folds (fold<k>.yaml).
     python annotate_boxes.py --prepare-only      # rebuild the dataset without annotating
+
+Pseudolabels: review detector output on new slides instead of drawing from scratch.
+    python training/detection/train_det.py predict --target roi --source <slides> --out runs/det/roi/pseudo
+    python training/detection/train_det.py predict --target follicle --weights <best.pt> --source <slides> \
+        --um-per-px 0.2577 --out runs/det/follicle/pseudo
+    python training/annotate_qc_boxes.py --pred-source <slides> --um-per-px 0.2577 \
+        --preds runs/det/roi/pseudo/detections.csv,runs/det/follicle/pseudo/detections.csv
+Shows the <slides> images not yet in the dataset with their predicted boxes (>= --min-conf). Edits and ratings
+are kept in --pending (pending/boxes.csv, sections.csv) until a / Accept copies the image into --source, moves its
+boxes and ratings into --csv / sections.csv and records --um-per-px in --calibration. Unaccepted images never
+reach the training data.
 """
 
 import argparse
 import csv
 import filecmp
+import json
 import math
 import random
 import re
 import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -50,6 +65,10 @@ import cv2
 import numpy as np
 import yaml
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root, for running this file as a script
+from training.detection.follicle_tiles import (TILE_OVERLAP, clip_quad, has_tissue, iter_tiles, load_calibration,
+                                               resize)
 
 Image.MAX_IMAGE_PIXELS = None  # slides exceed PIL's decompression-bomb limit; only headers are read
 cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # scanner TIFF tags spam warnings
@@ -95,6 +114,19 @@ def load_csv(path: Path):
     return boxes
 
 
+def load_preds(paths: str, min_conf: float):
+    """{image: [[class, x1, y1, ..., x4, y4], ...]} from comma-separated train_det.py detections.csv files."""
+    boxes = defaultdict(list)
+    for path in map(Path, paths.split(",")):
+        if not path.exists():
+            raise SystemExit(f"{path} not found")
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                if float(r["conf"]) >= min_conf:
+                    boxes[r["image"]].append([r["class"], *(int(r[k]) for k in CSV_HEADER[2:])])
+    return boxes
+
+
 def class_list(names: str, boxes):
     """Class order fixes YOLO IDs: --classes order first, then any other CSV classes sorted."""
     classes = names.split(",")
@@ -120,6 +152,8 @@ def write_annotations(csv_path: Path, yolo_dir: Path, boxes, classes, size_of):
         for name in sorted(boxes):
             for b in boxes[name]:
                 w.writerow([name, *b])
+    if yolo_dir is None:
+        return
     # rewrite every label file so none are left in the old (cx cy w h) format
     yolo_dir.mkdir(parents=True, exist_ok=True)
     for name, bs in boxes.items():
@@ -350,10 +384,11 @@ def prepare_dataset(a):
     val = set(pos_groups[:max(1, round(len(pos_groups) * a.val_frac))])
 
     out = Path(a.dataset)
-    # combined datasets share combined/cache_* across rebuilds
-    cache = (out.parent if a.require_all else out) / f"cache_{a.max_side}"
-    write_dataset(out, files, val, boxes, classes, cache, a.max_side)
+    write_dataset(out, files, val, boxes, classes, a.max_side)
     print(f"val slides: {sorted(val)}")
+    if a.combined:
+        write_follicle_dataset(Path(a.follicle_dataset), files, val, boxes, load_calibration(a.calibration),
+                               a.follicle_um_per_px, a.follicle_tile, a.folds, a.seed)
     if skipped:
         reason = "no boxes" if a.require_all else "no boxes" + ("" if a.include_empty else " / empty labels excluded")
         print(f"skipped ({reason}): {skipped}")
@@ -361,24 +396,20 @@ def prepare_dataset(a):
         print(f"excluded by {a.exclude}: {len(excluded)} images")
 
 
-def write_dataset(out: Path, files, val, boxes, classes, cache: Path, max_side: int):
+def write_dataset(out: Path, files, val, boxes, classes, max_side: int):
     if out.exists() and any(out.iterdir()) and not (out / "data.yaml").exists():
         raise SystemExit(f"{out} exists and is not a dataset made by this script; choose another --dataset")
     for d in ("images", "labels"):
         shutil.rmtree(out / d, ignore_errors=True)
     for d in ("images/train", "images/val", "labels/train", "labels/val"):
         (out / d).mkdir(parents=True)
-    cache.mkdir(parents=True, exist_ok=True)
 
     print(f"\nbuilding dataset in {out} ...", flush=True)
     stats = defaultdict(lambda: [0, 0])
     for p in files:
         split = "val" if slide_key(p.stem) in val else "train"
-        small = cache / f"{p.stem}.jpg"
-        if not small.exists() or small.stat().st_mtime < p.stat().st_mtime:
-            img, _, _, _ = load_scaled(p, max_side)
-            cv2.imwrite(str(small), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        shutil.copy2(small, out / "images" / split / small.name)
+        img, _, _, _ = load_scaled(p, max_side)
+        cv2.imwrite(str(out / "images" / split / f"{p.stem}.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
         w, h = image_size(p)
         lines = [obb_line(b, classes.index(b[0]), w, h) for b in boxes.get(p.name, [])]
         (out / "labels" / split / f"{p.stem}.txt").write_text("".join(lines))
@@ -391,18 +422,110 @@ def write_dataset(out: Path, files, val, boxes, classes, cache: Path, max_side: 
         "names": dict(enumerate(classes)), "max_side": max_side}, sort_keys=False))
     for s in ("train", "val"):
         print(f"{s}: {stats[s][0]} images, {stats[s][1]} boxes")
-    print(f"dataset ready: {out / 'data.yaml'}  ->  python train_det.py train --data {out.as_posix()}")
+    print(f"dataset ready: {out / 'data.yaml'}  ->  python training/detection/train_det.py train --target roi")
+
+
+def write_follicle_dataset(out: Path, files, val, boxes, calibration, um_per_px: float, tile: int, folds: int,
+                           seed: int, cls: str = "follicle"):
+    """Follicle tiles at a fixed um/px: images/ + labels/ (flat), train.txt / val.txt (same val slides as
+    yolo_det) and fold<k>_{train,val}.txt for --folds slide-level cross-validation folds."""
+    if out.exists() and any(out.iterdir()) and not (out / "data.yaml").exists():
+        raise SystemExit(f"{out} exists and is not a dataset made by this script")
+    for d in ("images", "labels"):
+        shutil.rmtree(out / d, ignore_errors=True)
+        (out / d).mkdir(parents=True)
+    for p in out.glob("*.txt"):
+        p.unlink()
+    for p in out.glob("*.yaml"):
+        p.unlink()
+
+    print(f"\nbuilding follicle tiles ({tile} px at {um_per_px} um/px) in {out} ...", flush=True)
+    tiles = defaultdict(list)  # slide -> tile image paths
+    n_fol = defaultdict(int)
+    missing = []
+    for p in files:
+        if p.name not in calibration:
+            missing.append(p.name)
+            continue
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        f = calibration[p.name] / um_per_px
+        img = resize(img, f)
+        quads = [quad_pts(b) * f for b in boxes.get(p.name, []) if b[0] == cls]
+        key, kept = slide_key(p.stem), 0
+        for x0, y0, crop in iter_tiles(img, tile):
+            clipped = [q for q in (clip_quad(q - (x0, y0), tile) for q in quads) if q is not None]
+            if not clipped and not has_tissue(crop):
+                continue
+            name = f"{p.stem}__x{x0}_y{y0}"
+            cv2.imwrite(str(out / "images" / f"{name}.jpg"), crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            (out / "labels" / f"{name}.txt").write_text("".join(
+                "0 " + " ".join(f"{v / tile:.6f}" for v in q.ravel()) + "\n" for q in clipped))
+            tiles[key].append((out / "images" / f"{name}.jpg").resolve())
+            kept += 1
+        n_fol[key] += len(quads)
+        print(f"  {p.name}: {calibration[p.name]:.3g} um/px -> {kept} tiles, {len(quads)} follicles", flush=True)
+    if missing:
+        print(f"WARNING: no um/px in the calibration file, skipped: {missing}")
+
+    def write_split(prefix, val_slides, yaml_name):
+        for split, sel in (("train", lambda s: s not in val_slides), ("val", lambda s: s in val_slides)):
+            paths = [str(t) for s in sorted(tiles) if sel(s) for t in tiles[s]]
+            (out / f"{prefix}{split}.txt").write_text("\n".join(paths) + "\n")
+        (out / yaml_name).write_text(yaml.safe_dump({
+            "path": str(out.resolve()), "train": f"{prefix}train.txt", "val": f"{prefix}val.txt",
+            "names": {0: cls}, "um_per_px": um_per_px, "tile": tile, "overlap": TILE_OVERLAP}, sort_keys=False))
+
+    write_split("", set(val), "data.yaml")
+    # balance follicles across folds (most-annotated slides first, each to the emptiest fold), then slides
+    slides = sorted(tiles)
+    random.Random(seed).shuffle(slides)
+    slides.sort(key=lambda s: -n_fol[s])
+    load = [[0, 0] for _ in range(folds)]
+    fold_of = {}
+    for s in slides:
+        k = min(range(folds), key=lambda i: tuple(load[i]) if n_fol[s] else tuple(load[i][::-1]))
+        fold_of[s] = k
+        load[k][0] += n_fol[s]
+        load[k][1] += 1
+    for k in range(folds):
+        write_split(f"fold{k}_", {s for s, v in fold_of.items() if v == k}, f"fold{k}.yaml")
+    (out / "folds.json").write_text(json.dumps(dict(sorted(fold_of.items())), indent=2))
+    n_val = sum(len(tiles[s]) for s in tiles if s in val)
+    print(f"follicle tiles: {sum(map(len, tiles.values())) - n_val} train / {n_val} val; "
+          f"{folds} folds (follicles, slides): {[tuple(v) for v in load]}")
+    print(f"dataset ready: {out / 'data.yaml'}  ->  python training/detection/train_det.py train --target follicle")
 
 
 class Annotator:
     def __init__(self, args):
+        self.args = args
+        self.importing = bool(args.preds)
         excluded = load_excluded(args.exclude)
-        self.files = [p for p in list_images(Path(args.source)) if p.name not in excluded]
-        if not self.files:
-            raise SystemExit(f"no images found in {args.source}")
-        self.csv_path, self.yolo_dir = Path(args.csv), Path(args.yolo_dir)
+        if self.importing:
+            skip = excluded | set(load_csv(Path(args.csv)))
+            # same stem, other extension (mde101f.svs.jpg vs .tif) = slide already in the dataset
+            skip_stems = {Path(n).stem for n in skip}
+            self.files = [p for p in list_images(Path(args.pred_source))
+                          if p.name not in skip and p.stem not in skip_stems]
+            if not self.files:
+                raise SystemExit(f"no images in {args.pred_source} that are not already in the dataset")
+            self.csv_path, self.yolo_dir = Path(args.pending) / "boxes.csv", None
+            self.boxes = load_csv(self.csv_path)
+            names = {p.name for p in self.files}
+            preds = {n: bs for n, bs in load_preds(args.preds, args.min_conf).items() if n in names}
+            unknown = {b[0] for bs in preds.values() for b in bs} - set(args.classes.split(","))
+            if unknown:
+                raise SystemExit(f"--preds classes {sorted(unknown)} not in --classes {args.classes}")
+            for name, bs in preds.items():
+                self.boxes.setdefault(name, bs)
+            print(f"{len(self.files)} images to review, {len(preds)} with predicted boxes", flush=True)
+        else:
+            self.files = [p for p in list_images(Path(args.source)) if p.name not in excluded]
+            if not self.files:
+                raise SystemExit(f"no images found in {args.source}")
+            self.csv_path, self.yolo_dir = Path(args.csv), Path(args.yolo_dir)
+            self.boxes = load_csv(self.csv_path)
         self.W, self.H = (int(v) for v in args.win.lower().split("x"))
-        self.boxes = load_csv(self.csv_path)
         self.classes = class_list(args.classes, self.boxes)
         self.history = {}
         self.sections_path = self.csv_path.with_name("sections.csv")
@@ -418,6 +541,8 @@ class Annotator:
         self.cut_drag = None
         self.menu = None
         buttons = [b for b in BUTTONS if b[1] != "rate" or ROI_CLASS in self.classes]
+        if self.importing:
+            buttons.insert(0, ("Accept", "accept"))
         bw, gap = 90, 8
         self.buttons = [(label, action, (self.W - (len(buttons) - k) * (bw + gap), 6, bw, HUD - 12))
                         for k, (label, action) in enumerate(buttons)]
@@ -437,8 +562,8 @@ class Annotator:
         self.mouse = (0, 0)
         self.dirty = True
         need = set(self.classes)
-        self.i = next((k for k, p in enumerate(self.files)
-                       if not need <= {b[0] for b in self.boxes.get(p.name, [])}), 0)
+        self.i = 0 if self.importing else next((k for k, p in enumerate(self.files)
+                                                if not need <= {b[0] for b in self.boxes.get(p.name, [])}), 0)
 
     # ---------------------------------------------------------------- view
     def to_img(self, x, y):
@@ -555,6 +680,8 @@ class Annotator:
         if self.rate:
             line2 = ("RATE MODE (r exits) | hover a section: 1 worst - 3 best, 0 clear | drag a divider to move it "
                      "| R-drag pan, wheel zoom")
+        if self.importing:
+            line2 = "PSEUDOLABELS: fix boxes, then a = accept into dataset | " + line2
         for text, y, scale, col in ((line1, 17, 0.5, (255, 255, 255)), (line2, 36, 0.45, (180, 180, 180))):
             while len(text) > 4 and cv2.getTextSize(text, FONT, scale, 1)[0][0] > self.text_w:
                 text = text[:-4] + "..."
@@ -567,7 +694,7 @@ class Annotator:
                 cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), col, 2 if action == self.cls else 1)
             else:
                 active = (action == "rate" and self.rate) or (action == "menu" and self.menu is not None)
-                fill = (60, 140, 60) if action == "next" else (0, 110, 200) if active else (90, 90, 90)
+                fill = (60, 140, 60) if action in ("next", "accept") else (0, 110, 200) if active else (90, 90, 90)
                 cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), fill, -1)
             (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 1)
             cv2.putText(canvas, label, (bx + (bw - tw) // 2, by + (bh + th) // 2), FONT, 0.55,
@@ -805,7 +932,57 @@ class Annotator:
         write_annotations(self.csv_path, self.yolo_dir, self.boxes, self.classes, self.image_size)
         if ROI_CLASS in self.classes:
             write_sections(self.sections_path, self.boxes, self.state)
-        print(f"saved {len(self.cur())} boxes for {self.files[self.i].name}", flush=True)
+        if self.files:
+            print(f"saved {len(self.cur())} boxes for {self.files[self.i].name}", flush=True)
+
+    def accept(self):
+        """Copy the current image into the dataset with its boxes, section ratings and um/px; drop it from pending."""
+        a, p = self.args, self.files[self.i]
+        if not self.cur():
+            print(f"NOT accepted: {p.name} has no boxes", flush=True)
+            return
+        dst = Path(a.source) / p.name
+        if dst.exists() and not filecmp.cmp(p, dst, shallow=False):
+            print(f"NOT accepted: {dst} exists and differs from {p}; rename one of them", flush=True)
+            return
+        self.save()
+        if not dst.exists():
+            print(f"copying {p.name} into {dst.parent} ...", flush=True)
+            shutil.copy2(p, dst)
+
+        data_csv = Path(a.csv)
+        data = load_csv(data_csv)
+        stored = load_sections(data_csv.with_name("sections.csv"))
+        states = {}
+        for name, bs in data.items():
+            for ri, box in enumerate(b for b in bs if b[0] == ROI_CLASS):
+                if st := stored.get(name, {}).get(ri):
+                    states[id(box)] = st
+        data[p.name] = self.cur()
+        for box in data[p.name]:
+            if box[0] == ROI_CLASS:
+                states[id(box)] = self.state(box)
+        write_annotations(data_csv, Path(a.yolo_dir), data, class_list(a.classes, data),
+                          lambda n: image_size(Path(a.source) / n))
+        write_sections(data_csv.with_name("sections.csv"), data,
+                       lambda b: states.get(id(b)) or even_sections(self.n_sections))
+
+        calib_path = Path(a.calibration)
+        calib = json.loads(calib_path.read_text()) if calib_path.exists() else {}
+        um = calib.setdefault("images", {}).setdefault(p.name, a.um_per_px)
+        if um != a.um_per_px:
+            print(f"  kept the existing {um} um/px for {p.name} in {calib_path}", flush=True)
+        calib_path.write_text(json.dumps(calib, indent=2) + "\n")
+
+        counts = ", ".join(f"{c} {sum(b[0] == c for b in data[p.name])}" for c in self.classes)
+        print(f"accepted {p.name} ({counts}) -> {data_csv}", flush=True)
+        del self.boxes[p.name]
+        self.history.pop(p.name, None)
+        self.files.pop(self.i)
+        self.i = min(self.i, len(self.files) - 1)
+        self.save()
+        if self.files:
+            self.load()
 
     def go(self, step):
         j = min(max(self.i + step, 0), len(self.files) - 1)
@@ -839,6 +1016,9 @@ class Annotator:
             self.points = []
         elif action == "menu":
             self.open_menu()
+        elif action == "accept" and self.importing:
+            self.points = []
+            self.accept()
         self.dirty = True
 
     # ---------------------------------------------------------------- events
@@ -890,7 +1070,7 @@ class Annotator:
         cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback(WIN, self.on_mouse)
         self.load()
-        while True:
+        while self.files:
             if self.dirty:
                 cv2.imshow(WIN, self.render())
                 self.dirty = False
@@ -913,6 +1093,8 @@ class Annotator:
                 self.act("prev")
             elif k == ord("r"):
                 self.act("rate")
+            elif k == ord("a"):
+                self.act("accept")
             elif self.rate and ord("0") <= k <= ord("9"):
                 if k <= ord("3"):
                     self.rate_section(k - ord("0") or None)
@@ -957,12 +1139,25 @@ def main():
                     help="use images whose label file is empty as negatives (only if you checked they have no follicles)")
     ap.add_argument("--prepare-only", action="store_true", help="rebuild the dataset without opening the annotator")
     ap.add_argument("--sections", type=int, default=5, help="number of even sections each new roi box is split into")
+    ap.add_argument("--follicle-dataset", help="follicle tile dataset rebuilt on quit (combined mode)")
+    ap.add_argument("--calibration", help="JSON with the um/px of each image in --source")
+    ap.add_argument("--follicle-um-per-px", type=float, default=2.5, help="scale of the follicle tiles")
+    ap.add_argument("--follicle-tile", type=int, default=1024, help="follicle tile size in px (= training imgsz)")
+    ap.add_argument("--folds", type=int, default=5, help="slide-level cross-validation folds of the follicle tiles")
+    ap.add_argument("--preds", help="comma-separated detections.csv files from train_det.py predict: review them as "
+                    "pseudolabels on the --pred-source images; a / Accept adds an image to the dataset")
+    ap.add_argument("--pred-source", help="folder of the images the --preds detections refer to")
+    ap.add_argument("--um-per-px", type=float, help="um/px of the --pred-source images, recorded in --calibration")
+    ap.add_argument("--min-conf", type=float, default=0.25, help="drop predicted boxes below this confidence")
+    ap.add_argument("--pending", help="folder for reviewed but not yet accepted --preds boxes and ratings")
     args = ap.parse_args()
     if args.sections < 1:
         raise SystemExit("--sections must be >= 1")
+    if args.preds and not (args.pred_source and args.um_per_px):
+        raise SystemExit("--preds needs --pred-source and --um-per-px")
     args.combined = not (args.follicles or args.roi)
 
-    root = Path("roi_follicle_bb_data")
+    root = Path("datasets/roi_follicle")
     args.source = args.source or str(root / "images")
     args.classes = args.classes or "follicle,roi"
     args.exclude = args.exclude or str(root / "excluded.txt")
@@ -970,6 +1165,9 @@ def main():
     args.csv = args.csv or str(root / "boxes.csv")
     args.yolo_dir = args.yolo_dir or str(root / "labels")
     args.dataset = args.dataset or str(root / "yolo_det")
+    args.follicle_dataset = args.follicle_dataset or str(root / "yolo_follicle")
+    args.calibration = args.calibration or str(root / "scale_calibration.json")
+    args.pending = args.pending or str(root / "pending")
     args.require_all = args.combined
     if args.merge_from:
         merge_annotations(args)
