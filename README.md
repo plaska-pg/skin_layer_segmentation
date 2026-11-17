@@ -227,7 +227,7 @@ python training\annotate_qc_boxes.py --pred-source $src --um-per-px 0.2577 --pre
   python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Lisa Image Pro analyzed images\D28 Topical GFF" --resume
 
 Enhancement of the interface:
-
+ The main run page should be better. give ideas 
 
   On the edit page: 
 

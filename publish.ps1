@@ -4,6 +4,8 @@
   Users then double-click run_app.cmd there. Only committed files are published (no .git, .venv,
   runs, datasets). The destination is mirrored - files no longer in the repo are deleted there - so it
   must be empty or a previous publish (marked by .skin_seg_publish).
+
+  can test with "C:\Users\plas.ka\OneDrive - Procter and Gamble\test"
 #>
 param([Parameter(Mandatory = $true)][string]$Destination)
 $ErrorActionPreference = "Stop"
