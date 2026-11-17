@@ -3,7 +3,14 @@
 
 Train (on PMC data), finetune on (P&G data), pseudolabeling (on generated segmented P&G data) and run inference on H&E stained skin 
 
-## Install
+## Use the app (Windows)
+
+1. Open the shared OneDrive folder of the app and choose **Add shortcut to My files** (or **Sync**), so it shows up in File Explorer.
+2. Double-click **`run_app.cmd`** in that folder. The app opens in your browser; keep the black window open while you use it (closing it stops the app).
+
+The first start takes a while: it offers to install Python 3.14 if it's missing, downloads the packages (PyTorch with GPU support if the computer has an NVIDIA GPU, otherwise the CPU version) and the models. Later starts take seconds. Everything runs on your own computer; installed files go to `%LOCALAPPDATA%\skin_layer_segmentation` (delete that folder to reinstall from scratch, e.g. after getting a GPU), and results are written next to your images.
+
+## Dev install
 
 1. Install Python 3.14 (on Windows, typing `python` in PowerShell opens the installer).
 2. Clone the repo outside OneDrive (the trained weights in `models/` come with it):
@@ -25,6 +32,16 @@ pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytor
 
 pip install -r requirements.txt
 ```
+
+`.\run_app.ps1` in a clone does steps 1-3 itself (in `.venv`), runs `git pull`, then starts the app.
+
+### Publishing a new version to the OneDrive folder
+
+Commit, then mirror HEAD into the shared folder (give users view-only access):
+```powershell
+.\publish.ps1 -Destination "C:\Users\<you>\OneDrive - Procter and Gamble\<shared app folder>"
+```
+Users get it as soon as OneDrive syncs; `run_app.cmd` prints the published `VERSION` at start.
 
 ## Run inference
 

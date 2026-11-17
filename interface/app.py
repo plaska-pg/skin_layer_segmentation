@@ -22,7 +22,8 @@ Image.MAX_IMAGE_PIXELS = None  # QA jpgs of whole-slide images exceed PIL's deco
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 BASE_CONFIG = PROJECT_DIR / "base_config.yaml"
-RUN_CONFIG_DIR = PROJECT_DIR / "runs" / "interface"
+# run_app.ps1 sets SKIN_SEG_STATE_DIR to a per-user local folder when the repo is a read-only OneDrive copy
+RUN_CONFIG_DIR = Path(os.environ.get("SKIN_SEG_STATE_DIR") or PROJECT_DIR / "runs" / "interface")
 LAST_USED = RUN_CONFIG_DIR / "last_used.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".svs"}  # keep in sync with predict.py
 PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
