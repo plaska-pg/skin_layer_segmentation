@@ -315,36 +315,68 @@ function createEditor(root) {
     for (const b of bar.querySelectorAll("button[data-mode]")) b.classList.toggle("on", b.dataset.mode === S.mode);
     const hide = bar.querySelector("button[data-act=hide]");
     if (hide) hide.classList.toggle("on", !S.showOthers);
+    const nav = S.nav || {};
+    const prev = bar.querySelector("button[data-act=prev]"), next = bar.querySelector("button[data-act=next]");
+    if (prev) prev.disabled = !nav.prev;
+    if (next) next.disabled = !nav.next;
+    const pos = bar.querySelector(".pos");
+    if (pos) pos.textContent = nav.label || "";
+    const sv = bar.querySelector("button[data-act=save]");
+    const svState = S.saving ? "saving" : "idle";
+    // redraw runs on every mouse move, so only touch the DOM when the state flips
+    if (sv && sv.dataset.state !== svState) {
+      sv.dataset.state = svState;
+      sv.innerHTML = S.saving ? '<span class="spin"></span>Saving\u2026' : "Save";
+      sv.title = S.saving ? "Re-measuring this image in the background; saving again queues another"
+                          : "Save and re-measure (s)";
+    }
     const counts = S.classes.map((c) => `${c.name}: ${(S.polys[c.name] || []).length}`).join("  ");
     statusEl.textContent = [counts, S.dirty ? "unsaved changes" : "saved", S.pending ? "working..." : "", S.message]
       .filter(Boolean).join("  |  ");
-    hintEl.textContent = HINTS[S.mode] + "  Right/middle-drag = pan, wheel = zoom, 1/2/3 class, e/c/m/g modes, " +
-      "x delete polygon, h hide others, f fit, u / Ctrl+Z undo, s save.";
+    statusEl.classList.toggle("dirty", S.dirty);
+    hintEl.textContent = HINTS[S.mode] + "  Right/middle-drag = pan, wheel = zoom, 1/2/3 class, d/e/c/m/g modes, " +
+      "x delete polygon, h hide others, f fit, u / Ctrl+Z undo, s save, p / n previous / next image.";
   }
 
   function buildBar() {
     bar.replaceChildren();
+    let group = null;
+    const newGroup = (cls = "") => {
+      group = document.createElement("div");
+      group.className = "grp " + cls;
+      bar.appendChild(group);
+    };
     const add = (label, attrs, title) => {
       const b = document.createElement("button");
       b.type = "button";
       b.textContent = label;
       if (title) b.title = title;
       for (const [k, v] of Object.entries(attrs)) b.dataset[k] = v;
-      bar.appendChild(b);
+      group.appendChild(b);
       return b;
     };
+    newGroup();
     S.classes.forEach((c, i) => {
-      const b = add(`${i + 1}: ${c.name}`, { cls: c.name });
+      const b = add(`${i + 1}: ${c.name}`, { cls: c.name }, `Active class (${i + 1})`);
       b.style.borderColor = c.color;
     });
-    add("Edit", { mode: "edit" }, "e");
-    add("Cut", { mode: "cut" }, "c");
-    add("Nudge", { mode: "nudge" }, "m");
-    add("Pan", { mode: "pan" }, "g");
-    add("Hide others", { act: "hide" }, "h");
+    newGroup();
+    add("Draw", { mode: "draw" }, "Draw / merge polygons (d)");
+    add("Edit", { mode: "edit" }, "Move, add, delete vertices (e)");
+    add("Cut", { mode: "cut" }, "Cut away part of the active class (c)");
+    add("Nudge", { mode: "nudge" }, "Push outlines with a brush (m)");
+    add("Pan", { mode: "pan" }, "Left-drag pans (g)");
+    newGroup();
+    add("Hide others", { act: "hide" }, "Show only the active class (h)");
     add("Undo", { act: "undo" }, "u / Ctrl+Z");
-    add("Fit", { act: "fit" }, "f");
-    add("Save", { act: "save" }, "s").classList.add("primary");
+    add("Fit", { act: "fit" }, "Fit image to view (f)");
+    newGroup("right");
+    add("Save", { act: "save" }, "Save and re-measure (s)").classList.add("primary");
+    add("\u25C0", { act: "prev" }, "Previous image (p)");
+    const pos = document.createElement("span");
+    pos.className = "pos";
+    group.appendChild(pos);
+    add("\u25B6", { act: "next" }, "Next image (n)");
   }
 
   function save() {
@@ -352,6 +384,14 @@ function createEditor(root) {
     S.pending = true;
     S.trigger("save", { polys: S.polys });
     redraw();
+  }
+
+  function navigate(d) {
+    const nav = S.nav || {};
+    if (!(d < 0 ? nav.prev : nav.next)) return;
+    if ((S.dirty || S.points.length) &&
+        !window.confirm(`Discard unsaved edits and go to the ${d < 0 ? "previous" : "next"} image?`)) return;
+    S.trigger("nav", d);
   }
 
   bar.addEventListener("click", (e) => {
@@ -363,6 +403,8 @@ function createEditor(root) {
     else if (b.dataset.act === "undo") undo();
     else if (b.dataset.act === "fit") fit();
     else if (b.dataset.act === "save") save();
+    else if (b.dataset.act === "prev") navigate(-1);
+    else if (b.dataset.act === "next") navigate(1);
     wrap.focus();
     redraw();
   });
@@ -481,6 +523,7 @@ function createEditor(root) {
       const i = S.classes.findIndex((c) => c.name === S.active);
       S.active = S.classes[(i + 1) % S.classes.length].name;
     } else if (k === "e") setMode("edit");
+    else if (k === "d") setMode("draw");
     else if (k === "c") setMode("cut");
     else if (k === "m") setMode("nudge");
     else if (k === "g") setMode("pan");
@@ -493,6 +536,8 @@ function createEditor(root) {
     else if (k === "[") S.brushR = Math.max(S.brushR / 1.2, NUDGE_R_MIN);
     else if (k === "]") S.brushR = Math.min(S.brushR * 1.2, NUDGE_R_MAX);
     else if (k === "s") save();
+    else if (k === "p") navigate(-1);
+    else if (k === "n") navigate(1);
     else if (k === "Enter" && S.points.length) closePoly();
     else if (k === "Delete" || k === "Backspace") {
       if (S.mode === "edit") deleteVertex(vertexAt(...S.mouse));
@@ -509,6 +554,8 @@ function createEditor(root) {
   function update(data) {
     if (!data) return;
     canvas.height = data.height || 720;
+    S.nav = data.nav || null;
+    S.saving = !!data.saving;
     if (data.doc !== S.doc) {
       S.doc = data.doc;
       S.iw = data.iw; S.ih = data.ih;

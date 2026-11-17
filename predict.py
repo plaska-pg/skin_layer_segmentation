@@ -10,6 +10,7 @@ postprocess each prediction (postprocess.py: close -> identify ROI -> rotate
     python predict.py --no-postprocess   # just dump raw overlays, no CSV/composite
 
     python predict.py --limit 5 --out runs/predict_mini
+    python predict.py --reprocess --source <folder>/<image>   # redo postprocess/measure from saved raw labels
 
 Default weights/scale match dataset/scale_calibration.json + the
 inference_images/ Motic 40X series (see plan.md "Decisions").
@@ -291,6 +292,13 @@ def main():
                           "row in the CSV are skipped and their row is kept; otherwise, if "
                           "<out>/raw_segmentations/<stem>.txt exists it is reused instead of re-running GPU "
                           "inference, and postprocess/measure re-runs")
+    ap.add_argument("--reprocess", action="store_true",
+                     help="re-run only postprocess/measure into an existing --out, reusing "
+                          "<out>/raw_segmentations/<stem>.txt (inference runs only if it is missing). Overwrites "
+                          "each image's _measurement/_steps images and postprocessed_segmentations label, replaces "
+                          "its CSV row and keeps all other rows; run_config.yaml is left untouched (settings go to "
+                          "run_config_reprocess_<timestamp>.yaml). For a single-image --source, --out defaults to "
+                          "the folder run's '<image's folder>/predicted_<folder name>'.")
     ap.add_argument("--csv-out", default=None, help="default: <out>/_results.csv")
     ap.add_argument("--limit", type=int, default=None, help="only process the first N images (for quick test runs)")
     ap.add_argument("--workers", type=int, default=_PREDICT_CFG.get("workers", 1),
@@ -299,6 +307,8 @@ def main():
                           "model inference - cv2/scipy/skimage release the GIL so this gets real parallelism. "
                           "Ignored with --no-postprocess. Keep this <= your CPU core count.")
     args = ap.parse_args()
+    if args.reprocess and args.no_postprocess:
+        raise SystemExit("--reprocess re-runs postprocessing; it can't be combined with --no-postprocess")
 
     device = pick_device(args.device)
     model, names, class_index = load_model(args.weights, device)
@@ -316,7 +326,7 @@ def main():
     # --source may be a single image file or a folder of images
     if src.is_file():
         files = [src] if src.suffix.lower() in IMAGE_EXTS else []
-        default_out = src.parent / f"predicted_{src.stem}"
+        default_out = src.parent / (f"predicted_{src.parent.name}" if args.reprocess else f"predicted_{src.stem}")
     else:
         files = sorted(p for p in src.iterdir() if p.suffix.lower() in IMAGE_EXTS)
         default_out = src / f"predicted_{src.name}"
@@ -349,22 +359,29 @@ def main():
     if any(p.suffix.lower() == ".svs" for p in files):
         long_path(tiff_dir).mkdir(parents=True, exist_ok=True)
     effective_mpp = {p.name: svs_mpp(p) or args.um_per_px for p in files}
-    run_config_path = out / "run_config.yaml"
+    run_config_path = out / (f"run_config_reprocess_{datetime.now():%Y%m%d_%H%M%S}.yaml" if args.reprocess
+                             else "run_config.yaml")
     write_run_config(long_path(run_config_path), args, src, out, device, names, files, effective_mpp)
     print(f"Wrote run configuration to {run_config_path}", flush=True)
 
     csv_path = Path(args.csv_out) if args.csv_out else out / "_results.csv"
     csv_io = long_path(csv_path)
-    prior_rows = {}
-    if args.resume and csv_io.exists():
+    prior_rows, fieldnames = {}, list(CSV_COLUMNS)
+    if (args.resume or args.reprocess) and csv_io.exists():
         with csv_io.open(newline="") as f:
-            prior_rows = {r["file name"]: r for r in csv.DictReader(f)}
+            reader = csv.DictReader(f)
+            prior_rows = {r["file name"]: r for r in reader}
+            # keep extra columns (e.g. the seg editor's 'edited') on rows that are carried over
+            fieldnames = list(dict.fromkeys(CSV_COLUMNS + list(reader.fieldnames or [])))
 
     rows = []
     # prior rows are already in memory, so it's safe to truncate the CSV and rewrite it row by row
     csv_file = csv_io.open("w", newline="")
-    writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
+    if args.reprocess:
+        reprocessed = {p.stem for p in files}
+        writer.writerows(r for stem, r in prior_rows.items() if stem not in reprocessed)
     csv_file.flush()
 
     def _write_row(row):
@@ -384,7 +401,7 @@ def main():
     for i, p in enumerate(files, 1):
         label_path = labels_dir / f"{p.stem}.txt"
         post_label_path = None if args.no_labels else post_labels_dir / f"{p.stem}.txt"
-        if args.resume:
+        if args.resume and not args.reprocess:
             if args.no_postprocess and (out_io / f"{p.stem}_overlay.jpg").exists():
                 print(f"[{i}/{len(files)}] {p.name}: overlay already exists, skipping", flush=True)
                 _save_svs_tiff(p, tiff_dir)
@@ -405,10 +422,12 @@ def main():
             print(f"{p.name}: using embedded MPP {um_per_px:.4g} um/px (overrides --um-per-px {args.um_per_px})",
                   flush=True)
         scale = (um_per_px / args.reference_um_per_px) if um_per_px else 1.0
-        if args.resume and label_path.exists():
+        if (args.resume or args.reprocess) and label_path.exists():
             print(f"[{i}/{len(files)}] {p.name}: reusing saved labels, skipping GPU inference...", flush=True)
             pred_mask = _rasterise(label_path, *orig_bgr.shape[:2])
         else:
+            if args.reprocess:
+                print(f"WARNING {p.name}: no saved raw labels at {label_path}, running inference", flush=True)
             print(f"[{i}/{len(files)}] {p.name}: running inference ({orig_bgr.shape[1]}x{orig_bgr.shape[0]})...",
                   flush=True)
             pred_mask = predict_mask_safe(model, orig_bgr, device, scale, name=p.name, tile=args.tile, tta=args.tta)

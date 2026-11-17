@@ -26,15 +26,20 @@ Gland predictions are rotated and smoothed - never ROI/follicle masked or clippe
 
 import os
 import threading
+import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+from scipy import ndimage as ndi
+from skimage.measure import label
+from skimage.morphology import skeletonize
 
 from config import CONFIG
-from measurement import (CSV_COLUMNS, _file_date, _layer_spine, draw_gl_midline_panel, draw_spine_panel,
-                         measure_layers, overlay, tissue_area_um2)
+from measurement import (CSV_COLUMNS, SKELETON_METHOD, _distance_transform, _file_date, _layer_spine,
+                         draw_gl_midline_panel, draw_spine_panel, measure_layers, overlay, skeleton_spine,
+                         tissue_area_um2)
 from training.annotate_qc_boxes import ROI_CLASS, even_sections, section_quad
 from training.detection.follicle_tiles import detect_tiled, tile_scale
 from training.quality.train_qual import load_model, mode_of, predict_tiles, prepare, score_color, warp_section
@@ -50,7 +55,7 @@ EPIDERMAL_ERODE_DILATE_UM = _PP_CFG.get("epidermal_erod_dil_kernel_size_um", 10.
 GLAND_ERODE_DILATE_UM = _PP_CFG.get("gland_erod_dil_kernel_size_um", 0.0)
 SC_EPIDERMIS_CONTACT_ENABLED = _PP_CFG.get("sc_epidermis_contact_enabled", True)
 SC_EPIDERMIS_CONTACT_GAP_UM = _PP_CFG.get("sc_epidermis_contact_gap_um", 5.0)
-LATERAL_CLIP_FRAC = _PP_CFG.get("lateral_clip_frac", 0.10)  # fraction of the rotated ROI's horizontal extent trimmed per side
+LATERAL_CLIP_FRAC = _PP_CFG.get("lateral_clip_frac", 0.10)  # fraction of the tissue band's spine arc length trimmed per end
 ROTATION_WEIGHTS = _PP_CFG.get("rotation_weights", "models/rotate_model.pt")
 ROTATION_DEVICE = _PP_CFG.get("rotation_device", "auto")
 FOLLICLE_ENABLED = _PP_CFG.get("follicle_enabled", True)
@@ -73,36 +78,66 @@ QUALITY_DEVICE = _PP_CFG.get("quality_device", "auto")
 QUALITY_SECTIONS = _PP_CFG.get("quality_sections", 5)
 
 
-def lateral_clip_window(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LATERAL_CLIP_FRAC):
-    """Column range [lo, hi) kept after trimming frac of the combined ROI's
-    horizontal extent off each side; (0, width) when nothing is trimmed."""
-    w = sc_mask.shape[1]
-    combined = sc_mask | gl_mask
-    cols = np.nonzero(combined.any(axis=0))[0]
-    if frac <= 0 or cols.size == 0:
-        return 0, w
-    x0, x1 = int(cols[0]), int(cols[-1])
-    clip = round(frac * (x1 - x0 + 1))
-    if clip <= 0:
-        return 0, w
-    return x0 + clip, x1 - clip + 1
+def _component_spines(mask: np.ndarray):
+    """Ordered medial-axis spine (ys, xs) of each 8-connected component of mask, in image coords."""
+    labels = label(mask, connectivity=2)
+    spines = []
+    for comp_id, sl in enumerate(ndi.find_objects(labels), start=1):
+        # pad so the distance transform sees background at the crop edge
+        filled = np.pad(ndi.binary_fill_holes(labels[sl] == comp_id), 1)
+        _, _, (pys, pxs) = skeleton_spine(skeletonize(filled, method=SKELETON_METHOD), _distance_transform(filled))
+        if len(pxs):
+            spines.append((pys + sl[0].start - 1, pxs + sl[1].start - 1))
+    return spines
 
 
-def clip_lateral_margins(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LATERAL_CLIP_FRAC):
-    """Zero out SC/Epidermal pixels within frac of the combined ROI's
-    horizontal extent from its left/right edges - trims tissue near the cut
-    ends of the mounted section (often thin/unreliable) before measurement.
-    Returns new (sc_mask, gl_mask); the originals are left untouched so
-    already-built rotation/overlay panels aren't affected."""
-    lo, hi = lateral_clip_window(sc_mask, gl_mask, frac)
-    if lo <= 0 and hi >= sc_mask.shape[1]:
-        return sc_mask, gl_mask
-    sc_clipped, gl_clipped = sc_mask.copy(), gl_mask.copy()
-    sc_clipped[:, :lo] = False
-    sc_clipped[:, hi:] = False
-    gl_clipped[:, :lo] = False
-    gl_clipped[:, hi:] = False
-    return sc_clipped, gl_clipped
+def lateral_clip_keep(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LATERAL_CLIP_FRAC) -> np.ndarray:
+    """False where SC/Epidermis tissue lies within frac of the band's total arc length of
+    either end, True elsewhere. Arc length runs along the Epidermis spine (not image
+    columns) so tips that curl back over the band are trimmed at their true ends; every
+    pixel takes the arc length of its nearest spine pixel. Epidermis pieces split by
+    follicle/ROI masking are chained left to right into one coordinate."""
+    keep = np.ones(sc_mask.shape, bool)
+    band = sc_mask.astype(bool) | gl_mask.astype(bool)
+    if frac <= 0 or not band.any():
+        return keep
+    spines = _component_spines(gl_mask.astype(bool) if gl_mask.any() else band)
+    spines.sort(key=lambda p: p[1].mean())
+
+    all_ys, all_xs, all_s = [], [], []
+    offset, chain_end = 0.0, None
+    for i, (ys, xs) in enumerate(spines):
+        a, b = np.array([ys[0], xs[0]], float), np.array([ys[-1], xs[-1]], float)
+        if chain_end is None:
+            # first piece starts at its end farther from the next piece
+            nxt = np.array([spines[i + 1][0].mean(), spines[i + 1][1].mean()]) if len(spines) > 1 else a
+            flip = np.linalg.norm(b - nxt) > np.linalg.norm(a - nxt)
+        else:
+            flip = np.linalg.norm(b - chain_end) < np.linalg.norm(a - chain_end)
+        if flip:
+            ys, xs, b = ys[::-1], xs[::-1], a
+        steps = np.hypot(np.diff(xs.astype(float)), np.diff(ys.astype(float)))
+        s = offset + np.concatenate([[0.0], np.cumsum(steps)])
+        all_ys.append(ys)
+        all_xs.append(xs)
+        all_s.append(s)
+        offset, chain_end = s[-1], b
+    total = offset
+    if total <= 0:
+        return keep
+    ys, xs, s = np.concatenate(all_ys), np.concatenate(all_xs), np.concatenate(all_s)
+
+    rows, cols = np.nonzero(band.any(axis=1))[0], np.nonzero(band.any(axis=0))[0]
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    src = np.ones((r1 - r0, c1 - c0), np.uint8)
+    src[ys - r0, xs - c0] = 0
+    _, lab = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    lut = np.zeros(int(lab.max()) + 1)
+    lut[lab[ys - r0, xs - c0]] = s
+    s_img = lut[lab]
+    inside = (s_img >= frac * total) & (s_img <= (1 - frac) * total)
+    keep[r0:r1, c0:c1] = ~band[r0:r1, c0:c1] | inside
+    return keep
 
 
 # ----------------------------------------------------------------------------
@@ -451,39 +486,62 @@ def imwrite_jpg(path, img: np.ndarray, quality: int) -> None:
 # orchestration
 # ----------------------------------------------------------------------------
 
+class _StageLog:
+    """Prints '<stem>: <msg> (<secs since previous lap>s)'; total() = secs since creation."""
+
+    def __init__(self, stem: str):
+        self.stem = stem
+        self.start = self.last = time.perf_counter()
+
+    def __call__(self, msg: str):
+        now = time.perf_counter()
+        print(f"{self.stem}: {msg} ({now - self.last:.1f}s)", flush=True)
+        self.last = now
+
+    def total(self) -> float:
+        return time.perf_counter() - self.start
+
+
 def measure_rotated(rot_img: np.ndarray, rot_sc: np.ndarray, rot_gl: np.ndarray, rot_gland, keep: np.ndarray,
-                    um_per_px: float, lateral_clip_frac: float, source_path: Path = None):
+                    um_per_px: float, lateral_clip_frac: float, source_path: Path = None, log=None,
+                    spine_panel: bool = True):
     """Lateral clip + measure_layers on canonically rotated masks; `keep` = False where the
-    tissue was cut artificially (ROI / follicles). Returns (row_extra, measurement_panel, spine_panel)."""
+    tissue was cut artificially (ROI / follicles). Returns (row_extra, measurement_panel, spine_panel);
+    spine_panel is None when not requested."""
+    log = log or (lambda msg: None)
     # spines first, then clip: build each layer's medial-axis spine on the full
     # rotated mask so the lateral clip can't carve cut-edges into the skeleton,
-    # then keep only the clip-window portion as the mean-height denominator.
-    lo, hi = lateral_clip_window(rot_sc, rot_gl, lateral_clip_frac)
-    sc_spine, sc_len = _layer_spine(rot_sc.astype(bool), col_window=(lo, hi))
-    gl_spine, gl_len = _layer_spine(rot_gl.astype(bool), col_window=(lo, hi))
-    meas_sc, meas_gl = clip_lateral_margins(rot_sc, rot_gl, lateral_clip_frac)
-    cut_mask = ~keep
-    cut_mask[:, :lo] = True
-    cut_mask[:, hi:] = True
+    # then keep only the unclipped portion as the mean-height denominator.
+    lat_keep = lateral_clip_keep(rot_sc, rot_gl, lateral_clip_frac)
+    log(f"lateral clip ({int((~lat_keep & (rot_sc | rot_gl)).sum())} px trimmed)")
+    sc_spine, sc_len = _layer_spine(rot_sc.astype(bool), keep_mask=lat_keep)
+    gl_spine, gl_len = _layer_spine(rot_gl.astype(bool), keep_mask=lat_keep)
+    log("layer spines")
+    meas_sc, meas_gl = rot_sc & lat_keep, rot_gl & lat_keep
+    cut_mask = ~keep | ~lat_keep
     row_extra, measurement_panel, spine_cache = measure_layers(
         rot_img, meas_sc, meas_gl, um_per_px, date=_file_date(source_path),
         spines={"SC": sc_spine, "Epidermal": gl_spine},
         lengths_px={"SC": sc_len, "Epidermal": gl_len},
         gland_mask=rot_gland, cut_mask=cut_mask)
+    log("measure_layers (skeleton, sides, EDJ, stats, measurement panel)")
+    if not spine_panel:
+        return row_extra, measurement_panel, None
 
     sc_stats = {"mean_height": row_extra["SC mean height"], "area": row_extra["SC area"]}
     gl_stats = {"mean_height": row_extra["Epidermal mean height"], "area": row_extra["Epidermal area"]}
     spine_panel = draw_spine_panel(rot_img, meas_sc, meas_gl, sc_stats, gl_stats, um_per_px,
                                    spines=spine_cache["spines"], lengths_px=spine_cache["lengths_px"],
                                    edj=spine_cache["edj"])
+    log("spine panel")
     return row_extra, measurement_panel, spine_panel
 
 
 def remeasure_labels(orig_bgr: np.ndarray, label_mask: np.ndarray, class_index: dict, um_per_px: float,
                      lateral_clip_frac: float = LATERAL_CLIP_FRAC, source_path: Path = None):
     """Measures user-edited segmentations as they are: no ROI / follicle masking or morphology.
-    `label_mask` holds class_index values. Returns (row_extra, measurement_panel), or None if SC or
-    Epidermis is empty."""
+    `label_mask` holds class_index values. Returns (row_extra, measurement_panel, corrected_overlay),
+    or None if SC or Epidermis is empty."""
     sc_id = class_index["SC"]
     gl_id = class_index.get("Epidermis", class_index.get("Epidermal", class_index.get("Granular Layer")))
     gland_id = class_index.get("gland", class_index.get("glands"))
@@ -494,8 +552,18 @@ def remeasure_labels(orig_bgr: np.ndarray, label_mask: np.ndarray, class_index: 
     rot_gland = rotate_k(label_mask == gland_id, k) if gland_id is not None else None
     keep = np.ones(rot_img.shape[:2], bool)
     row_extra, measurement_panel, _ = measure_rotated(rot_img, rot_sc, rot_gl, rot_gland, keep, um_per_px,
-                                                      lateral_clip_frac, source_path)
-    return row_extra, measurement_panel
+                                                      lateral_clip_frac, source_path, spine_panel=False)
+    masks = {"SC": rot_sc, "Epidermal": rot_gl}
+    if rot_gland is not None:
+        masks["gland"] = rot_gland
+    # the steps pane is shown 480 px tall, so draw it at that size instead of full resolution
+    h, w = rot_img.shape[:2]
+    f = min(1.0, 480 / h)
+    size = (max(1, round(w * f)), max(1, round(h * f)))
+    small = cv2.resize(rot_img, size, interpolation=cv2.INTER_AREA) if f < 1 else rot_img
+    masks = {n: cv2.resize(m.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool) if f < 1 else m
+             for n, m in masks.items()}
+    return row_extra, measurement_panel, overlay(small, masks)
 
 
 def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: np.ndarray,
@@ -528,15 +596,20 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         raise KeyError("class_index must contain 'Epidermis' (or legacy 'Epidermal' / 'Granular Layer')")
     gland_id = class_index.get("gland", class_index.get("glands"))
     gland_full = pred_mask == gland_id if gland_id is not None else np.zeros(pred_mask.shape, bool)
+    log = _StageLog(stem)
+    log(f"postprocess start ({orig_bgr.shape[1]}x{orig_bgr.shape[0]} px, {um_per_px:.4g} um/px)")
 
     # Preserve raw-frame QA, but rotate the complete prediction before any
     # ROI selection so all downstream postprocessing uses the canonical orientation.
     rot_img, rot_sc_full, rot_gl_full, k = rotate_to_canonical(
         orig_bgr, pred_mask == sc_id, pred_mask == gl_id)
     rot_gland = rotate_k(gland_full, k)
+    log(f"rotated {k * 90} deg")
     raw_overlay = overlay(orig_bgr, {"SC": pred_mask == sc_id, "Epidermal": pred_mask == gl_id, "gland": gland_full})
     rotated_overlay = overlay(rot_img, {"SC": rot_sc_full, "Epidermal": rot_gl_full, "gland": rot_gland})
+    log("raw + rotated overlays")
     rot_gland = erode_dilate(rot_gland, kernel_px(gland_kernel_um, um_per_px))
+    log(f"gland morphology ({kernel_px(gland_kernel_um, um_per_px)} px kernel)")
 
     follicles = None
     if follicle_enabled:
@@ -553,6 +626,7 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     fol_removed = follicle_mask(rot_img.shape, follicles, follicle_mask_frac)
     follicle_panels = [] if follicles is None else [
         (f"Follicles ({len(follicles)})", draw_obb_panel(rotated_overlay, follicles, fol_removed))]
+    log("follicles: " + ("disabled/skipped" if follicles is None else f"{len(follicles)} detected"))
 
     rois = None
     if roi_enabled:
@@ -565,6 +639,7 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
             imgsz=settings.get("roi_imgsz", ROI_IMGSZ), name="ROI")
     roi_panels = [] if rois is None else [
         (f"ROI Boxes ({len(rois)})", draw_obb_panel(rotated_overlay, rois, color=(255, 0, 255)))]
+    log("ROI: " + ("disabled/skipped" if rois is None else f"{len(rois)} boxes"))
     quality = ""
     # rois is None when detection didn't run (disabled / no weights) -> leave blank
     if rois == [] and quality_enabled:
@@ -578,6 +653,7 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         if scored is not None:
             quality = round(float(np.mean(scored[0])), 3)
             roi_panels.append((f"Quality ({quality:.2f})", draw_quality_panel(rot_img, *scored)))
+        log(f"quality: {quality}")
     if rois:
         keep = roi_mask(rot_img.shape, rois)
     else:
@@ -589,19 +665,24 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     # re-mask after morphology so closing can't reintroduce pixels outside ROI / inside follicles
     rot_sc = erode_dilate(rot_sc_full & keep, kernel_px(sc_kernel_um, um_per_px)) & keep
     rot_gl = erode_dilate(rot_gl_full & keep, kernel_px(gl_kernel_um, um_per_px)) & keep
+    log(f"SC/Epidermis morphology ({kernel_px(sc_kernel_um, um_per_px)} / "
+        f"{kernel_px(gl_kernel_um, um_per_px)} px kernels)")
     if contact_enabled:
         rot_sc, rot_gl = keep_touching_components(rot_sc, rot_gl, round(contact_gap_um / um_per_px))
+        log("contact filter")
     if not rot_sc.any() or not rot_gl.any():
         print(f"SKIP {stem}: SC or Epidermis empty after ROI/follicle masking", flush=True)
         return (None, None) if return_visuals else None
+    log(f"kept SC {int(rot_sc.sum())} px, Epidermis {int(rot_gl.sum())} px")
 
     roi_overlay = overlay(rot_img, {"SC": rot_sc, "Epidermal": rot_gl, "gland": rot_gland})
 
     midline_panel = draw_gl_midline_panel(rot_img, rot_sc, rot_gl)
+    log("ROI overlay + midline panel")
 
     row_extra, measurement_panel, spine_panel = measure_rotated(
         rot_img, rot_sc, rot_gl, rot_gland if gland_id is not None else None, keep, um_per_px,
-        lateral_clip_frac, source_path)
+        lateral_clip_frac, source_path, log=log)
 
     composite = make_composite([
         ("Original", orig_bgr),
@@ -613,11 +694,13 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         ("Epidermal Midline", midline_panel),
         ("Height Spine", spine_panel),
     ])
+    log("steps composite")
     out_dir = Path(out_dir)
     if write_outputs:
         out_dir.mkdir(parents=True, exist_ok=True)
         imwrite_jpg(out_dir / f"{stem}_measurement.jpg", measurement_panel, 90)
         imwrite_jpg(out_dir / f"{stem}_steps.jpg", composite, 90)
+        log(f"wrote {stem}_measurement.jpg + {stem}_steps.jpg")
     if write_outputs and seg_path is not None:
         post_mask = np.zeros(rot_img.shape[:2], dtype=pred_mask.dtype)
         if gland_id is not None:
@@ -627,7 +710,10 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         seg_path = Path(seg_path)
         seg_path.parent.mkdir(parents=True, exist_ok=True)
         write_yolo_labels(rotate_k(post_mask, -k), class_index, seg_path)
+        log(f"wrote {seg_path.name}")
 
     row = {"folder name": folder_name, "file name": stem, **row_extra, "quality": quality,
            "total_tissue_um2": round(tissue_area_um2(orig_bgr, um_per_px), 2)}
+    log("total tissue area")
+    print(f"{stem}: postprocess total {log.total():.1f}s", flush=True)
     return (row, composite) if return_visuals else row

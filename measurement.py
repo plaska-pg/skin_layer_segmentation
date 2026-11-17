@@ -81,8 +81,8 @@ CSV_COLUMNS = [
    "EDJ tortuosity",
     "quality",
     "num_glands", "total_sebocyte_um2", "total_tissue_um2",
-    # set by the interface's Edit and review tab; kept here so predict.py --resume preserves them
-    "reviewed", "edited",
+    # save timestamp from the interface's segmentation editor; kept here so predict.py --resume preserves it
+    "edited",
 ]
 
 
@@ -195,57 +195,76 @@ def skeleton_spine(skel: np.ndarray, dt: np.ndarray):
 
 
 
+def _bbox_slices(mask: np.ndarray, pad: int = 1):
+   """(row slice, col slice) of mask's bounding box grown by pad and clipped to the frame; None if empty."""
+   rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+   if rows.size == 0:
+       return None
+   h, w = mask.shape[:2]
+   return (slice(max(rows[0] - pad, 0), min(rows[-1] + 1 + pad, h)),
+           slice(max(cols[0] - pad, 0), min(cols[-1] + 1 + pad, w)))
+
+
 def _prep_layer(mask: np.ndarray, hole_area_px: int = HOLE_AREA_PX):
    """Hole-filled mask + its distance transform + medial-axis skeleton, computed
    once so layer_sides / layer_stats / the spine panel all reuse them instead of
-   each recomputing the (expensive) skeletonize + distance transform."""
-   clean = remove_small_holes(mask.astype(bool), max_size=hole_area_px)
+   each recomputing the (expensive) skeletonize + distance transform.
+   Hole filling and skeletonizing run on the mask's bounding box only."""
+   mask = mask.astype(bool)
+   clean = np.zeros_like(mask)
+   skel = np.zeros_like(mask)
+   # background margin larger than hole_area_px, so edge-touching background is never filled as a hole
+   sl = _bbox_slices(mask, pad=int(np.sqrt(hole_area_px)) + 1)
+   if sl is not None:
+       clean[sl] = remove_small_holes(mask[sl], max_size=hole_area_px)
+       skel[sl] = skeletonize(clean[sl], method=SKELETON_METHOD)
    dt = _distance_transform(clean)
-   skel = skeletonize(clean, method=SKELETON_METHOD)
    return clean, dt, skel
 
 
 def _layer_spine(mask: np.ndarray, hole_area_px: int = HOLE_AREA_PX,
                 clean: np.ndarray = None, dt: np.ndarray = None, skel: np.ndarray = None,
-                col_window: tuple = None):
+                keep_mask: np.ndarray = None):
    """Medial-axis spine mask + total arc length (px) of a layer - per connected
    component, skeleton_spine's longest geodesic path through the skeleton,
    combined/summed across components. This IS the Area/Length denominator
    (see _centerline_length_px), exposed here so it can also be drawn.
    `clean`/`dt`/`skel` may be passed in (from _prep_layer) to skip recomputing them.
-   `col_window` = (lo, hi): the skeleton is still built from the WHOLE mask (so a
-   lateral clip can't carve cut-edges into it), but the returned spine mask and
-   its summed length keep only the portion in columns [lo, hi)."""
+   `keep_mask`: the skeleton is still built from the WHOLE mask (so a lateral
+   clip can't carve cut-edges into it), but the returned spine mask and its
+   summed length keep only the portion where keep_mask is True."""
    spine_mask = np.zeros_like(mask, bool)
    if not mask.any():
        return spine_mask, 0.0
-   if clean is None:
-       clean = remove_small_holes(mask.astype(bool), max_size=hole_area_px)
-   if dt is None:
-       dt = _distance_transform(clean)
-   if skel is None:
-       skel = skeletonize(clean, method=SKELETON_METHOD)
-   comp_labels = label(clean, connectivity=2)
+   if clean is None or dt is None or skel is None:
+       p_clean, p_dt, p_skel = _prep_layer(mask, hole_area_px)
+       clean = p_clean if clean is None else clean
+       dt = p_dt if dt is None else dt
+       skel = p_skel if skel is None else skel
+   sl = _bbox_slices(clean)
+   if sl is None:
+       return spine_mask, 0.0
+   skel_c, dt_c = skel[sl], dt[sl]
+   keep_c = keep_mask[sl] if keep_mask is not None else None
+   spine_c = spine_mask[sl]  # view into spine_mask
+   comp_labels = label(clean[sl], connectivity=2)
    total = 0.0
    for comp_id in range(1, int(comp_labels.max()) + 1):
-       comp_skel = skel & (comp_labels == comp_id)
+       comp_skel = skel_c & (comp_labels == comp_id)
        if not comp_skel.any():
            continue
-       spine, _, (pys, pxs) = skeleton_spine(comp_skel, dt)
-       spine_mask |= spine
+       spine, _, (pys, pxs) = skeleton_spine(comp_skel, dt_c)
+       spine_c |= spine
        if len(pxs) < 2:
            continue
        pys_f, pxs_f = np.asarray(pys, dtype=np.float64), np.asarray(pxs, dtype=np.float64)
        seg = np.hypot(np.diff(pxs_f), np.diff(pys_f))
-       if col_window is not None:
-           lo, hi = col_window
-           inside = (pxs_f >= lo) & (pxs_f < hi)
+       if keep_c is not None:
+           inside = keep_c[pys, pxs]
            seg = seg[inside[:-1] & inside[1:]]
        total += float(seg.sum())
-   if col_window is not None:
-       lo, hi = col_window
-       spine_mask[:, :lo] = False
-       spine_mask[:, hi:] = False
+   if keep_mask is not None:
+       spine_mask &= keep_mask
    return spine_mask, total
 
 

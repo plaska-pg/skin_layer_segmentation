@@ -22,7 +22,7 @@ postprocess:
   gland_erod_dil_kernel_size_um: 10      # same for gland (0 disables)
   sc_epidermis_contact_enabled: true     # drop SC/Epidermis connected components that don't touch the other class (after morphology)
   sc_epidermis_contact_gap_um: 5         # mostly to get rid of SC components not touching Epidermis (the ones separated from the main tissue)
-  lateral_clip_frac: 0.05     # fraction of the rotated ROI's horizontal extent trimmed off each side
+  lateral_clip_frac: 0.05     # fraction of the SC+Epidermis band's arc length (along its spine) trimmed off each end
   rotation_weights: models/rotate_model.pt   # trained orientation classifier (training/rotation/rotate.py)
   rotation_device: auto
   follicle_enabled: true                     # YOLO-OBB follicle detector on the rotated image (steps panel + follicle masking)
@@ -45,7 +45,7 @@ postprocess:
   quality_sections: 5       # even sections per ROI box (= training/qc_pipeline/qc_pipeline.yaml eval.sections)
 
 measurement:
-  skeleton_method: lee   # 'zhang' (skimage's 2D default) or 'lee'
+  skeleton_method: zhang   # 'zhang' (skimage's 2D default) or 'lee'
   hole_area_px: 64        # small holes filled before skeletonizing
   sc_surface_gl_margin_frac: 0.5   # excludes SC boundary within this fraction of SC's typical thickness from GL
   sc_surface_gl_margin_min_px: 3   # margin floor, so a paper-thin SC still gets some separation from GL

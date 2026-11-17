@@ -72,6 +72,10 @@ python predict.py --source "difficult_test_images" --limit 5
 
 python predict.py --weights "runs\semseg\dataset_3cls_gland_v2\best.pt" --source "difficult_test_images" --limit 2
 
+Re-run only postprocessing/measurement (e.g. after changing base_config.yaml) on one image or a whole folder, reusing the saved raw segmentations. It overwrites that image's `_measurement`/`_steps` images and `postprocessed_segmentations` label and replaces its `_results.csv` row; other rows and `run_config.yaml` are kept:
+
+python predict.py --reprocess --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Lisa Image Pro analyzed images\D28 Topical GFF\D28 L10C1.svs"
+
 ### to know:
 
 BX61 10X → 0.645 µm/px
@@ -112,7 +116,7 @@ ROI + follicle + quality together: `python training\qc_pipeline\qc_pipeline.py t
 4. Remove SC/Epidermis outside the union of ROI boxes and inside the bottom `follicle_mask_frac` of each follicle box
 5. Per-class elliptical opening then closing (`sc_erod_dil_kernel_size_um`, `epidermal_erod_dil_kernel_size_um`, `gland_erod_dil_kernel_size_um`)
 6. Drop SC/Epidermis components not within `sc_epidermis_contact_gap_um` of the other class (`sc_epidermis_contact_enabled`)
-7. Trim `lateral_clip_frac` per side, then measure
+7. Trim `lateral_clip_frac` of the band's arc length (along its medial-axis spine) off each end, then measure
 
 
 # adding more training examples as corrected pseudolabels
@@ -178,20 +182,43 @@ python training\annotate_qc_boxes.py --pred-source "<slides>" --um-per-px 0.2577
 ```
 Fix every box (add missed follicles: unboxed follicles teach the model to miss them) and rate sections (`r`). Unaccepted edits stay in `datasets\roi_follicle\pending\`; Accept copies the slide into `datasets\roi_follicle\images` with its boxes, ratings and um/px. 
 
-# the streamlit app design sucks and is ways too complicaed. 
-
-
 how can i add the images from here to the  roi_follicle training dataset ?
  "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
 
 tyring to add pseudolabels to box annotation 
 
+11/17 FINISH THIS: ( to kate: the box annotations were saved from a prior run. now we add them to the training dataset. )
 $src = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
 python training\annotate_qc_boxes.py --pred-source $src --um-per-px 0.2577 --preds runs\det\roi\pseudo_mde\detections.csv,runs\det\follicle\pseudo_mde\detections.csv
 
+  python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Lisa Image Pro analyzed images\D28 Topical GFF" --resume
 
-11/17 FINISH THIS: 
-$src = "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\Skin Biology Technology Development - Fundamental_MDE (Multi Decade & Ethnicity study)\MDE-TIFF"
-python training\annotate_qc_boxes.py --pred-source $src --um-per-px 0.2577 --preds runs\det\roi\pseudo_mde\detections.csv,runs\det\follicle\pseudo_mde\detections.csv
+Enhancement of the interface:
 
-  python predict.py --source "difficult_test_images"
+
+  On the edit page: 
+
+  - inspect ways to speed up the saving of the user modified segmentations
+  - allow user to edit the raw segmentations (to then be used in the seg_finetune dataset if it exists. this is like for admin mode. I am the admin)
+
+  On the process page:
+  - display what is happening: like show the postprocessing steps happening
+
+other to do
+
+the _measurement and _steps images should go into an "image_segs" folder (as child folder of predicted_ folder)
+
+ Zhang vs lee skeletonization comparison?
+  audit the git situation. I want a user to be able to clone the repo and be able to run inference. 
+
+
+
+
+ DONE:
+--reprocess for single image. It overwrites its current postprocessing files (its current _measurement and _steps files, as well as the postprocessed_segmentations .txt file)
+ add more logging for postprocessing. 
+- the editing tools should hover so that they are always visible. clicking to next image should be along side the editing tools 
+  - show editing pane first, and turn on "edit segmentation" by default
+  - the user should edit the postprocessed segmentations rather than the raw segmentations
+  - the user's segmentations should overwrite the postprocessed_segmentations .txt file and the _measurement and _steps files. 
+  - the user's corrected segmentations should be added as another pane to the _steps file.

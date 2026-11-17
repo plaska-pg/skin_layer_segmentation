@@ -4,6 +4,8 @@ import base64
 import csv
 import shutil
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +27,9 @@ CLASS_COLORS = {"SC": "#00c8ff", "Epidermis": "#ffc800", "gland": "#00ff00"}  # 
 IMAGE_EXTS = (".tif", ".tiff", ".svs", ".png", ".jpg", ".jpeg")
 DOC_KEY = "edit_doc"
 EDITOR_KEY = "seg_editor"
+SAVE_JOBS = "save_jobs"
+# one worker: saves run in order, so two saves never write the same CSV at once
+_SAVER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="seg-save")
 
 
 def long_path(p) -> Path:
@@ -221,14 +226,20 @@ def _on_need_image():
         st.session_state[DOC_KEY]["image_sent"] = False
 
 
-def save_doc(doc: dict, polys: dict) -> str:
-    """Overwrite postprocessed_segmentations/<stem>.txt (original kept once in original/), re-measure,
-    rewrite <stem>_measurement.jpg and the CSV row. Returns a status message."""
-    from measurement import _rasterise, tissue_area_um2
-    from postprocess import LATERAL_CLIP_FRAC, imwrite_jpg, remeasure_labels
+def append_user_pane(steps_path: Path, panel: np.ndarray):
+    """Appends a captioned 'User Corrected' pane to the existing <stem>_steps.jpg."""
+    from postprocess import imwrite_jpg, make_composite
+    p = long_path(steps_path)
+    steps = read_image(steps_path) if p.exists() else None
+    h = steps.shape[0] if steps is not None else 508  # make_composite default: 480 + 28 px caption
+    pane = make_composite([(f"User Corrected ({datetime.now():%Y-%m-%d %H:%M})", panel)], target_h=h - 28)
+    out = pane if steps is None else np.hstack([steps, np.zeros((h, 4, 3), np.uint8), pane])
+    imwrite_jpg(p, out, 90)
 
-    pred_dir, stem, info = Path(doc["pred_dir"]), doc["stem"], doc["info"]
-    names = info["names"]
+
+def write_labels(doc: dict, polys: dict) -> Path:
+    """Overwrites postprocessed_segmentations/<stem>.txt (original kept once in original/)."""
+    pred_dir, stem, names = Path(doc["pred_dir"]), doc["stem"], doc["info"]["names"]
     lbl = pred_dir / "postprocessed_segmentations" / f"{stem}.txt"
     backup = pred_dir / "postprocessed_segmentations" / "original" / f"{stem}.txt"
     if long_path(lbl).exists() and not long_path(backup).exists():
@@ -239,53 +250,113 @@ def save_doc(doc: dict, polys: dict) -> str:
     long_path(lbl.parent).mkdir(parents=True, exist_ok=True)
     with long_path(lbl).open("w", newline="\n") as f:
         f.writelines(l + "\n" for l in lines)
+    return lbl
 
+
+def remeasure_doc(doc: dict) -> str:
+    """Re-measures the saved labels: rewrites <stem>_measurement.jpg, appends the correction to
+    <stem>_steps.jpg and updates the CSV row. Returns a status message."""
+    from measurement import _rasterise, tissue_area_um2
+    from postprocess import LATERAL_CLIP_FRAC, imwrite_jpg, remeasure_labels
+
+    pred_dir, stem, info = Path(doc["pred_dir"]), doc["stem"], doc["info"]
+    lbl = pred_dir / "postprocessed_segmentations" / f"{stem}.txt"
     img_path = Path(doc["img_path"])
     img = read_image(img_path)
     um = (info["files"].get(stem) or {}).get("um_per_px") or info["um_default"] or 1.0
-    class_index = {n: k + 1 for k, n in enumerate(names)}
+    class_index = {n: k + 1 for k, n in enumerate(info["names"])}
     mask = _rasterise(long_path(lbl), *img.shape[:2])
     res = remeasure_labels(img, mask, class_index, um, info["lateral_clip_frac"] or LATERAL_CLIP_FRAC,
                            source_path=long_path(img_path))
     if res is None:
-        return "Saved labels; SC or Epidermis is empty, so measurements were not updated."
-    row_extra, panel = res
+        return "labels saved; SC or Epidermis is empty, so measurements were not updated"
+    row_extra, panel, corrected = res
     imwrite_jpg(long_path(pred_dir / f"{stem}_measurement.jpg"), panel, 90)
+    append_user_pane(pred_dir / f"{stem}_steps.jpg", corrected)
     src = Path(info["source"]) if info["source"] else pred_dir.parent
     update_row(pred_dir, stem, {**row_extra, "edited": datetime.now().isoformat(timespec="seconds")},
                new_row={"folder name": src.name, "total_tissue_um2": round(tissue_area_um2(img, um), 2)})
-    return "Saved labels and updated the measurement image and CSV row."
+    return "measurements, steps image and CSV row updated"
+
+
+def _describe_error(e: Exception) -> str:
+    if isinstance(e, PermissionError):
+        name = Path(str(e.filename)).name if e.filename else "an output file"
+        return f"{name} is open in another program (e.g. Excel or an image viewer); close it and save again"
+    return str(e)
+
+
+def _run_job(doc: dict, job: dict):
+    job["started"] = time.time()
+    try:
+        job["message"] = remeasure_doc(doc)
+    except Exception as e:  # noqa: BLE001 - reported in the page header
+        job["message"], job["error"] = f"re-measure failed: {_describe_error(e)}", True
+    job["end"] = time.time()
+
+
+def submit_save(doc: dict, polys: dict):
+    """Writes the labels now and queues the slow re-measure; progress goes to st.session_state[SAVE_JOBS]."""
+    write_labels(doc, polys)
+    job = {"stem": doc["stem"], "pred_dir": doc["pred_dir"], "queued": time.time(), "started": None,
+           "end": None, "message": "", "error": False}
+    jobs = st.session_state.setdefault(SAVE_JOBS, [])
+    jobs.append(job)
+    del jobs[:-20]
+    _SAVER.submit(_run_job, dict(doc), job)
+
+
+def is_saving(pred_dir, stem: str) -> bool:
+    return any(j["end"] is None and j["pred_dir"] == str(pred_dir) and j["stem"] == stem
+               for j in st.session_state.get(SAVE_JOBS, []))
 
 
 _EDITOR = st.components.v2.component(
     "seg_editor",
     html="""
 <div class="seg-ed" tabindex="0">
-  <div class="bar"></div>
-  <canvas></canvas>
-  <div class="status"></div>
+  <div class="top">
+    <div class="bar"></div>
+    <div class="status"></div>
+  </div>
   <div class="hint"></div>
+  <canvas></canvas>
 </div>
 """,
     css="""
 .seg-ed { outline: none; font-family: var(--st-font, sans-serif); color: var(--st-text-color); }
 .seg-ed:focus canvas { box-shadow: 0 0 0 2px var(--st-primary-color); }
-.bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+/* stays visible while the page scrolls past the canvas */
+.top { position: sticky; top: var(--seg-ed-top, 3.75rem); z-index: 10; padding: 6px 0;
+  background: var(--st-background-color, #fff); border-bottom: 1px solid var(--st-border-color, #ccc); }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.grp { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.grp.right { margin-left: auto; }
 .bar button { border: 2px solid var(--st-border-color, #888); background: var(--st-secondary-background-color);
   color: var(--st-text-color); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.85rem; }
 .bar button.on { background: var(--st-primary-color); color: #fff; }
-.bar button.primary { margin-left: auto; background: var(--st-primary-color); color: #fff;
-  border-color: var(--st-primary-color); }
-canvas { display: block; width: 100%; cursor: crosshair; touch-action: none; border-radius: 4px; }
+.bar button.primary { background: var(--st-primary-color); color: #fff; border-color: var(--st-primary-color);
+  margin-right: 8px; }
+.bar button:disabled { opacity: 0.35; cursor: default; }
+.spin { display: inline-block; width: 0.8em; height: 0.8em; margin-right: 6px; vertical-align: -0.1em;
+  border: 2px solid rgba(255, 255, 255, 0.4); border-top-color: #fff; border-radius: 50%;
+  animation: seg-spin 0.8s linear infinite; }
+@keyframes seg-spin { to { transform: rotate(360deg); } }
+.pos { font-size: 0.85rem; min-width: 3.5em; text-align: center; }
+canvas { display: block; width: 100%; margin-top: 6px; cursor: crosshair; touch-action: none; border-radius: 4px; }
 .status { margin-top: 4px; font-size: 0.85rem; }
-.hint { font-size: 0.75rem; opacity: 0.7; }
+.status.dirty { color: var(--st-red-color, #d33); }
+.hint { margin-top: 4px; font-size: 0.75rem; opacity: 0.7; }
 """,
     js=(Path(__file__).with_name("seg_editor.js")).read_text(encoding="utf-8"),
 )
 
 
-def editor(pred_dir: Path, stem: str):
-    """Mounts the polygon editor for `stem`; saves when the editor asks to. Returns True after a save."""
+def editor(pred_dir: Path, stem: str, nav: dict = None, on_nav=None):
+    """Mounts the polygon editor for `stem`. Save writes the labels and queues the re-measure in the
+    background (see submit_save); returns True when a save was queued. `nav` = {"label", "prev", "next"}
+    drives the toolbar's image arrows; `on_nav` runs when one is used (the step, -1 or 1, is in
+    st.session_state[EDITOR_KEY]["nav"])."""
     doc = st.session_state.get(DOC_KEY)
     if not doc or doc["pred_dir"] != str(pred_dir) or doc["stem"] != stem:
         err = load_doc(pred_dir, stem)
@@ -293,24 +364,17 @@ def editor(pred_dir: Path, stem: str):
             st.error(err)
             return False
         doc = st.session_state[DOC_KEY]
-    saved = False
+    queued = False
     if doc["pending_save"] is not None:
         polys, doc["pending_save"] = doc["pending_save"], None
-        with st.spinner("Saving and re-measuring (about a minute for a whole slide)..."):
-            try:
-                doc["message"] = save_doc(doc, polys)
-                doc.update(polys=polys, dirty=False)
-                saved = True
-            except Exception as e:  # noqa: BLE001 - keep the edits in the browser, show why the save failed
-                doc.update(polys=polys, dirty=True, message=f"save failed: {e}")
+        try:
+            submit_save(doc, polys)
+            doc.update(polys=polys, dirty=False, message="saved; re-measuring in the background")
+            queued = True
+        except Exception as e:  # noqa: BLE001 - keep the edits in the browser, show why the save failed
+            doc.update(polys=polys, dirty=True, message=f"save failed: {_describe_error(e)}")
         doc.update(version=doc["version"] + 1, noop=False)
 
-    c1, c2 = st.columns([4, 1], vertical_alignment="center")
-    c1.caption(f"Editing the {doc['kind']} segmentation of `{doc['img_path']}`. Unsaved edits are lost when you "
-               "switch images or reload.")
-    if c2.button("Reload from disk", width="stretch"):
-        load_doc(pred_dir, stem)
-        doc = st.session_state[DOC_KEY]
     # the multi-MB image goes out once per document; reruns for merge / cut / save only carry polygons
     image = None
     if not doc.get("image_sent"):
@@ -319,11 +383,13 @@ def editor(pred_dir: Path, stem: str):
     _EDITOR(
         key=EDITOR_KEY,
         data={k: doc[k] for k in ("iw", "ih", "polys", "version", "dirty", "noop", "message")} | {
-            "doc": doc["id"], "height": EDITOR_HEIGHT, "image": image,
+            "doc": doc["id"], "height": EDITOR_HEIGHT, "image": image, "nav": nav,
+            "saving": is_saving(pred_dir, stem),
             "classes": [{"name": c, "color": CLASS_COLORS.get(c, "#ffffff")} for c in doc["polys"]],
         },
         on_op_change=_on_op,
         on_save_change=_on_save,
         on_need_image_change=_on_need_image,
+        on_nav_change=on_nav or (lambda: None),
     )
-    return saved
+    return queued
