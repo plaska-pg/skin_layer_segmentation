@@ -107,7 +107,8 @@ Start-Process powershell -WindowStyle Hidden -ArgumentList "-NoProfile", "-Encod
     ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Opener)))
 
 Step "Starting the app at $Url (keep this window open; close it to stop the app)"
-$StreamlitArgs = @("--server.port", $Port, "--server.headless", "true", "--browser.gatherUsageStats", "false")
+# localhost only: the app can read/write the user's files, so don't expose it to the network
+$StreamlitArgs = @("--server.address", "localhost", "--server.port", $Port, "--server.headless", "true", "--browser.gatherUsageStats", "false")
 if (-not $DevMode) { $StreamlitArgs += @("--server.fileWatcherType", "none") }
 & $VenvPython -m streamlit run (Join-Path $Repo "interface\app.py") @StreamlitArgs
 exit $LASTEXITCODE
