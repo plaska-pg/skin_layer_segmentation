@@ -1,4 +1,4 @@
-﻿--extra-index-url https://download.pytorch.org/whl/cu128
+﻿# torch==2.11.0 / torchvision==0.26.0 are installed first, from the CUDA or CPU index (see README)
 altair==6.3.0
 anyio==4.15.1
 attrs==26.1.0
@@ -56,8 +56,6 @@ streamlit==1.64.0
 sympy==1.14.0
 tifffile==2026.9.20
 toml==0.10.2
-torch==2.11.0+cu128
-torchvision==0.26.0+cu128
 typing_extensions==4.16.0
 tzdata==2026.4
 ultralytics==8.4.177

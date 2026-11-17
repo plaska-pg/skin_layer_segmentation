@@ -33,7 +33,7 @@ Image.MAX_IMAGE_PIXELS = None  # these whole-slide TIFFs/SVS are far bigger than
 
 from training.semseg.train_semseg import MEAN, STD, ResUNet, pick_device  # noqa: E402
 
-from config import BASE_CONFIG_PATH, CONFIG  # noqa: E402
+from config import BASE_CONFIG_PATH, CONFIG, repo_path  # noqa: E402
 from postprocess import (EPIDERMAL_ERODE_DILATE_UM, FOLLICLE_CONF, FOLLICLE_ENABLED, FOLLICLE_MASK_FRAC,
                          FOLLICLE_PADDING_UM, FOLLICLE_WEIGHTS, GLAND_ERODE_DILATE_UM, LATERAL_CLIP_FRAC, ROI_CONF, ROI_ENABLED, ROI_WEIGHTS,
                          QUALITY_ENABLED, QUALITY_SECTIONS, QUALITY_WEIGHTS,
@@ -307,6 +307,7 @@ def main():
                           "model inference - cv2/scipy/skimage release the GIL so this gets real parallelism. "
                           "Ignored with --no-postprocess. Keep this <= your CPU core count.")
     args = ap.parse_args()
+    args.weights = repo_path(args.weights)
     if args.reprocess and args.no_postprocess:
         raise SystemExit("--reprocess re-runs postprocessing; it can't be combined with --no-postprocess")
 

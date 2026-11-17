@@ -3,32 +3,48 @@
 
 Train (on PMC data), finetune on (P&G data), pseudolabeling (on generated segmented P&G data) and run inference on H&E stained skin 
 
-## Quick start
+## Install
 
-Run the app interface
-```
-streamlit run interface/app.py
-```
-
-## For pipeline Dev
-
-### Download the repo from github (https://github.com/plaska-pg/skin_layer_segmentation)
+1. Install Python 3.14 (on Windows, typing `python` in PowerShell opens the installer).
+2. Clone the repo outside OneDrive (the trained weights in `models/` come with it):
 
 ```powershell
 git clone https://github.com/plaska-pg/skin_layer_segmentation.git "$HOME\skin_layer_segmentation"
 cd "$HOME\skin_layer_segmentation"
-```
-### Environment setup
-
-Install python3.14. You can do this by typing python in the powershell terminal (if on windows). This'll pull up an install window. The commands above clone the repo into your home folder (for example, `C:\Users\plas.ka\skin_layer_segmentation` on this computer), keeping the virtual environment off OneDrive.
-
-```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+```
+
+3. Install PyTorch for your hardware, then the rest:
+
+```powershell
+# NVIDIA GPU
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+# or CPU only (much slower)
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins the exact packages. The background `run_predict_background*.ps1` scripts resolve the interpreter from `.venv\Scripts\python.exe` under `$ProjectDir`, so keep the venv there (or update `$ProjectDir`).
+## Run inference
+
+App (Run / Review / Results pages):
+```powershell
+streamlit run interface/app.py
+```
+
+Command line, on the bundled example (a Motic 40X scan at 0.2577 um/px):
+```powershell
+python predict.py --source examples --um-per-px 0.2577
+```
+
+- `--source`: an image file or a folder (.jpg/.png/.tif/.tiff/.svs). `.svs` files use their embedded µm/px; for other formats pass `--um-per-px` (BX61 10X = 0.645, Motic 40X = 0.2577) or set `predict.um_per_px` in `base_config.yaml`.
+- Output goes to `<source folder>/predicted_<folder name>/` (or `--out <dir>`): `_results.csv` (one row of measurements per image), `raw_segmentations/` and `postprocessed_segmentations/` (YOLO-seg polygon `.txt`), plus `<image>_measurement.jpg` / `<image>_steps.jpg` QA images and `run_config.yaml`.
+- All pipeline settings live in `base_config.yaml`; `--device cpu|cuda|auto` picks the device.
+
+## For pipeline Dev
+
+The background `run_predict_background*.ps1` scripts resolve the interpreter from `.venv\Scripts\python.exe` under `$ProjectDir`, so keep the venv there (or update `$ProjectDir`); their source folders are hard-coded personal OneDrive paths, edit them before use.
 
 
 

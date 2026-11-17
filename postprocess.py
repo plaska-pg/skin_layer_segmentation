@@ -36,7 +36,7 @@ from scipy import ndimage as ndi
 from skimage.measure import label
 from skimage.morphology import skeletonize
 
-from config import CONFIG
+from config import CONFIG, repo_path
 from measurement import (CSV_COLUMNS, SKELETON_METHOD, _distance_transform, _file_date, _layer_spine,
                          draw_gl_midline_panel, draw_spine_panel, measure_layers, overlay, skeleton_spine,
                          tissue_area_um2)
@@ -56,10 +56,10 @@ GLAND_ERODE_DILATE_UM = _PP_CFG.get("gland_erod_dil_kernel_size_um", 0.0)
 SC_EPIDERMIS_CONTACT_ENABLED = _PP_CFG.get("sc_epidermis_contact_enabled", True)
 SC_EPIDERMIS_CONTACT_GAP_UM = _PP_CFG.get("sc_epidermis_contact_gap_um", 5.0)
 LATERAL_CLIP_FRAC = _PP_CFG.get("lateral_clip_frac", 0.10)  # fraction of the tissue band's spine arc length trimmed per end
-ROTATION_WEIGHTS = _PP_CFG.get("rotation_weights", "models/rotate_model.pt")
+ROTATION_WEIGHTS = repo_path(_PP_CFG.get("rotation_weights", "models/rotate_model.pt"))
 ROTATION_DEVICE = _PP_CFG.get("rotation_device", "auto")
 FOLLICLE_ENABLED = _PP_CFG.get("follicle_enabled", True)
-FOLLICLE_WEIGHTS = _PP_CFG.get("follicle_weights", "models/follicle_det_v4.pt")
+FOLLICLE_WEIGHTS = repo_path(_PP_CFG.get("follicle_weights", "models/follicle_det_v4.pt"))
 FOLLICLE_DEVICE = _PP_CFG.get("follicle_device", "auto")
 FOLLICLE_CONF = _PP_CFG.get("follicle_conf", 0.25)
 FOLLICLE_MAX_SIDE = _PP_CFG.get("follicle_max_side", 1024)
@@ -67,13 +67,13 @@ FOLLICLE_IMGSZ = _PP_CFG.get("follicle_imgsz", 1024)
 FOLLICLE_PADDING_UM = _PP_CFG.get("follicle_padding_um", 0.0)
 FOLLICLE_MASK_FRAC = _PP_CFG.get("follicle_mask_frac", 0.8)
 ROI_ENABLED = _PP_CFG.get("roi_enabled", True)
-ROI_WEIGHTS = _PP_CFG.get("roi_weights", "models/roi_det_v3.pt")
+ROI_WEIGHTS = repo_path(_PP_CFG.get("roi_weights", "models/roi_det_v3.pt"))
 ROI_DEVICE = _PP_CFG.get("roi_device", "auto")
 ROI_CONF = _PP_CFG.get("roi_conf", 0.25)
 ROI_MAX_SIDE = _PP_CFG.get("roi_max_side", 1024)
 ROI_IMGSZ = _PP_CFG.get("roi_imgsz", 1024)
 QUALITY_ENABLED = _PP_CFG.get("quality_enabled", True)
-QUALITY_WEIGHTS = _PP_CFG.get("quality_weights", "models/qual_v2.pt")
+QUALITY_WEIGHTS = repo_path(_PP_CFG.get("quality_weights", "models/qual_v2.pt"))
 QUALITY_DEVICE = _PP_CFG.get("quality_device", "auto")
 QUALITY_SECTIONS = _PP_CFG.get("quality_sections", 5)
 

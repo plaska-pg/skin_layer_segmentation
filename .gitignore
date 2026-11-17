@@ -18,3 +18,4 @@ calibrations/*.IQC
 *.tif
 sssshhhhh.md
 *.tiff
+predicted_*/

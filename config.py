@@ -11,7 +11,14 @@ from pathlib import Path
 import yaml
 
 # SKIN_SEG_CONFIG lets a caller (e.g. interface/app.py) point a run at an edited copy of the config
-BASE_CONFIG_PATH = Path(os.environ.get("SKIN_SEG_CONFIG") or Path(__file__).resolve().parent / "base_config.yaml")
+REPO_ROOT = Path(__file__).resolve().parent
+BASE_CONFIG_PATH = Path(os.environ.get("SKIN_SEG_CONFIG") or REPO_ROOT / "base_config.yaml")
+
+
+def repo_path(p) -> str:
+    """p as given if absolute or present relative to the cwd, else relative to the repo root."""
+    p = Path(p)
+    return str(p if p.is_absolute() or p.exists() else REPO_ROOT / p)
 
 
 def load_config(path: Path = None) -> dict:

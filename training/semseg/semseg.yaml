@@ -4,7 +4,7 @@
 
 train:
   data: datasets/seg_finetune
-  init_weights: models/3cls_best_v7.pt
+  init_weights: models/init/3cls_best_v7.pt
   encoder: resnet34
   epochs: 100
   batch: 2
