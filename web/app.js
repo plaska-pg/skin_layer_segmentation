@@ -971,17 +971,12 @@ async function chooseFolder() {
   }
 }
 
-async function reopenFolder() {
-  if (state.saved && (await state.saved.requestPermission({ mode: "readwrite" })) === "granted") await setRoot(state.saved);
-}
-
-// the working folder is remembered across visits (interface/app.py LAST_USED); reopening needs a click
+// the working folder is remembered across visits (interface/app.py LAST_USED)
 async function setRoot(handle) {
   state.root = handle;
   state.pred = null;
   document.body.classList.remove("no-folder");
   $("folder-name").value = handle.name;
-  $("reopen-folder").hidden = true;
   if (!state.busy) {
     state.lastRun = null;
     $("last-warnings").replaceChildren();
@@ -1587,7 +1582,6 @@ function downloadResults() {
 function wire() {
   window.addEventListener("hashchange", () => showPage(location.hash.slice(1)));
   $("choose-folder").addEventListener("click", chooseFolder);
-  $("reopen-folder").addEventListener("click", () => reopenFolder().catch(showError));
   $("pred-select").addEventListener("change", (e) => {
     state.pred = state.preds[Number(e.target.value)] ?? null;
     if (state.page === "review") loadReview().catch(showError);
@@ -1613,7 +1607,6 @@ function wire() {
     if (it?.path) openInReview(it.path, it.stem);
   });
   $("cta-choose").addEventListener("click", chooseFolder);
-  $("cta-reopen").addEventListener("click", () => reopenFolder().catch(showError));
   $("log-toggle").addEventListener("click", () => { $("log-pop").hidden = !$("log-pop").hidden; });
   document.addEventListener("click", (e) => { if (!$("status-box").contains(e.target)) $("log-pop").hidden = true; });
   $("vw-prev").addEventListener("click", () => stepViewer(-1));
@@ -1655,21 +1648,10 @@ async function init() {
   showExample();
   loadExample().then(() => { if (!state.busy && !state.lastRun) showExample(); })
     .catch((e) => showViewer([], { badge: "Example", empty: `The example could not be loaded (${e.message}).` }));
-  // a remembered folder skips the landing page; one whose permission lapsed needs a click to reopen
+  // a remembered folder that still has permission skips the landing page
   try {
     const saved = window.showDirectoryPicker ? await idb("readonly", (s) => s.get("root")).catch(() => null) : null;
-    if (saved) {
-      if ((await saved.queryPermission({ mode: "readwrite" })) === "granted") await setRoot(saved);
-      else {
-        state.saved = saved;
-        $("reopen-folder").textContent = `Reopen ${saved.name}`;
-        $("reopen-folder").hidden = false;
-        $("cta-reopen").textContent = `\u{1F4C2} Continue with ${saved.name}`;
-        $("cta-reopen").hidden = false;
-        $("cta-choose").classList.remove("primary");
-        $("cta-choose").textContent = "Choose another folder";
-      }
-    }
+    if (saved && (await saved.queryPermission({ mode: "readwrite" })) === "granted") await setRoot(saved);
   } catch (e) {
     console.warn("could not reopen the remembered folder", e);
     state.root = null;

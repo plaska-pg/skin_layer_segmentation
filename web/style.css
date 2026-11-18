@@ -151,7 +151,6 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 .run-actions { position: sticky; bottom: 0; margin-top: auto; padding: .5rem 0 0; background: var(--bg); }
 .hero h2 { font-size: 1.6rem; line-height: 1.25; margin: .5rem 0 .75rem; }
 .hero p { margin: 0 0 1rem; }
-.hero .btn + .btn { margin-top: .5rem; }
 .btn.lg { min-height: 3rem; font-size: 1.05rem; font-weight: 600; }
 .hero ol.how { padding-left: 1.25rem; margin: 1.25rem 0; font-size: .95rem; }
 .hero ol.how li { margin-bottom: .35rem; }
