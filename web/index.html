@@ -51,7 +51,7 @@
     </header>
     <main>
       <section id="page-run" data-page="run" class="run-grid">
-        <div class="run-left">
+        <div class="run-left" id="run-left">
         <div class="hero" id="run-landing">
           <h2>Measure skin layers on H&amp;E slides</h2>
           <p>Segments the stratum corneum, epidermis and glands, then measures layer thickness, area, EDJ tortuosity
@@ -64,61 +64,6 @@
             <li>Results are saved in a predicted_&lt;folder&gt; folder inside it; check and correct them on the Review page.</li>
           </ol>
           <p class="caption">Runs on this computer in the browser (Chrome or Edge); images are not uploaded.</p>
-        </div>
-        <div id="run-body" hidden>
-          <div class="field">
-            <span class="label">Process</span>
-            <div class="seg" id="scope">
-              <button type="button" data-v="folder" class="on">This folder</button>
-              <button type="button" data-v="subfolders">Include subfolders</button>
-              <button type="button" data-v="one">One image</button>
-            </div>
-          </div>
-          <div class="field" id="image-field" hidden>
-            <label for="run-image">Image</label>
-            <select id="run-image"></select>
-          </div>
-          <div class="field">
-            <label for="scanner" title="Sets the image resolution (µm per pixel).">Scanner</label>
-            <select id="scanner"></select>
-          </div>
-          <div class="field" id="mpp-field" hidden>
-            <label for="mpp">µm per pixel</label>
-            <input type="number" id="mpp" step="any" min="0.01">
-          </div>
-          <div class="field">
-            <span class="label" title="Average predictions over flipped / rotated copies (4x or 8x slower).">Test-time augmentation</span>
-            <div class="seg" id="tta">
-              <button type="button" data-v="none" class="on">none</button>
-              <button type="button" data-v="flip">flip</button>
-              <button type="button" data-v="d4">d4</button>
-            </div>
-          </div>
-          <label class="switch"><input type="checkbox" id="opt-roi" checked> Detect ROI (drop SC/Epidermis outside it)</label>
-          <label class="switch"><input type="checkbox" id="opt-follicle" checked> Detect and mask follicles</label>
-          <label class="switch"><input type="checkbox" id="opt-quality" checked> Score section quality</label>
-          <details class="expander">
-            <summary>Advanced settings</summary>
-            <div>
-              <div class="field">
-                <label for="backend">Compute</label>
-                <select id="backend">
-                  <option value="webgpu">GPU (WebGPU)</option>
-                  <option value="wasm">CPU (WebAssembly)</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="limit">Limit images per folder (0 = all)</label>
-                <input type="number" id="limit" min="0" step="1" value="0">
-              </div>
-              <label class="check"><input type="checkbox" id="resume" checked> Resume (reuse already-processed images)</label>
-              <p class="caption">Results go to predicted_&lt;folder&gt; inside each image folder (predicted_&lt;image&gt; for one image).
-                Images over 45 MP are measured at 0.4 µm/px to fit in browser memory.</p>
-            </div>
-          </details>
-          <div class="run-actions">
-            <button class="btn primary wide" id="run" type="button" disabled>&#x25B6; Run</button>
-          </div>
         </div>
         </div>
 
@@ -134,12 +79,17 @@
               <button type="button" data-v="measurement" class="on">Measurement</button>
               <button type="button" data-v="steps">Steps</button>
             </div>
+            <button class="btn primary sm" id="open-run" type="button" hidden>&#x25B6; Run...</button>
           </div>
           <div class="metrics" id="vw-metrics"></div>
           <div class="vw-stage">
             <canvas id="run-preview" hidden></canvas>
             <img id="vw-img" alt="" title="Open full size" hidden>
             <span class="caption" id="vw-empty" hidden></span>
+            <div class="run-pie" id="run-pie" hidden>
+              <div class="pie"><span id="run-pie-pct">0%</span></div>
+              <span class="pie-label" id="run-pie-label"></span>
+            </div>
           </div>
           <div id="last-warnings" class="vw-warnings"></div>
           <div class="vw-foot">
@@ -147,6 +97,11 @@
             <a class="btn" id="vw-download" download="example_results.csv" hidden>&#x2B73; Example CSV</a>
             <button class="btn primary" id="review-last" type="button" hidden>&#x2611; Review results</button>
           </div>
+        </div>
+
+        <div class="run-queue" id="run-queue" hidden>
+          <div class="rq-head"><span>Images</span><span class="caption" id="rq-count"></span></div>
+          <ol id="rq-list"></ol>
         </div>
       </section>
 
@@ -217,5 +172,75 @@
     </main>
   </div>
 </div>
+<dialog id="run-dlg" class="dlg run-dlg">
+  <h3>Analyze <span id="run-dlg-folder"></span></h3>
+  <p class="caption" id="run-dlg-count"></p>
+  <div class="field">
+    <span class="label">Process</span>
+    <div class="seg" id="scope">
+      <button type="button" data-v="folder" class="on">This folder</button>
+      <button type="button" data-v="subfolders">Include subfolders</button>
+      <button type="button" data-v="one">One image</button>
+    </div>
+  </div>
+  <div class="field" id="image-field" hidden>
+    <label for="run-image">Image</label>
+    <select id="run-image"></select>
+  </div>
+  <div class="field">
+    <label for="scanner" title="Sets the image resolution (µm per pixel).">Scanner</label>
+    <select id="scanner"></select>
+  </div>
+  <div class="field" id="mpp-field" hidden>
+    <label for="mpp">µm per pixel</label>
+    <input type="number" id="mpp" step="any" min="0.01">
+  </div>
+  <label class="switch"><input type="checkbox" id="opt-roi" checked> Detect ROI (drop SC/Epidermis outside it)</label>
+  <label class="switch"><input type="checkbox" id="opt-follicle" checked> Detect and mask follicles</label>
+  <label class="switch"><input type="checkbox" id="opt-quality" checked> Score section quality</label>
+  <details class="expander">
+    <summary>Advanced settings</summary>
+    <div>
+      <div class="field">
+        <span class="label" title="Average predictions over flipped / rotated copies of each image (4x or 8x slower).">Test-time augmentation</span>
+        <div class="seg" id="tta">
+          <button type="button" data-v="none" class="on">none</button>
+          <button type="button" data-v="flip">flip</button>
+          <button type="button" data-v="d4">d4</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="backend">Compute</label>
+        <select id="backend">
+          <option value="webgpu">GPU (WebGPU)</option>
+          <option value="wasm">CPU (WebAssembly)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="limit">Limit images per folder (0 = all)</label>
+        <input type="number" id="limit" min="0" step="1" value="0">
+      </div>
+      <label class="check"><input type="checkbox" id="resume" checked> Resume (reuse already-processed images)</label>
+      <p class="caption">Results go to predicted_&lt;folder&gt; inside each image folder (predicted_&lt;image&gt; for one image).
+        Images over 45 MP are measured at 0.4 µm/px to fit in browser memory.</p>
+    </div>
+  </details>
+  <p class="caption" id="run-dlg-wait" hidden>Downloading the models; Run is enabled when they are ready.</p>
+  <div class="dlg-actions">
+    <button class="btn" type="button" id="run-cancel">Cancel</button>
+    <button class="btn primary" type="button" id="run" disabled>&#x25B6; Run</button>
+  </div>
+</dialog>
+<dialog id="confirm-dlg" class="dlg">
+  <form method="dialog">
+    <h3 id="dlg-title"></h3>
+    <p id="dlg-text"></p>
+    <ul id="dlg-list"></ul>
+    <div class="dlg-actions">
+      <button class="btn" value="cancel" autofocus>Cancel</button>
+      <button class="btn primary" value="ok" id="dlg-ok">Continue</button>
+    </div>
+  </form>
+</dialog>
 </body>
 </html>

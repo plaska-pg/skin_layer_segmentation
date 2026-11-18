@@ -62,9 +62,10 @@ async function init({ version, files, packages, modules }) {
 const heapMB = () => Math.round(py._module.HEAPU8.buffer.byteLength / 2 ** 20);
 
 async function run(msg) {
-  const { id, name, rgb, mask, w, h, umPerPx, k, lastModified, quality, folderName, options } = msg;
+  const { id, name, rgb, mask, w, h, umPerPx, k, lastModified, quality, folderName, options, region, det } = msg;
   const result = JSON.parse(await pipeline.run(name, rgb, mask, w, h, umPerPx, k, lastModified, infer, quality,
-    folderName ?? "", JSON.stringify(options ?? {})));
+    folderName ?? "", JSON.stringify(options ?? {}), JSON.stringify(region ?? null), det?.rgb ?? null,
+    det?.w ?? 0, det?.h ?? 0));
   const files = {};
   for (const f of result.files) files[f] = py.FS.readFile(`/out/${f}`);
   postMessage({ type: "done", id, ...result, files, heapMB: heapMB() }, Object.values(files).map((a) => a.buffer));

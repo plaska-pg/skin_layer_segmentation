@@ -3,18 +3,19 @@
 // linear ramp, bilinear upsampling of probabilities, argmax). Measuring and the Review editor's merge / cut /
 // re-measure run postprocess.py & co. in Pyodide workers (worker.js); the editor is interface/seg_editor.js.
 import mountEditor from "../interface/seg_editor.js?v=dev";
-import { decode, previewJpeg, pyRound, resize, toRGB, workSize } from "./imaging.js?v=dev";
+import { crop, decode, previewJpeg, pyRound, resize, tissueBox, toRGB, workSize } from "./imaging.js?v=dev";
 import { canCopyTiff, isSvs, openSvs, readSvsScaled, TiffWriter } from "./svs.js?v=dev";
 
 // ?v=<commit> on every app file (set by the Pages build) keeps cached files from different deploys apart
 const VERSION = new URL(import.meta.url).searchParams.get("v") ?? "";
 const { ort } = window;
 const $ = (id) => document.getElementById(id);
-const COLORS = [null, [230, 80, 60], [60, 170, 90], [70, 110, 230]];
 // larger images are measured at POST_UM_PER_PX so Pyodide stays under its 4 GB memory limit
 const MAX_POST_MP = 45, POST_UM_PER_PX = 0.4;
 // .svs are read straight to the measuring size; above this it would not fit in Pyodide
 const MAX_SVS_WORK_MP = 150;
+// above MAX_POST_MP the measuring image is cropped to the tissue (+ margin); 108 MP crashed the measuring worker
+const CROP_MARGIN_UM = 200, MAX_MEASURE_MP = 90;
 const WORKER_RECYCLE_MB = 1024;
 const EDITOR_MAX_SIDE = 4096, EDITOR_HEIGHT = 720;  // interface/seg_editor.py
 // display-size copy of each source image, written next to the results so Review opens without decoding the source
@@ -175,7 +176,7 @@ async function ttaProbs(session, data, PH, PW, nCls, tta) {
   return acc;
 }
 
-async function tiledProbs(session, img, nCls, tta = "none") {
+async function tiledProbs(session, img, nCls, tta = "none", onTile = null) {
   const { w, h, px, cn } = img, tile = manifest.tile;
   const m = Math.floor(tile * manifest.tile_overlap / 2), stride = tile - 2 * m;
   const ys = starts(h, tile, stride), xs = starts(w, tile, stride);
@@ -206,6 +207,7 @@ async function tiledProbs(session, img, nCls, tta = "none") {
         }
       }
       status(`Tile ${++k} / ${n}`, k / n);
+      onTile?.(k, n);
       await tick();
     }
   }
@@ -253,8 +255,10 @@ function upsampleArgmax(probs, nCls, w, h, ow, oh) {
   return mask;
 }
 
-function drawPreview(img, mask) {
-  const s = Math.min(1, 1200 / img.w), pw = Math.max(1, Math.round(img.w * s)), ph = Math.max(1, Math.round(img.h * s));
+// the image being processed, downscaled, replacing whatever the viewer showed
+function drawRaw(img) {
+  const s = Math.min(1, 1200 / Math.max(img.w, img.h));
+  const pw = Math.max(1, Math.round(img.w * s)), ph = Math.max(1, Math.round(img.h * s));
   const canvas = $("run-preview"), ctx = canvas.getContext("2d");
   vw.token++;
   canvas.hidden = false;
@@ -266,17 +270,26 @@ function drawPreview(img, mask) {
   for (let y = 0; y < ph; y++) {
     const sy = Math.min(img.h - 1, Math.floor((y + 0.5) / s));
     for (let x = 0; x < pw; x++) {
-      const sx = Math.min(img.w - 1, Math.floor((x + 0.5) / s)), si = sy * img.w + sx, o = 4 * (y * pw + x);
-      const col = COLORS[mask[si]];
-      for (let c = 0; c < 3; c++) {
-        const v = img.px[si * img.cn + c];
-        im.data[o + c] = col ? 0.55 * v + 0.45 * col[c] : v;
-      }
+      const si = (sy * img.w + Math.min(img.w - 1, Math.floor((x + 0.5) / s))) * img.cn, o = 4 * (y * pw + x);
+      im.data[o] = img.px[si]; im.data[o + 1] = img.px[si + 1]; im.data[o + 2] = img.px[si + 2];
       im.data[o + 3] = 255;
     }
   }
   ctx.putImageData(im, 0, 0);
 }
+
+// share of the current image done, as a pie over the viewer
+function imageProgress(frac, label) {
+  const p = Math.round(Math.min(1, Math.max(0, frac)) * 100);
+  $("run-pie").hidden = false;
+  $("run-pie").style.setProperty("--p", p);
+  $("run-pie-pct").textContent = `${p}%`;
+  if (label) $("run-pie-label").textContent = label;
+  if (rq.active) rq.active.note.textContent = `${p}%`;
+}
+
+// typical number of postprocess log lines per image, to turn them into progress
+const MEASURE_LINES = 20;
 
 async function prepareBackend() {
   let backend = $("backend").value, session;
@@ -294,6 +307,8 @@ async function prepareBackend() {
 
 function setBusy(busy) {
   $("run").disabled = busy || !state.root || !state.modelsReady;
+  $("run-dlg-wait").hidden = state.modelsReady;
+  $("open-run").hidden = busy || !state.root;
   $("stop").hidden = !busy;
   $("status-progress").hidden = !busy;
   $("status-box").classList.toggle("busy", busy);
@@ -306,6 +321,7 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
   const tAll = performance.now();
   let t0 = performance.now();
   status(`${file.name}: reading...`);
+  imageProgress(0, `Reading ${file.name}`);
   await tick();
   const svs = isSvs(file.name) ? await openSvs(file) : null;
   if (svs?.mpp) mpp = svs.mpp;
@@ -329,12 +345,18 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
       await tiff.discard();
     }
     ({ net, work, sq } = await readSvsScaled(svs, { net: [tw, th], work: [ww, wh], sq: [rs, rs] },
-      { tiff: sink, onRow: (r, n) => status(`${file.name}: reading ${Math.round((100 * r) / n)}%`) }));
+      { tiff: sink, onRow: (r, n) => {
+        status(`${file.name}: reading ${Math.round((100 * r) / n)}%`);
+        imageProgress(0.1 * r / n);
+      } }));
     log(`read at ${tw} x ${th} px (${manifest.reference_um_per_px} \u00b5m/px) and ${ww} x ${wh} px ` +
       `(${workMpp.toFixed(4)} \u00b5m/px)${sink ? " + TIFF copy" : ""}: ${ms(t0)}`);
+    drawRaw(work);
   } else {
     log(`${file.name}: ${iw} x ${ih} px, decode ${ms(t0)}`);
+    drawRaw(img);
   }
+  imageProgress(0.1, "Finding the orientation");
 
   t0 = performance.now();
   const k = await rotationFromSquare(backend, (sq ?? resize(img, rs, rs)).px);
@@ -354,6 +376,7 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
     if (scale !== 1 && (tw !== iw || th !== ih)) {
       t0 = performance.now();
       status(`${file.name}: resizing...`);
+      imageProgress(0.12, "Resizing");
       await tick();
       net = resize(img, tw, th);
       log(`resize to ${tw} x ${th} px (${manifest.reference_um_per_px} um/px): ${ms(t0)}`);
@@ -370,27 +393,57 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
   }
   img = null;
   const nCls = manifest.classes.length;
-  let probs = await tiledProbs(session, net, nCls, opts.tta);
+  let probs = await tiledProbs(session, net, nCls, opts.tta,
+    (i, n) => imageProgress(0.15 + 0.4 * i / n, `Segmenting: tile ${i} / ${n}`));
 
   t0 = performance.now();
   status(`${file.name}: building mask...`);
+  imageProgress(0.55, "Building the mask");
   await tick();
   const mask = upsampleArgmax(probs, nCls, net.w, net.h, work.w, work.h);
   probs = net = null;
   log(`mask at ${work.w} x ${work.h} px: ${ms(t0)}`);
 
   const stem = file.name.replace(/\.[^.]+$/, "");
-  drawPreview(work, mask);
   log(`segmentation (${backend}): ${ms(tAll)}`);
+
+  // a whole slide is mostly glass: measure only the tissue so Pyodide stays within memory
+  let region = null, wm = mask, det = null;
+  if (work.w * work.h > MAX_POST_MP * 1e6) {
+    t0 = performance.now();
+    const box = tissueBox(work, { mask, block: Math.max(8, Math.round(20 / workMpp)),
+      margin: Math.round(CROP_MARGIN_UM / workMpp) });
+    if (box) {
+      region = [...box, work.w, work.h];
+      // the detectors and quality model downscale the whole image to max_side anyway
+      const side = Math.max(...["roi", "follicle", "quality"].map((m) => manifest[m]?.max_side ?? 0));
+      const f = Math.min(1, side / Math.max(work.w, work.h));
+      const d = resize(work, Math.max(1, pyRound(work.w * f)), Math.max(1, pyRound(work.h * f)));
+      det = { rgb: d.px, w: d.w, h: d.h };
+      wm = crop({ w: work.w, h: work.h, px: mask, cn: 1 }, box).px;
+      work = crop(work, box);
+      log(`measuring the tissue only: ${box[2]} x ${box[3]} px at (${box[0]}, ${box[1]}), ${ms(t0)}`);
+    }
+  }
+  if (work.w * work.h > MAX_MEASURE_MP * 1e6)
+    throw new Error(`${file.name}: the tissue is too large to measure in the browser ` +
+      `(${(work.w * work.h / 1e6).toFixed(0)} MP at ${workMpp.toFixed(3)} \u00b5m/px); use the desktop app`);
 
   t0 = performance.now();
   status(`${file.name}: measuring...`);
+  imageProgress(0.6, "Measuring");
   const rgb = toRGB(work);
+  let lines = 0;
   const res = await measureWorker.run(
-    { name: file.name, rgb, mask, w: work.w, h: work.h, umPerPx: workMpp, k, lastModified: file.lastModified,
-      quality: JSON.stringify(manifest.quality), folderName, options: opts.detect },
-    [rgb.buffer, mask.buffer],
-    (line) => { log(line); status(`Measuring: ${line.replace(/^[^:]*: /, "")}`); });
+    { name: file.name, rgb, mask: wm, w: work.w, h: work.h, umPerPx: workMpp, k, lastModified: file.lastModified,
+      quality: JSON.stringify(manifest.quality), folderName, options: opts.detect, region, det },
+    [rgb.buffer, wm.buffer, ...(det ? [det.rgb.buffer] : [])],
+    (line) => {
+      log(line);
+      const step = line.replace(/^[^:]*: /, "");
+      status(`Measuring: ${step}`);
+      imageProgress(0.6 + 0.38 * Math.min(1, ++lines / MEASURE_LINES), `Measuring: ${step.replace(/ \([\d.]+s\)$/, "")}`);
+    });
   log(`measuring: ${ms(t0)} (measurement engine memory ${res.heapMB} MB)`);
   log(`total: ${ms(tAll)}`);
   return { res, stem, workMpp, preview, mpp };
@@ -498,6 +551,23 @@ async function subdir(dir, name) {
   }
 }
 
+// modal yes/no question; Escape or Cancel answers false
+function confirmDialog({ title, text, items = [], ok = "Continue" }) {
+  const dlg = $("confirm-dlg");
+  $("dlg-title").textContent = title;
+  $("dlg-text").textContent = text;
+  $("dlg-ok").textContent = ok;
+  $("dlg-list").replaceChildren(...items.map((t) => {
+    const li = document.createElement("li");
+    li.textContent = t;
+    return li;
+  }));
+  $("dlg-list").hidden = !items.length;
+  dlg.returnValue = "";
+  dlg.showModal();
+  return new Promise((resolve) => dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true }));
+}
+
 function setImg(img, blob) {
   if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
   img.dataset.url = blob ? URL.createObjectURL(blob) : "";
@@ -523,6 +593,28 @@ async function runJobs() {
   }
   const total = jobs.reduce((n, j) => n + j.files.length, 0);
   if (!total) { setHeader(`No images in ${root.name}.`, "err"); return; }
+  const existing = [];
+  for (const j of jobs) {
+    try {
+      await j.dir.getDirectoryHandle(j.outName);
+      existing.push(j.path ? `${j.path}/${j.outName}` : j.outName);
+    } catch (e) {
+      if (e.name !== "NotFoundError" && e.name !== "TypeMismatchError") throw e;
+    }
+  }
+  if (existing.length && !(await confirmDialog({
+    title: existing.length === 1 ? `${existing[0]} already exists` : `${existing.length} predicted folders already exist`,
+    text: resume
+      ? "Resume is on: images already in its _results.csv are kept. Every other image is processed and its outputs " +
+        "replace files with the same name in it."
+      : "Resume is off: every image is processed again and its outputs replace the existing files in it.",
+    items: existing.length > 1 ? existing.slice(0, 8).concat(existing.length > 8 ? [`and ${existing.length - 8} more`] : [])
+      : [],
+    ok: "Overwrite and run",
+  }))) {
+    openRunDialog();
+    return;
+  }
   state.busy = true;
   state.stop = false;
   logLines.length = 0;
@@ -534,6 +626,7 @@ async function runJobs() {
   vw.liveCaption = `${total} image(s) in ${jobs.length} folder(s), saved to predicted_<folder> inside each. ` +
     "Switching pages does not stop the run.";
   showViewer([], { badge: "Running", caption: vw.liveCaption, empty: "Reading the first image..." });
+  initQueue(jobs);
   setBusy(true);
   $("run-caption").textContent = vw.liveCaption;
   progress(0, "Starting...");
@@ -554,7 +647,7 @@ async function runJobs() {
   progress(1, `${counts.done} processed, ${counts.skipped} already done, ${counts.failed} failed`);
   setHeader(`${state.stop ? "\u25A0 Stopped" : "\u2713 Done"}: ${counts.done} processed, ${counts.skipped} already done, ` +
     `${counts.failed} failed`, counts.failed ? "err" : "");
-  await refreshPreds();
+  await refreshPreds(vw.live.at(-1)?.path ?? outs[0]?.path);
   await showLastRun(outs, warnings);
 }
 
@@ -576,12 +669,15 @@ async function processJob({ dir, path, files, outName }, jobIdx, nJobs, mpp, ses
     const stem = h.name.replace(/\.[^.]+$/, "");
     progress(counts.n / counts.total, `Folder ${jobIdx + 1}/${nJobs}, image ${i + 1}/${files.length}: ${h.name}`);
     counts.n++;
+    const q = rq.items.get(`${outPath}|${h.name}`);
     if (resume && rows.has(stem)) {
       log(`[${i + 1}/${files.length}] ${h.name}: already processed, reusing its CSV row`);
+      setQueue(q, "skipped", "already done");
       counts.skipped++;
       continue;
     }
     if (state.stop) break;
+    setQueue(q, "active", "0%");
     const t0 = performance.now();
     let tiff = null;
     try {
@@ -608,16 +704,97 @@ async function processJob({ dir, path, files, outName }, jobIdx, nJobs, mpp, ses
         await writeFile(out, "run_config.yaml", JSON.stringify(config, null, 1));
       }
       log(`${h.name}: ${res.row ? "done" : "SC or Epidermis empty, no CSV row"} (${ms(t0)})`);
+      setQueue(q, res.row ? "done" : "empty",
+        res.row ? `${Math.round((performance.now() - t0) / 1000)} s` : "no SC/Epidermis");
       counts.done++;
     } catch (e) {
       console.error(e);
       await tiff?.discard();
       log(String(e.stack ?? e));
       warnings.push(`${path ? `${path}/` : ""}${h.name}: ${describeError(e)}`);
+      setQueue(q, "failed", describeError(e));
       counts.failed++;
     }
   }
   return { out, path: outPath };
+}
+
+// ---------------------------------------------------------------- Run page: per-image progress list
+const rq = { items: new Map(), active: null };
+const RQ_ICONS = { pending: "", active: "", done: "\u2713", skipped: "\u2713", empty: "!", failed: "\u2715" };
+
+function initQueue(jobs) {
+  rq.items.clear();
+  rq.active = null;
+  const lis = [];
+  for (const j of jobs) {
+    const outPath = j.path ? `${j.path}/${j.outName}` : j.outName;
+    if (jobs.length > 1) {
+      const g = document.createElement("li");
+      g.className = "rq-group";
+      g.textContent = g.title = j.path || state.root.name;
+      lis.push(g);
+    }
+    for (const h of j.files) {
+      const li = document.createElement("li"), icon = document.createElement("span");
+      const name = document.createElement("span"), note = document.createElement("span");
+      icon.className = "rq-icon";
+      name.className = "rq-name";
+      name.textContent = name.title = h.name;
+      note.className = "rq-note";
+      li.append(icon, name, note);
+      const it = { li, icon, note, path: outPath, stem: h.name.replace(/\.[^.]+$/, ""), state: "pending" };
+      li.addEventListener("click", () => showQueueItem(it));
+      rq.items.set(`${outPath}|${h.name}`, it);
+      setQueue(it, "pending");
+      lis.push(li);
+    }
+  }
+  $("rq-list").replaceChildren(...lis);
+  $("run-queue").hidden = false;
+  $("page-run").classList.add("queue");
+  queueCount();
+}
+
+function setQueue(it, st, note = "") {
+  if (!it) return;
+  it.state = st;
+  it.li.className = `rq-item ${st}`;
+  it.icon.textContent = RQ_ICONS[st];
+  it.note.textContent = note;
+  it.note.title = st === "active" ? "" : note;
+  if (st === "active") {
+    rq.active = it;
+    it.li.scrollIntoView({ block: "nearest" });
+  } else if (rq.active === it) {
+    rq.active = null;
+  }
+  queueCount();
+}
+
+function queueCount() {
+  const all = [...rq.items.values()];
+  const done = all.filter((i) => ["done", "skipped", "empty"].includes(i.state)).length;
+  const failed = all.filter((i) => i.state === "failed").length;
+  $("rq-count").textContent = `${done} / ${all.length} done${failed ? ` \u00B7 ${failed} failed` : ""}`;
+}
+
+// clicking a finished image shows it in the viewer
+function showQueueItem(it) {
+  const i = vw.items.findIndex((x) => x.path === it.path && x.stem === it.stem);
+  if (i < 0) return;
+  vw.idx = i;
+  showViewerItem().catch(showError);
+}
+
+function markShownInQueue(it) {
+  for (const q of rq.items.values()) q.li.classList.toggle("shown", Boolean(it) && q.path === it.path && q.stem === it.stem);
+}
+
+function hideQueue() {
+  $("run-queue").hidden = true;
+  $("page-run").classList.remove("queue");
+  rq.items.clear();
 }
 
 async function showLastRun(outs, warnings) {
@@ -687,6 +864,7 @@ function showViewer(items, { badge, caption = "", empty = "No results to show.",
 
 async function showViewerItem() {
   const it = vw.items[vw.idx], token = ++vw.token;
+  markShownInQueue(it);
   $("vw-select").value = String(vw.idx);
   $("vw-select").disabled = vw.items.length < 2;
   $("vw-prev").disabled = vw.idx <= 0;
@@ -696,6 +874,7 @@ async function showViewerItem() {
   if (token !== vw.token) return;
   const img = $("vw-img");
   $("run-preview").hidden = true;
+  $("run-pie").hidden = true;
   if (typeof src === "string") {
     setImg(img, null);
     img.src = src;
@@ -967,11 +1146,25 @@ function idb(mode, fn) {
 
 async function chooseFolder() {
   if (!window.showDirectoryPicker) return;
+  let handle;
   try {
-    await setRoot(await window.showDirectoryPicker({ id: "skin-seg-folder", mode: "readwrite" }));
+    handle = await window.showDirectoryPicker({ id: "skin-seg-folder", mode: "readwrite" });
   } catch (e) {
     if (e.name !== "AbortError") setHeader(`Error: ${e.message}`, "err");
+    return;
   }
+  await setRoot(handle).catch(showError);
+  openRunDialog();
+}
+
+function openRunDialog() {
+  if (!state.root || state.busy || $("run-dlg").open) return;
+  const n = $("run-image").options.length;
+  $("run-dlg-folder").textContent = state.root.name;
+  $("run-dlg-count").textContent = n ? `${n} image(s) directly in this folder.`
+    : "No images directly in this folder; use Include subfolders to process the folders inside it.";
+  renderRun();
+  $("run-dlg").showModal();
 }
 
 // the working folder is remembered across visits (interface/app.py LAST_USED)
@@ -983,6 +1176,7 @@ async function setRoot(handle) {
   if (!state.busy) {
     state.lastRun = null;
     $("last-warnings").replaceChildren();
+    hideQueue();
     showExample().catch(showError);
   }
   idb("readwrite", (s) => s.put(handle, "root")).catch(() => {});
@@ -1009,11 +1203,12 @@ async function predictionFolders(root) {
   return found.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-async function refreshPreds() {
+async function refreshPreds(prefer = null) {
   if (!state.root) return;
-  const keep = state.pred?.path;
+  const keep = prefer ?? state.pred?.path;
   state.preds = await predictionFolders(state.root);
-  state.pred = state.preds.find((p) => p.path === keep) ?? state.preds[0] ?? null;
+  state.pred = state.preds.find((p) => p.path === keep) ??
+    state.preds.find((p) => p.path === `predicted_${state.root.name}`) ?? state.preds[0] ?? null;
   const sel = $("pred-select");
   sel.replaceChildren(...(state.preds.length ? state.preds.map((p, i) => option(String(i), p.path))
     : [option("", "None yet")]));
@@ -1064,8 +1259,8 @@ function emptyInfo(el, msg) {
 }
 
 function renderRun() {
-  $("run-landing").hidden = Boolean(state.root);
-  $("run-body").hidden = !state.root;
+  $("run-left").hidden = Boolean(state.root);
+  $("page-run").classList.toggle("solo", Boolean(state.root));
   $("image-field").hidden = state.scope !== "one";
   setBusy(state.busy);
 }
@@ -1595,11 +1790,21 @@ function wire() {
   for (const k of ["roi", "follicle", "quality"]) {
     $(`opt-${k}`).addEventListener("change", () => { toggleDefaultsApplied = true; });
   }
-  $("run").addEventListener("click", () => runJobs().catch((e) => {
-    state.busy = false;
-    setBusy(false);
-    showError(e);
-  }));
+  $("run").addEventListener("click", () => {
+    if (!(Number($("mpp").value) > 0)) {
+      $("mpp-field").hidden = false;
+      $("mpp").focus();
+      return;
+    }
+    $("run-dlg").close();
+    runJobs().catch((e) => {
+      state.busy = false;
+      setBusy(false);
+      showError(e);
+    });
+  });
+  $("run-cancel").addEventListener("click", () => $("run-dlg").close());
+  $("open-run").addEventListener("click", openRunDialog);
   $("stop").addEventListener("click", () => {
     state.stop = true;
     $("stop").disabled = true;

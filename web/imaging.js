@@ -128,6 +128,64 @@ export function workSize(w, h, um, maxMP, postUm) {
   return [Math.max(1, pyRound(w * s)), Math.max(1, pyRound(h * s))];
 }
 
+// Bounding box [x0, y0, w, h] of the tissue (HSV saturation > sat, as measurement.tissue_area_um2) plus any
+// mask / box pixels, ignoring specks far smaller than the section; null if it would not save much.
+// Blocks of ~20 um; components under minFrac of the largest are dropped; margin in px
+export function tissueBox(img, { mask = null, extra = null, sat = 20, block = 32, minFrac = 0.02, margin = 0 } = {}) {
+  const { w, h, px, cn } = img, bw = Math.ceil(w / block), bh = Math.ceil(h / block);
+  const count = new Uint32Array(bw * bh), hit = new Uint8Array(bw * bh);
+  for (let y = 0; y < h; y++) {
+    const by = Math.floor(y / block) * bw;
+    for (let x = 0, i = y * w * cn; x < w; x++, i += cn) {
+      const r = px[i], g = px[i + 1], b = px[i + 2], mx = Math.max(r, g, b);
+      // cv2 HSV S (8-bit) = 255 * (max - min) / max, rounded
+      if (mx && Math.round((255 * (mx - Math.min(r, g, b))) / mx) > sat) count[by + Math.floor(x / block)]++;
+      if (mask && mask[y * w + x]) hit[by + Math.floor(x / block)] = 1;
+    }
+  }
+  const on = new Uint8Array(bw * bh);
+  for (let b = 0; b < on.length; b++) on[b] = hit[b] || count[b] * 4 >= block * block ? 1 : 0;
+  // 8-connected components of the block grid
+  const comp = new Int32Array(bw * bh).fill(-1), boxes = [];
+  for (let s = 0; s < on.length; s++) {
+    if (!on[s] || comp[s] >= 0) continue;
+    const stack = [s], bx = [bw, bh, -1, -1, 0];
+    comp[s] = boxes.length;
+    while (stack.length) {
+      const b = stack.pop(), x = b % bw, y = (b - x) / bw;
+      bx[0] = Math.min(bx[0], x); bx[1] = Math.min(bx[1], y); bx[2] = Math.max(bx[2], x); bx[3] = Math.max(bx[3], y);
+      bx[4]++;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy, n = ny * bw + nx;
+        if (nx >= 0 && ny >= 0 && nx < bw && ny < bh && on[n] && comp[n] < 0) { comp[n] = boxes.length; stack.push(n); }
+      }
+    }
+    boxes.push(bx);
+  }
+  if (!boxes.length) return null;
+  const big = Math.max(...boxes.map((b) => b[4]));
+  let x0 = w, y0 = h, x1 = 0, y1 = 0;
+  for (const [bx0, by0, bx1, by1, n] of boxes) {
+    if (n < minFrac * big) continue;
+    x0 = Math.min(x0, bx0 * block); y0 = Math.min(y0, by0 * block);
+    x1 = Math.max(x1, (bx1 + 1) * block); y1 = Math.max(y1, (by1 + 1) * block);
+  }
+  if (extra) {
+    x0 = Math.min(x0, extra[0]); y0 = Math.min(y0, extra[1]);
+    x1 = Math.max(x1, extra[0] + extra[2]); y1 = Math.max(y1, extra[1] + extra[3]);
+  }
+  x0 = Math.max(0, Math.floor(x0 - margin)); y0 = Math.max(0, Math.floor(y0 - margin));
+  x1 = Math.min(w, Math.ceil(x1 + margin)); y1 = Math.min(h, Math.ceil(y1 + margin));
+  return (x1 - x0) * (y1 - y0) < 0.9 * w * h ? [x0, y0, x1 - x0, y1 - y0] : null;
+}
+
+// region [x0, y0, cw, ch] of an image ({w, h, px, cn}) or of a single-channel array (cn = 1)
+export function crop(img, [x0, y0, cw, ch]) {
+  const { w, px, cn } = img, out = new px.constructor(cw * ch * cn);
+  for (let y = 0; y < ch; y++) out.set(px.subarray(((y0 + y) * w + x0) * cn, ((y0 + y) * w + x0 + cw) * cn), y * cw * cn);
+  return { w: cw, h: ch, px: out, cn };
+}
+
 export function toRGB(img) {
   if (img.cn === 3) return img.px;
   const out = new Uint8Array(img.w * img.h * 3);
