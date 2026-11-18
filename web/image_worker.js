@@ -1,5 +1,5 @@
 // Decodes source images off the page's main thread: Review previews and re-measure inputs.
-import { decode, previewJpeg, resize, toRGB, workSize } from "./imaging.js?v=dev";
+import { crop, decode, previewJpeg, resize, tissueBox, toRGB, workSize } from "./imaging.js?v=dev";
 import { isSvs, openSvs, readSvsScaled } from "./svs.js?v=dev";
 
 const UTIF_URL = "https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js";
@@ -15,7 +15,7 @@ async function loadUtif() {
   new Function(new TextDecoder().decode(buf))();
 }
 
-async function handle({ id, op, file, maxSide, um, maxMP, postUm, rotSize }) {
+async function handle({ id, op, file, maxSide, um, maxMP, postUm, rotSize, labelBox, cropMarginUm }) {
   // .svs: read band by band straight to the needed sizes; other formats are decoded whole
   const svs = isSvs(file.name) ? await openSvs(file) : null;
   let img = svs ? null : await decode(file);
@@ -38,8 +38,22 @@ async function handle({ id, op, file, maxSide, um, maxMP, postUm, rotSize }) {
     work = ww === iw && wh === ih ? img : resize(img, ww, wh);
   }
   img = null;
-  const workUm = work.w === iw ? um : um * iw / work.w, rgb = toRGB(work), sqPx = sq?.px ?? null;
-  return [{ id, iw, ih, w: work.w, h: work.h, rgb, workUm, sq: sqPx }, [rgb.buffer, ...(sqPx ? [sqPx.buffer] : [])]];
+  const workUm = work.w === iw ? um : um * iw / work.w, sqPx = sq?.px ?? null;
+  // as processFile: a huge image is measured on its tissue + the labels only
+  let region = null;
+  if (work.w * work.h > maxMP * 1e6) {
+    const lb = labelBox && [labelBox[0] * work.w, labelBox[1] * work.h, (labelBox[2] - labelBox[0]) * work.w,
+      (labelBox[3] - labelBox[1]) * work.h];
+    const box = tissueBox(work, { extra: lb, block: Math.max(8, Math.round(20 / workUm)),
+      margin: Math.round((cropMarginUm ?? 0) / workUm) });
+    if (box) {
+      region = [...box, work.w, work.h];
+      work = crop(work, box);
+    }
+  }
+  const rgb = toRGB(work);
+  return [{ id, iw, ih, w: work.w, h: work.h, rgb, workUm, sq: sqPx, region },
+    [rgb.buffer, ...(sqPx ? [sqPx.buffer] : [])]];
 }
 
 // one image at a time: a 100 MP TIFF needs ~1 GB while decoding

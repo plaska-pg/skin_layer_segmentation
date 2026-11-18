@@ -47,6 +47,7 @@ Users get it as soon as OneDrive syncs; `run_app.cmd` prints the published `VERS
 
 `web/` is the same app running entirely in the browser (Chrome or Edge): models via ONNX Runtime Web (WebGPU), measuring and editing via `postprocess.py` & co. in Pyodide. Images never leave the computer; results are written into the chosen folder in the same layout as `predict.py`.
 
+- `.svs` (Aperio tiled JPEG; not JPEG 2000) is read tile by tile at the µm/px in its header, and a lossless `TIFF_<folder>/<stem>.tif` copy is written unless a TIFF of that name already exists. Images over 45 MP are measured at 0.4 µm/px, cropped to the tissue (ROI / follicle / quality still see the whole slide).
 - Publish: `.github/workflows/pages.yml` runs on every push to `main` (Settings > Pages > Source: **GitHub Actions**). It exports `models/` to ONNX (`web/export_onnx.py`, cached until the weights or code change) and deploys the site.
 - Local: `pip install onnx==1.23.2 onnxruntime==1.32.0 onnxscript==0.7.2`, `python web/export_onnx.py`, then `python -m http.server 8765 --bind 127.0.0.1` in the repo root and open http://127.0.0.1:8765/web/index.html.
 
@@ -234,11 +235,24 @@ python training\annotate_qc_boxes.py --pred-source $src --um-per-px 0.2577 --pre
   python predict.py --source "C:\Users\plas.ka\OneDrive - Procter and Gamble\Shortcuts\W Cheng Section (BDT-Skin) - Histology\Lisa Image Pro analyzed images\D28 Topical GFF" --resume
 
 Enhancement of the interface:
- The main run page should be better. give ideas 
+During a segmentation run, just show the raw image.while is processing, show a percent of that image done (as like a pie chart) over the image with updates. When it is done, replace with _measurement image. then continue . Also in the run tab, if there is already a predicted_ folder, then it should pull up a window and warn that this overwrites that folder. while it is running, the run parameters pane should close. 
+
+after pressing run, i want a pane on the right side with a green checkmark next to each image that has been analyzed so a user can clearly see the progress. 
+
+the wheel on the image being processed stays on "Measuring" too long. 
+Done should be a popup window with run summary. It should include a button to review segmentation results. 
+
+ is it possible to detect if there is another user using/writing to the same onedrive folder? I'd want to bring this up as an error so there are no conflicts. 
+
+write user error tests to test functionality 
+the TIFF_ folder should go in the predicted_ folder. 
+ if a tiff file already exists with the same name, do not remake the tiff file in TIFF_ folder.  
+ Rename the predicted_ folder to analysis_outputs_<parent_dir_name>
 
   On the edit page: 
 
   - inspect ways to speed up the saving of the user modified segmentations
+  - any errors should be popup window: like if unable to write to _results file, show popup error. 
   - allow user to edit the raw segmentations (to then be used in the seg_finetune dataset if it exists. this is like for admin mode. I am the admin)
 
   On the process page:

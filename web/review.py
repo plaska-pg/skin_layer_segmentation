@@ -24,10 +24,21 @@ def _append_pane(steps, panel):
 
 
 def remeasure(name: str, rgb, w: int, h: int, um_per_px: float, k: int, label: str, names_json: str, steps,
-              lateral_clip_frac, last_modified_ms: float) -> str:
+              lateral_clip_frac, last_modified_ms: float, region_json: str = "null") -> str:
     """seg_editor.remeasure_doc: measures the saved labels on the (possibly reduced) source image.
+    region_json: [x0, y0, w, h, full_w, full_h] when rgb is a crop of the image the labels are normalised to.
     Writes /out_review/measurement.jpg and steps.jpg (steps = existing <stem>_steps.jpg bytes or None)."""
     names = json.loads(names_json)
+    region = json.loads(region_json)
+    if region:
+        x0, y0, _, _, full_w, full_h = region
+        lines = []
+        for line in label.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                xy = (np.array(parts[1:], float).reshape(-1, 2) * (full_w, full_h) - (x0, y0)) / (w, h)
+                lines.append(parts[0] + " " + " ".join(f"{v:.6f}" for v in xy.ravel()))
+        label = "\n".join(lines) + "\n"
     bgr = np.frombuffer(rgb.to_py(), np.uint8).reshape(h, w, 3)[..., ::-1].copy()
     OUT.mkdir(exist_ok=True)
     for f in OUT.iterdir():

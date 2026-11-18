@@ -1595,6 +1595,18 @@ function queueRemeasure(d, label) {
   saveTimer ||= setInterval(() => { if (!state.busy) setHeader(idleHeader(), saveJobs.at(-1)?.error ? "err" : ""); }, 1000);
 }
 
+// normalised [x0, y0, x1, y1] of all polygons in a YOLO-seg label, or null
+function labelBounds(label) {
+  let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+  for (const line of label.split("\n")) {
+    const v = line.trim().split(/\s+/).slice(1).map(Number);
+    for (let i = 0; i + 1 < v.length; i += 2) {
+      x0 = Math.min(x0, v[i]); x1 = Math.max(x1, v[i]); y0 = Math.min(y0, v[i + 1]); y1 = Math.max(y1, v[i + 1]);
+    }
+  }
+  return x1 > x0 && y1 > y0 ? [x0, y0, x1, y1] : null;
+}
+
 async function remeasureJob(d, label, job) {
   job.started = Date.now();
   try {
@@ -1603,15 +1615,20 @@ async function remeasureJob(d, label, job) {
     // decoded off the page; the rotation comes from review_cache when the run saved it
     const needK = d.k == null;
     const w = await imageJob({ op: "work", file, um, maxMP: MAX_POST_MP, postUm: POST_UM_PER_PX,
-      rotSize: needK ? manifest.rotation.size : 0 });
+      rotSize: needK ? manifest.rotation.size : 0, labelBox: labelBounds(label), cropMarginUm: CROP_MARGIN_UM });
     if (needK) {
       if (!currentBackend) await prepareBackend();
       d.k = await rotationFromSquare(currentBackend, w.sq);
       await savePreviewK(d).catch((e) => console.warn("could not save the rotation", e));
     }
+    if (w.w * w.h > MAX_MEASURE_MP * 1e6)
+      throw new Error(`the tissue is too large to measure in the browser (${(w.w * w.h / 1e6).toFixed(0)} MP)`);
     const workUm = w.workUm, steps = await readBytes(d.pred.dir, `${d.stem}_steps.jpg`);
+    log(`re-measure ${d.stem}: ${w.w} x ${w.h} px at ${workUm.toFixed(4)} \u00b5m/px` +
+      (w.region ? `, tissue at (${w.region[0]}, ${w.region[1]}) of ${w.region[4]} x ${w.region[5]}` : ""));
     const r = await measureWorker.call("remeasure", [file.name, w.rgb, w.w, w.h, workUm, d.k, label,
-      JSON.stringify(d.info.names), steps, d.info.lateral_clip_frac ?? null, file.lastModified],
+      JSON.stringify(d.info.names), steps, d.info.lateral_clip_frac ?? null, file.lastModified,
+      JSON.stringify(w.region ?? null)],
       [w.rgb.buffer, ...(steps ? [steps.buffer] : [])]);
     if (!r.result.row) {
       job.message = "labels saved; SC or Epidermis is empty, so measurements were not updated";
