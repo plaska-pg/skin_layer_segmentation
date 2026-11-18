@@ -3,7 +3,8 @@
 // linear ramp, bilinear upsampling of probabilities, argmax). Measuring and the Review editor's merge / cut /
 // re-measure run postprocess.py & co. in Pyodide workers (worker.js); the editor is interface/seg_editor.js.
 import mountEditor from "../interface/seg_editor.js?v=dev";
-import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js?v=dev";
+import { decode, previewJpeg, pyRound, resize, toRGB, workSize } from "./imaging.js?v=dev";
+import { canCopyTiff, isSvs, openSvs, readSvsScaled, TiffWriter } from "./svs.js?v=dev";
 
 // ?v=<commit> on every app file (set by the Pages build) keeps cached files from different deploys apart
 const VERSION = new URL(import.meta.url).searchParams.get("v") ?? "";
@@ -12,6 +13,8 @@ const $ = (id) => document.getElementById(id);
 const COLORS = [null, [230, 80, 60], [60, 170, 90], [70, 110, 230]];
 // larger images are measured at POST_UM_PER_PX so Pyodide stays under its 4 GB memory limit
 const MAX_POST_MP = 45, POST_UM_PER_PX = 0.4;
+// .svs are read straight to the measuring size; above this it would not fit in Pyodide
+const MAX_SVS_WORK_MP = 150;
 const WORKER_RECYCLE_MB = 1024;
 const EDITOR_MAX_SIDE = 4096, EDITOR_HEIGHT = 720;  // interface/seg_editor.py
 // display-size copy of each source image, written next to the results so Review opens without decoding the source
@@ -52,12 +55,13 @@ const logLines = [];
 
 function setHeader(text, cls = "") {
   $("header-status").textContent = text;
-  $("header-status").className = "caption " + cls;
+  $("header-status").title = text;
+  $("status-box").classList.toggle("err", cls === "err");
 }
 function log(line) {
   logLines.push(line);
   if (logLines.length > 400) logLines.splice(0, logLines.length - 400);
-  $("log").textContent = logLines.slice(-25).join("\n");
+  $("log").textContent = logLines.slice(-200).join("\n");
 }
 let runLabel = "";
 // progress of the current step (model download, tile, measuring stage) goes to the page header
@@ -67,7 +71,7 @@ function status(text) {
 function progress(frac, label) {
   runLabel = label;
   $("progress-bar").style.width = `${Math.round(Math.min(1, frac) * 100)}%`;
-  $("progress-text").textContent = label;
+  if (state.busy) setHeader(`\u25B6 ${label}`);
 }
 const tick = () => new Promise((r) => setTimeout(r));
 const ms = (t0) => `${((performance.now() - t0) / 1000).toFixed(2)} s`;
@@ -252,8 +256,11 @@ function upsampleArgmax(probs, nCls, w, h, ow, oh) {
 function drawPreview(img, mask) {
   const s = Math.min(1, 1200 / img.w), pw = Math.max(1, Math.round(img.w * s)), ph = Math.max(1, Math.round(img.h * s));
   const canvas = $("run-preview"), ctx = canvas.getContext("2d");
+  vw.token++;
   canvas.hidden = false;
-  $("run-latest").hidden = true;
+  $("vw-img").hidden = true;
+  $("vw-empty").hidden = true;
+  renderMetrics(null);
   canvas.width = pw; canvas.height = ph;
   const im = ctx.createImageData(pw, ph);
   for (let y = 0; y < ph; y++) {
@@ -287,52 +294,79 @@ async function prepareBackend() {
 
 function setBusy(busy) {
   $("run").disabled = busy || !state.root || !state.modelsReady;
-  $("run-progress").hidden = !busy;
+  $("stop").hidden = !busy;
+  $("status-progress").hidden = !busy;
+  $("status-box").classList.toggle("busy", busy);
 }
 
-// segment + measure one image; shows the mask preview and measurements, returns the worker's result
-async function processFile(file, mpp, session, folderName = "", opts = readOptions()) {
+// segment + measure one image; shows the mask preview and measurements, returns the worker's result.
+// .svs: um/px from its header when present; tiff = TiffWriter target for the lossless copy (or null)
+async function processFile(file, mpp, session, folderName = "", opts = readOptions(), tiff = null) {
   const backend = currentBackend;
   const tAll = performance.now();
   let t0 = performance.now();
   status(`${file.name}: reading...`);
   await tick();
-  let img = await decode(file);
-  log(`${file.name}: ${img.w} x ${img.h} px, decode ${ms(t0)}`);
+  const svs = isSvs(file.name) ? await openSvs(file) : null;
+  if (svs?.mpp) mpp = svs.mpp;
+  let img = svs ? null : await decode(file);
+  const iw = svs?.w ?? img.w, ih = svs?.h ?? img.h, rs = manifest.rotation.size;
+  const scale = mpp / manifest.reference_um_per_px;
+  const tw = Math.max(1, pyRound(iw * scale)), th = Math.max(1, pyRound(ih * scale));
+  const [ww, wh] = workSize(iw, ih, mpp, MAX_POST_MP, POST_UM_PER_PX);
+  const workMpp = ww === iw ? mpp : mpp * iw / ww;
+  let net, work, sq;
+  if (svs) {
+    log(`${file.name}: ${iw} x ${ih} px, ${svs.mpp ? `${mpp} \u00b5m/px from its header`
+      : `no \u00b5m/px in its header, using ${mpp}`}`);
+    if (ww * wh > MAX_SVS_WORK_MP * 1e6)
+      throw new Error(`${file.name} is too large for the browser (${(ww * wh / 1e6).toFixed(0)} MP at ` +
+        `${workMpp.toFixed(3)} \u00b5m/px); use the desktop app`);
+    let sink = null;
+    if (tiff && canCopyTiff(svs)) tiff.sink = sink = new TiffWriter(tiff.writable, iw, ih, svs.tw, svs.th);
+    else if (tiff) {
+      log(`${file.name}: tile size ${svs.tw} x ${svs.th} can't be copied to a TIFF in the browser`);
+      await tiff.discard();
+    }
+    ({ net, work, sq } = await readSvsScaled(svs, { net: [tw, th], work: [ww, wh], sq: [rs, rs] },
+      { tiff: sink, onRow: (r, n) => status(`${file.name}: reading ${Math.round((100 * r) / n)}%`) }));
+    log(`read at ${tw} x ${th} px (${manifest.reference_um_per_px} \u00b5m/px) and ${ww} x ${wh} px ` +
+      `(${workMpp.toFixed(4)} \u00b5m/px)${sink ? " + TIFF copy" : ""}: ${ms(t0)}`);
+  } else {
+    log(`${file.name}: ${iw} x ${ih} px, decode ${ms(t0)}`);
+  }
 
   t0 = performance.now();
-  const k = await rotationK(backend, img);
+  const k = await rotationFromSquare(backend, (sq ?? resize(img, rs, rs)).px);
   log(`rotation: ${k * 90} deg clockwise to upright, ${ms(t0)}`);
 
   t0 = performance.now();
   let preview = null;
   try {
-    preview = { blob: await previewJpeg(img, EDITOR_MAX_SIDE), width: img.w, height: img.h, k };
+    preview = { blob: await previewJpeg(img ?? work, EDITOR_MAX_SIDE), width: iw, height: ih, k };
     log(`review preview: ${ms(t0)}`);
   } catch (e) {
     log(`review preview failed (${describeError(e)}); Review will build it`);
   }
 
-  const scale = mpp / manifest.reference_um_per_px;
-  const tw = Math.max(1, pyRound(img.w * scale)), th = Math.max(1, pyRound(img.h * scale));
-  let net = img;
-  if (scale !== 1 && (tw !== img.w || th !== img.h)) {
-    t0 = performance.now();
-    status(`${file.name}: resizing...`);
-    await tick();
-    net = resize(img, tw, th);
-    log(`resize to ${tw} x ${th} px (${manifest.reference_um_per_px} um/px): ${ms(t0)}`);
-  }
-  let work = img, workMpp = mpp;
-  if (img.w * img.h > MAX_POST_MP * 1e6 && mpp < POST_UM_PER_PX) {
-    t0 = performance.now();
-    status(`${file.name}: reducing resolution for measuring...`);
-    await tick();
-    const s = mpp / POST_UM_PER_PX;
-    work = resize(img, Math.max(1, pyRound(img.w * s)), Math.max(1, pyRound(img.h * s)));
-    workMpp = mpp * img.w / work.w;
-    log(`${(img.w * img.h / 1e6).toFixed(0)} MP > ${MAX_POST_MP} MP: measuring at ${work.w} x ${work.h} px ` +
-      `(${workMpp.toFixed(4)} um/px), ${ms(t0)}`);
+  if (!svs) {
+    net = img;
+    if (scale !== 1 && (tw !== iw || th !== ih)) {
+      t0 = performance.now();
+      status(`${file.name}: resizing...`);
+      await tick();
+      net = resize(img, tw, th);
+      log(`resize to ${tw} x ${th} px (${manifest.reference_um_per_px} um/px): ${ms(t0)}`);
+    }
+    work = img;
+    if (ww !== iw || wh !== ih) {
+      t0 = performance.now();
+      status(`${file.name}: reducing resolution for measuring...`);
+      await tick();
+      work = resize(img, ww, wh);
+      log(`${(iw * ih / 1e6).toFixed(0)} MP > ${MAX_POST_MP} MP: measuring at ${ww} x ${wh} px ` +
+        `(${workMpp.toFixed(4)} um/px), ${ms(t0)}`);
+    }
   }
   img = null;
   const nCls = manifest.classes.length;
@@ -359,11 +393,11 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
     (line) => { log(line); status(`Measuring: ${line.replace(/^[^:]*: /, "")}`); });
   log(`measuring: ${ms(t0)} (measurement engine memory ${res.heapMB} MB)`);
   log(`total: ${ms(tAll)}`);
-  return { res, stem, workMpp, preview };
+  return { res, stem, workMpp, preview, mpp };
 }
 
 // ---------------------------------------------------------------- folder mode (File System Access API)
-const IMAGE_RE = /\.(tiff?|jpe?g|png|bmp|webp)$/i;
+const IMAGE_RE = /\.(tiff?|svs|jpe?g|png|bmp|webp)$/i;
 
 function parseCsv(text) {
   const rows = [];
@@ -401,6 +435,41 @@ async function writeFile(dir, path, data) {
   const w = await (await dir.getFileHandle(parts.at(-1), { create: true })).createWritable();
   await w.write(data);
   await w.close();
+}
+
+async function hasFile(dir, name) {
+  try {
+    await dir.getFileHandle(name);
+    return true;
+  } catch (e) {
+    if (e.name === "NotFoundError" || e.name === "TypeMismatchError") return false;
+    throw e;
+  }
+}
+
+// predict.py's lossless TIFF_<folder>/<stem>.tif copy of an .svs, unless a TIFF of that name already exists
+async function openTiffCopy(dir, stem, name) {
+  const dirName = `TIFF_${dir.name}`, tiffDir = await subdir(dir, dirName);
+  const existing = [
+    ...(tiffDir && (await hasFile(tiffDir, `${stem}.tif`)) ? [`${dirName}/${stem}.tif`] : []),
+    ...(await Promise.all([`${stem}.tif`, `${stem}.tiff`, `${name}.tif`, `${name}.tiff`]
+      .map(async (n) => ((await hasFile(dir, n)) ? n : null)))).filter(Boolean),
+  ];
+  if (existing.length) {
+    log(`${name}: ${existing[0]} exists, no TIFF copy written`);
+    return null;
+  }
+  const d = tiffDir ?? await dir.getDirectoryHandle(dirName, { create: true });
+  const writable = await (await d.getFileHandle(`${stem}.tif`, { create: true })).createWritable();
+  const tiff = {
+    writable, sink: null,
+    async discard() {
+      if (tiff.sink?.done) return;
+      await writable.abort().catch(() => {});
+      await d.removeEntry(`${stem}.tif`).catch(() => {});
+    },
+  };
+  return tiff;
 }
 
 // worker output name -> path inside predicted_<folder>, as predict.py lays it out
@@ -459,12 +528,14 @@ async function runJobs() {
   logLines.length = 0;
   $("log").textContent = "";
   $("stop").disabled = false;
-  $("last-run").hidden = true;
-  $("run-preview").hidden = true;
-  setImg($("run-latest"), null);
+  $("last-warnings").replaceChildren();
+  state.lastRun = null;
+  vw.live = [];
+  vw.liveCaption = `${total} image(s) in ${jobs.length} folder(s), saved to predicted_<folder> inside each. ` +
+    "Switching pages does not stop the run.";
+  showViewer([], { badge: "Running", caption: vw.liveCaption, empty: "Reading the first image..." });
   setBusy(true);
-  $("run-caption").textContent = `${jobs.length} folder(s), ${total} image(s). Results go to ` +
-    `predicted_<name> inside each folder; switching pages does not stop the run.`;
+  $("run-caption").textContent = vw.liveCaption;
   progress(0, "Starting...");
   const counts = { done: 0, skipped: 0, failed: 0, n: 0, total }, outs = [], warnings = [];
   try {
@@ -498,6 +569,7 @@ async function processJob({ dir, path, files, outName }, jobIdx, nJobs, mpp, ses
   try { cfg = priorCfg === null ? null : JSON.parse(priorCfg); } catch { cfg = undefined; }
   if (cfg === undefined) log(`${outName}/run_config.yaml was written by predict.py; leaving it unchanged`);
   const inputFiles = new Map((cfg?.resolved?.input_files ?? []).map((f) => [f.file, f]));
+  const outPath = path ? `${path}/${outName}` : outName;
   log(`===== [${jobIdx + 1}/${nJobs}] ${path || dir.name}`);
 
   for (const [i, h] of files.entries()) {
@@ -511,26 +583,27 @@ async function processJob({ dir, path, files, outName }, jobIdx, nJobs, mpp, ses
     }
     if (state.stop) break;
     const t0 = performance.now();
+    let tiff = null;
     try {
       const file = await h.getFile();
-      const { res, workMpp, preview } = await processFile(file, mpp, session, dir.name, opts);
+      if (isSvs(h.name)) tiff = await openTiffCopy(dir, stem, h.name);
+      const { res, workMpp, preview, mpp: fileMpp } = await processFile(file, mpp, session, dir.name, opts, tiff);
       for (const [f, data] of Object.entries(res.files)) {
         const p = outputPath(stem, f);
         if (p) await writeFile(out, p, data);
       }
       if (preview) await writePreview(out, stem, file, preview);
-      const meas = res.files[`${stem}_measurement.jpg`];
-      if (meas) {
-        setImg($("run-latest"), new Blob([meas], { type: "image/jpeg" }));
-        $("run-preview").hidden = true;
+      if (res.files[`${stem}_measurement.jpg`]) {
+        vw.live.push(runItem(out, outPath, stem, res.row, path ? `${path}/${stem}` : stem));
+        showViewer(vw.live, { badge: "Running", caption: vw.liveCaption, select: vw.live.length - 1 }).catch(showError);
       }
       if (res.row) rows.set(stem, { ...res.row, processed_um_per_px: +workMpp.toFixed(4) });
       fields = [...new Set([...res.columns, ...fields, "processed_um_per_px"])];
       const csv = [csvLine(fields), ...[...rows.values()].map((r) => csvLine(fields.map((c) => r[c])))].join("\n");
       await writeFile(out, "_results.csv", csv + "\n");
       if (cfg !== undefined) {
-        inputFiles.set(h.name, { file: h.name, um_per_px: mpp, processed_um_per_px: +workMpp.toFixed(4),
-          inference_scale: mpp / manifest.reference_um_per_px });
+        inputFiles.set(h.name, { file: h.name, um_per_px: fileMpp, processed_um_per_px: +workMpp.toFixed(4),
+          inference_scale: fileMpp / manifest.reference_um_per_px });
         const config = runConfig(dir.name, outName, mpp, [...inputFiles.values()], opts);
         await writeFile(out, "run_config.yaml", JSON.stringify(config, null, 1));
       }
@@ -538,36 +611,124 @@ async function processJob({ dir, path, files, outName }, jobIdx, nJobs, mpp, ses
       counts.done++;
     } catch (e) {
       console.error(e);
+      await tiff?.discard();
       log(String(e.stack ?? e));
       warnings.push(`${path ? `${path}/` : ""}${h.name}: ${describeError(e)}`);
       counts.failed++;
     }
   }
-  return { out, path: path ? `${path}/${outName}` : outName };
+  return { out, path: outPath };
 }
 
 async function showLastRun(outs, warnings) {
   state.lastRun = outs;
-  $("last-run").hidden = false;
   $("last-warnings").replaceChildren(...warnings.map((w) => {
     const div = document.createElement("div");
     div.className = "warn";
     div.textContent = w;
     return div;
   }));
-  const latest = $("run-latest").dataset.url;
-  $("last-image").hidden = !latest;
-  if (latest) $("last-image").src = latest;
-  let fields = [];
-  const rows = [];
+  const items = [];
   for (const o of outs) {
-    const p = parseCsv((await readText(o.out, "_results.csv")) ?? "");
-    fields = [...new Set([...fields, ...p.fields])];
-    rows.push(...p.rows);
+    const rows = parseCsv((await readText(o.out, "_results.csv")) ?? "").rows.filter((r) => r["file name"]);
+    for (const row of rows) {
+      const stem = row["file name"];
+      items.push(runItem(o.out, o.path, stem, row, outs.length > 1 ? `${o.path}/${stem}` : stem));
+    }
   }
-  renderTable($("last-table"), fields, rows);
-  $("last-table").hidden = !rows.length;
-  $("review-last").disabled = !outs.length;
+  const where = outs.length === 1 ? outs[0].path : `${outs.length} predicted folders`;
+  const last = vw.live.at(-1);
+  await showViewer(items, { badge: state.stop ? "Stopped" : "Last run", review: true,
+    select: Math.max(0, items.findIndex((it) => it.stem === last?.stem && it.path === last?.path)),
+    caption: `${items.length} image(s) in ${where}. Click the image to open it full size.`,
+    empty: "No measurements; see the warnings and the log." });
+}
+
+// ---------------------------------------------------------------- Run page viewer: the example, a live run, the last run
+const EXAMPLE_DIR = "example/";
+const VIEW_METRICS = [["SC mean height", "SC thickness", "\u00b5m"], ["Epidermal mean height", "Epidermis thickness", "\u00b5m"],
+  ["EDJ tortuosity", "EDJ tortuosity", ""], ["quality", "Section quality", "/ 3"], ["num_glands", "Glands", ""]];
+const vw = { items: [], idx: 0, view: "measurement", token: 0, empty: "", live: [], liveCaption: "" };
+
+// src(view) gives the item's measurement / steps image: a URL (example) or a Blob read from its predicted folder
+function runItem(dir, path, stem, row, label) {
+  return { stem, path, row, label, src: async (view) => {
+    const bytes = await readBytes(dir, `${stem}_${view}.jpg`);
+    return bytes && new Blob([bytes], { type: "image/jpeg" });
+  } };
+}
+
+async function loadExample() {
+  const r = await fetch(`${EXAMPLE_DIR}_results.csv?v=${VERSION}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  state.example = parseCsv(await r.text()).rows.filter((row) => row["file name"]).map((row) => {
+    const stem = row["file name"];
+    return { stem, row, label: stem, src: async (view) => `${EXAMPLE_DIR}${encodeURIComponent(stem)}_${view}.jpg?v=${VERSION}` };
+  });
+}
+
+function showExample() {
+  return showViewer(state.example ?? [], { badge: "Example", example: true, empty: "Loading the example...",
+    caption: "Two slides from the MDE study (Motic 40X, 0.2577 \u00b5m/px). Click the image to open it full size." });
+}
+
+function showViewer(items, { badge, caption = "", empty = "No results to show.", select = 0, example = false,
+  review = false } = {}) {
+  Object.assign(vw, { items, idx: Math.max(0, Math.min(select, items.length - 1)), empty });
+  $("vw-badge").textContent = badge;
+  $("vw-caption").textContent = caption;
+  $("vw-download").hidden = !example;
+  $("review-last").hidden = !review || !items.length;
+  $("vw-select").replaceChildren(...items.map((it, i) => option(String(i), it.label)));
+  return showViewerItem();
+}
+
+async function showViewerItem() {
+  const it = vw.items[vw.idx], token = ++vw.token;
+  $("vw-select").value = String(vw.idx);
+  $("vw-select").disabled = vw.items.length < 2;
+  $("vw-prev").disabled = vw.idx <= 0;
+  $("vw-next").disabled = vw.idx >= vw.items.length - 1;
+  renderMetrics(it?.row);
+  const src = it ? await it.src(vw.view) : null;
+  if (token !== vw.token) return;
+  const img = $("vw-img");
+  $("run-preview").hidden = true;
+  if (typeof src === "string") {
+    setImg(img, null);
+    img.src = src;
+    img.hidden = false;
+  } else {
+    setImg(img, src);
+  }
+  img.alt = it ? `${it.stem} ${vw.view}` : "";
+  $("vw-empty").hidden = Boolean(src);
+  $("vw-empty").textContent = it ? `No ${vw.view} image for ${it.stem}.` : vw.empty;
+}
+
+function stepViewer(d) {
+  vw.idx = Math.max(0, Math.min(vw.idx + d, vw.items.length - 1));
+  showViewerItem().catch(showError);
+}
+
+function renderMetrics(row) {
+  $("vw-metrics").replaceChildren(...(row ? VIEW_METRICS : []).map(([key, name, unit]) => {
+    const card = document.createElement("div"), k = document.createElement("div"), v = document.createElement("div");
+    card.className = "metric";
+    card.title = key;
+    k.className = "k";
+    k.textContent = name;
+    v.className = "v";
+    const val = row[key], num = val !== "" && val != null && !Number.isNaN(Number(val));
+    v.textContent = num ? String(+Number(val).toFixed(2)) : "\u2013";
+    if (num && unit) {
+      const small = document.createElement("small");
+      small.textContent = unit;
+      v.append(small);
+    }
+    card.append(k, v);
+    return card;
+  }));
 }
 
 // folders that directly hold images; predicted_* (and legacy *_predicted) output folders are skipped, as in app.py
@@ -631,11 +792,6 @@ function initScanner(mpp) {
   $("mpp").value = mpp;
   apply();
   sel.addEventListener("change", apply);
-}
-
-async function rotationK(backend, img) {
-  const s = manifest.rotation.size;
-  return rotationFromSquare(backend, resize(img, s, s).px);
 }
 
 // sq: RGB size x size, INTER_AREA from the full image
@@ -807,6 +963,7 @@ function idb(mode, fn) {
 }
 
 async function chooseFolder() {
+  if (!window.showDirectoryPicker) return;
   try {
     await setRoot(await window.showDirectoryPicker({ id: "skin-seg-folder", mode: "readwrite" }));
   } catch (e) {
@@ -822,8 +979,14 @@ async function reopenFolder() {
 async function setRoot(handle) {
   state.root = handle;
   state.pred = null;
+  document.body.classList.remove("no-folder");
   $("folder-name").value = handle.name;
   $("reopen-folder").hidden = true;
+  if (!state.busy) {
+    state.lastRun = null;
+    $("last-warnings").replaceChildren();
+    showExample().catch(showError);
+  }
   idb("readwrite", (s) => s.put(handle, "root")).catch(() => {});
   await refreshPreds();
   await refreshRunImages();
@@ -886,8 +1049,24 @@ function showError(e) {
   setHeader(`Error: ${describeError(e)}`, "err");
 }
 
+// Review / Results without a folder: the message plus the landing page's choose button
+function emptyInfo(el, msg) {
+  el.textContent = msg;
+  if (!state.root) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn primary";
+    b.style.marginLeft = "1rem";
+    b.textContent = "\u{1F4C2} Analyze your images";
+    b.disabled = !window.showDirectoryPicker;
+    b.addEventListener("click", chooseFolder);
+    el.append(b);
+  }
+  el.hidden = false;
+}
+
 function renderRun() {
-  $("run-nofolder").hidden = Boolean(state.root);
+  $("run-landing").hidden = Boolean(state.root);
   $("run-body").hidden = !state.root;
   $("image-field").hidden = state.scope !== "one";
   setBusy(state.busy);
@@ -1007,11 +1186,10 @@ function prefetchNext() {
 
 async function loadReview() {
   const empty = (msg) => {
-    $("review-empty").textContent = msg;
-    $("review-empty").hidden = false;
+    emptyInfo($("review-empty"), msg);
     $("review-body").hidden = true;
   };
-  if (!state.root) return empty("Choose a working folder in the sidebar.");
+  if (!state.root) return empty("No folder chosen yet. Analyze a folder of images first, then check and correct the results here.");
   const pred = state.pred;
   if (!pred) return empty("No predicted folders in this working folder yet. Process images on the Run page first.");
   ensureEditPy();
@@ -1071,15 +1249,17 @@ async function labelFile(dir, stem) {
   return null;
 }
 
-// interface/seg_editor.find_image, in the folder holding the predicted folder (.svs can't be decoded here)
+// interface/seg_editor.find_image, in the folder holding the predicted folder; an .svs is read before its TIFF copy
+// because it is streamed, while a TIFF is decoded whole
 async function findSource(pred, stem, info) {
   const d = pred.parent;
   if (!d) return null;
-  const names = [info?.files?.[stem]?.file, ...[".tif", ".tiff", ".png", ".jpg", ".jpeg"].map((e) => stem + e)];
+  const known = info?.files?.[stem]?.file;
+  const names = [`${stem}.svs`, ...[".tif", ".tiff", ".png", ".jpg", ".jpeg"].map((e) => stem + e)];
   const tiffDir = await subdir(d, `TIFF_${d.name}`);
-  const cands = [...(tiffDir ? [[tiffDir, `${stem}.tif`]] : []), ...names.filter(Boolean).map((n) => [d, n])];
+  const cands = [...(known ? [[d, known]] : []), [d, names[0]], ...(tiffDir ? [[tiffDir, `${stem}.tif`]] : []),
+    ...names.slice(1).map((n) => [d, n])];
   for (const [dir, name] of cands) {
-    if (/\.svs$/i.test(name)) continue;
     try {
       return await dir.getFileHandle(name);
     } catch (e) {
@@ -1107,7 +1287,7 @@ async function openDoc() {
     if (!lbl) throw new Error(`No raw or postprocessed segmentation found for ${stem} in ${pred.path}`);
     // run_config (read by the editor engine) is only needed when the source isn't <stem>.<ext>
     const src = (await findSource(pred, stem, rv.info)) ?? (await findSource(pred, stem, await infoP));
-    if (!src) throw new Error(`Source image of ${stem} not found next to ${pred.path} (.svs files need their TIFF copy)`);
+    if (!src) throw new Error(`Source image of ${stem} not found next to ${pred.path}`);
     lap("label + source");
     const pv = await ensurePreview(pred, stem, src);
     lap(pv.built ? "preview built" : "preview from review_cache");
@@ -1291,11 +1471,10 @@ async function findResults(dir, path, out) {
 
 async function loadResults() {
   const empty = (msg) => {
-    $("results-empty").textContent = msg;
-    $("results-empty").hidden = false;
+    emptyInfo($("results-empty"), msg);
     $("results-body").hidden = true;
   };
-  if (!state.root) return empty("Choose a working folder in the sidebar.");
+  if (!state.root) return empty("No folder chosen yet. Analyze a folder of images first; its measurements are combined here.");
   setHeader("Searching for _results.csv...");
   const files = await findResults(state.root, "", []);
   res.rows = [];
@@ -1429,7 +1608,26 @@ function wire() {
     $("stop").disabled = true;
     setHeader("Stopping after the current image...");
   });
-  $("review-last").addEventListener("click", () => state.lastRun?.[0] && openInReview(state.lastRun[0].path, null));
+  $("review-last").addEventListener("click", () => {
+    const it = vw.items[vw.idx];
+    if (it?.path) openInReview(it.path, it.stem);
+  });
+  $("cta-choose").addEventListener("click", chooseFolder);
+  $("cta-reopen").addEventListener("click", () => reopenFolder().catch(showError));
+  $("log-toggle").addEventListener("click", () => { $("log-pop").hidden = !$("log-pop").hidden; });
+  document.addEventListener("click", (e) => { if (!$("status-box").contains(e.target)) $("log-pop").hidden = true; });
+  $("vw-prev").addEventListener("click", () => stepViewer(-1));
+  $("vw-next").addEventListener("click", () => stepViewer(1));
+  $("vw-select").addEventListener("change", (e) => {
+    vw.idx = Number(e.target.value);
+    showViewerItem().catch(showError);
+  });
+  segControl("vw-view", (v) => {
+    vw.view = v;
+    showViewerItem().catch(showError);
+  });
+  $("vw-img").addEventListener("click", (e) => window.open(e.target.src, "_blank", "noopener"));
+  $("vw-download").href = `${EXAMPLE_DIR}_results.csv?v=${VERSION}`;
   $("rv-image").addEventListener("change", (e) => {
     rv.stem = e.target.value;
     showReviewImage().catch(showError);
@@ -1450,8 +1648,34 @@ async function init() {
   wire();
   showPage(location.hash.slice(1));
   if (!window.showDirectoryPicker) {
-    $("choose-folder").disabled = true;
+    for (const id of ["choose-folder", "cta-choose"]) $(id).disabled = true;
     $("folder-support").hidden = false;
+    $("cta-support").hidden = false;
+  }
+  showExample();
+  loadExample().then(() => { if (!state.busy && !state.lastRun) showExample(); })
+    .catch((e) => showViewer([], { badge: "Example", empty: `The example could not be loaded (${e.message}).` }));
+  // a remembered folder skips the landing page; one whose permission lapsed needs a click to reopen
+  try {
+    const saved = window.showDirectoryPicker ? await idb("readonly", (s) => s.get("root")).catch(() => null) : null;
+    if (saved) {
+      if ((await saved.queryPermission({ mode: "readwrite" })) === "granted") await setRoot(saved);
+      else {
+        state.saved = saved;
+        $("reopen-folder").textContent = `Reopen ${saved.name}`;
+        $("reopen-folder").hidden = false;
+        $("cta-reopen").textContent = `\u{1F4C2} Continue with ${saved.name}`;
+        $("cta-reopen").hidden = false;
+        $("cta-choose").classList.remove("primary");
+        $("cta-choose").textContent = "Choose another folder";
+      }
+    }
+  } catch (e) {
+    console.warn("could not reopen the remembered folder", e);
+    state.root = null;
+    document.body.classList.add("no-folder");
+    $("folder-name").value = "";
+    renderPage();
   }
   try {
     if (!navigator.gpu) {
@@ -1470,15 +1694,6 @@ async function init() {
       for (const k of ["roi", "follicle", "quality"]) $(`opt-${k}`).checked = defaults[k];
     }).catch(() => {});
     initScanner(manifest.default_um_per_px);
-    const saved = window.showDirectoryPicker ? await idb("readonly", (s) => s.get("root")).catch(() => null) : null;
-    if (saved) {
-      if ((await saved.queryPermission({ mode: "readwrite" })) === "granted") await setRoot(saved);
-      else {
-        state.saved = saved;
-        $("reopen-folder").textContent = `Reopen ${saved.name}`;
-        $("reopen-folder").hidden = false;
-      }
-    }
     modelUrls.seg = sameOrigin(new URL(manifest.model, jsonUrl).href);
     models.seg = await fetchBytes(modelUrls.seg, "Downloading segmentation model");
     for (const key of ["rotation", "roi", "follicle", "quality"]) {

@@ -5,7 +5,7 @@
   /* names interface/seg_editor.js's CSS expects (Streamlit theme variables) */
   --st-font: var(--font); --st-text-color: var(--text); --st-primary-color: var(--primary);
   --st-background-color: var(--bg); --st-secondary-background-color: var(--bg2); --st-border-color: var(--border);
-  --st-red-color: #d33; --seg-ed-top: var(--header-h);
+  --st-red-color: #d33; --seg-ed-top: 0px;
   --font: "Source Sans 3", "Source Sans Pro", -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 * { box-sizing: border-box; }
@@ -15,21 +15,37 @@ h3 { font-size: 1.5rem; font-weight: 600; margin: 1.5rem 0 .75rem; line-height: 
 .caption { font-size: .875rem; color: var(--text-soft); }
 [hidden] { display: none !important; }
 
-/* layout: sidebar + header with top navigation + main */
-.app { display: flex; min-height: 100vh; }
-aside { width: 21rem; flex: none; background: var(--bg2); padding: 1.5rem 1.25rem; position: sticky; top: 0;
-  height: 100vh; overflow-y: auto; }
+/* layout: sidebar + header with top navigation + main; the window never scrolls, only main does (Review, Results) */
+.app { display: flex; height: 100vh; overflow: hidden; }
+aside { width: 21rem; flex: none; background: var(--bg2); padding: 1.5rem 1.25rem; height: 100vh; overflow-y: auto; }
 aside h1 { font-size: 1.15rem; margin: 0 0 1.25rem; }
-.content { flex: 1; min-width: 0; }
-header { position: sticky; top: 0; z-index: 20; height: var(--header-h); background: var(--bg);
+body.no-folder aside { display: none; }
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100vh; }
+header { flex: none; z-index: 20; height: var(--header-h); background: var(--bg);
   display: flex; align-items: center; gap: .25rem; padding: 0 1.5rem; border-bottom: 1px solid #eee; }
+header .brand { display: none; font-weight: 600; margin-right: 1rem; white-space: nowrap; }
+body.no-folder header .brand { display: inline; }
 header a { text-decoration: none; color: var(--text-soft); padding: .35rem .75rem; border-radius: var(--radius);
-  font-size: .95rem; }
+  font-size: .95rem; white-space: nowrap; }
 header a:hover { background: var(--bg2); color: var(--text); }
 header a.on { color: var(--text); font-weight: 600; background: var(--bg2); }
-main { padding: 1.25rem 5rem 4rem; max-width: 100%; }
-#header-status { margin-bottom: 1rem; }
-#header-status.err { color: #d33; }
+main { flex: 1; min-height: 0; overflow: auto; padding: 1.25rem 2rem; }
+
+/* header status box: current step, progress, stop, log */
+.status-box { position: relative; margin-left: auto; display: flex; align-items: center; gap: .4rem; min-width: 0;
+  max-width: min(46rem, 60%); background: var(--bg2); border-radius: var(--radius); padding: .2rem .25rem .2rem .75rem;
+  overflow: visible; }
+.status-box .status-text { flex: 1; min-width: 0; font-size: .85rem; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; color: var(--text-soft); }
+.status-box.busy .status-text { color: var(--text); }
+.status-box.err .status-text { color: #d33; }
+.status-box .progress { position: absolute; left: .5rem; right: .5rem; bottom: 0; height: 3px; margin: 0; }
+.btn.sm { min-height: 1.9rem; padding: .1rem .6rem; font-size: .85rem; flex: none; }
+.log-pop { position: absolute; top: calc(100% + .4rem); right: 0; width: min(44rem, 80vw); background: var(--bg);
+  border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 6px 20px rgba(0,0,0,.12); padding: .75rem;
+  z-index: 30; }
+.log-pop .caption { margin: 0 0 .5rem; }
+.log-pop pre.log { max-height: 60vh; }
 
 /* widgets */
 .field { margin-bottom: 1rem; }
@@ -123,9 +139,55 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 .seg-ed .hint { margin-top: 4px; font-size: 0.75rem; opacity: 0.7; }
 .imgnav { display: flex; align-items: center; gap: .5rem; margin: .5rem 0; }
 
-@media (max-width: 900px) {
+/* Run page: landing text or settings on the left, example / run results on the right, sized to the window */
+.run-grid { display: grid; grid-template-columns: 22rem minmax(0, 1fr); gap: 1.5rem; height: 100%; }
+.run-grid[hidden] { display: none; }
+.run-left { min-height: 0; overflow-y: auto; padding-right: .25rem; display: flex; flex-direction: column; }
+.run-left .field { margin-bottom: .75rem; }
+.run-left .switch { margin: .3rem 0; font-size: .9rem; }
+.run-left details.expander { margin: .75rem 0; }
+#run-body { display: flex; flex-direction: column; flex: 1; }
+#run-body[hidden] { display: none; }
+.run-actions { position: sticky; bottom: 0; margin-top: auto; padding: .5rem 0 0; background: var(--bg); }
+.hero h2 { font-size: 1.6rem; line-height: 1.25; margin: .5rem 0 .75rem; }
+.hero p { margin: 0 0 1rem; }
+.hero .btn + .btn { margin-top: .5rem; }
+.btn.lg { min-height: 3rem; font-size: 1.05rem; font-weight: 600; }
+.hero ol.how { padding-left: 1.25rem; margin: 1.25rem 0; font-size: .95rem; }
+.hero ol.how li { margin-bottom: .35rem; }
+
+.viewer { display: flex; flex-direction: column; gap: .6rem; min-height: 0; min-width: 0; }
+.vw-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
+.badge { font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: .2rem .55rem;
+  border-radius: 1rem; background: var(--primary-soft); color: var(--primary); white-space: nowrap; }
+.vw-nav { display: flex; align-items: center; gap: .25rem; min-width: 0; flex: 1; max-width: 26rem; }
+.vw-nav select { height: 2rem; padding: .1rem .5rem; min-width: 0; }
+#vw-view { margin-left: auto; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: .5rem; }
+.metric { background: var(--bg2); border-radius: var(--radius); padding: .35rem .75rem; min-width: 0; }
+.metric .k { font-size: .78rem; color: var(--text-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.metric .v { font-size: 1.25rem; font-weight: 600; line-height: 1.3; white-space: nowrap; }
+.metric .v small { font-size: .8rem; font-weight: 400; color: var(--text-soft); margin-left: .2rem; }
+.vw-stage { flex: 1; min-height: 12rem; display: flex; align-items: center; justify-content: center; overflow: hidden;
+  background: var(--bg2); border-radius: var(--radius); position: relative; }
+.vw-stage img, .vw-stage canvas { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.vw-stage img { cursor: zoom-in; }
+.vw-warnings { max-height: 6rem; overflow: auto; }
+.vw-warnings:empty { display: none; }
+.vw-warnings .warn { margin: 0 0 .25rem; padding: .4rem .75rem; font-size: .85rem; }
+.vw-foot { display: flex; align-items: center; gap: .5rem; }
+.vw-foot .grow { flex: 1; min-width: 0; }
+a.btn { text-decoration: none; color: inherit; }
+
+@media (max-width: 900px), (max-height: 560px) {
+  .app, .content, aside { height: auto; overflow: visible; }
   .app { flex-direction: column; }
-  aside { width: 100%; height: auto; position: static; }
-  main { padding: 1rem 1.25rem 3rem; }
+  aside { width: 100%; }
+  header { position: sticky; top: 0; flex-wrap: wrap; height: auto; min-height: var(--header-h); padding: .4rem 1rem; }
+  :root { --seg-ed-top: var(--header-h); }
+  main { overflow: visible; padding: 1rem 1.25rem 3rem; }
+  .run-grid { grid-template-columns: 1fr; height: auto; }
+  .vw-stage { height: 70vh; flex: none; }
+  .status-box { max-width: none; flex-basis: 100%; }
   .cols2, .cols-3-2 { grid-template-columns: 1fr; }
 }

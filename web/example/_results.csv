@@ -1,0 +1,3 @@
+folder name,file name,date,SC mean height,SC area,Epidermal mean height,Epidermal area,EDJ tortuosity,quality,num_glands,total_sebocyte_um2,total_tissue_um2,edited
+examples_v1,mde101f.svs,2024-09-06,14.35,14828.07,43.15,46060.62,1.31,2.721,4,45881.71,2386541.76,
+examples_v1,mde103f.svs,2024-09-06,12.71,9759.11,36.86,27926.9,1.07,2.849,2,90801.95,1417855.01,

@@ -51,28 +51,81 @@ function linearTab(ssize, dsize) {
   return tab;
 }
 
-export function resize(img, dw, dh) {
-  const { w, h, px, cn } = img;
-  const area = dw < w || dh < h;
-  const xt = (area ? areaTab : linearTab)(w, dw), yt = (area ? areaTab : linearTab)(h, dh);
-  const out = new Uint8Array(dw * dh * 3), row = new Float32Array(dw * 3), acc = new Float32Array(dw * 3);
-  for (let dy = 0; dy < dh; dy++) {
-    acc.fill(0);
-    for (const [sy, ay] of yt[dy]) {
-      row.fill(0);
-      const base = sy * w * cn;
-      for (let dx = 0; dx < dw; dx++) {
-        for (const [sx, ax] of xt[dx]) {
-          const i = base + sx * cn;
-          row[dx * 3] += ax * px[i]; row[dx * 3 + 1] += ax * px[i + 1]; row[dx * 3 + 2] += ax * px[i + 2];
+// source columns read by each destination column of resize(sw x sh -> dw x dh): [[sx, weight], ...] ascending
+export function xTaps(sw, sh, dw, dh) {
+  return (dw < sw || dh < sh ? areaTab : linearTab)(sw, dw);
+}
+
+// cv2.resize (INTER_AREA down, INTER_LINEAR up) fed source rows in order, so huge images can be resampled band by
+// band while decoding; float32 accumulation in the same order as a whole-image pass. Optionally only destination
+// columns [x0, x1) from bands whose first column is source column sx0 (columns are independent: same result)
+export class Resampler {
+  constructor(sw, sh, dw, dh, { x0 = 0, x1 = dw, sx0 = 0 } = {}) {
+    const tab = dw < sw || dh < sh ? areaTab : linearTab;
+    const xt = tab(sw, dw).slice(x0, x1), yt = tab(sh, dh), cols = x1 - x0;
+    this.sw = sw; this.sh = sh; this.dw = cols; this.dh = dh; this.y = 0; this.next = 0;
+    this.xStart = new Int32Array(cols + 1);
+    xt.forEach((t, dx) => { this.xStart[dx + 1] = this.xStart[dx] + t.length; });
+    this.xIdx = new Int32Array(this.xStart[cols]);
+    this.xW = new Float64Array(this.xStart[cols]);
+    xt.flat().forEach(([sx, ax], i) => { this.xIdx[i] = sx - sx0; this.xW[i] = ax; });
+    this.bySrc = Array.from({ length: sh }, () => []);
+    this.last = new Int32Array(dh);
+    yt.forEach((t, dy) => {
+      for (const [sy, ay] of t) this.bySrc[sy].push(dy, ay);
+      this.last[dy] = Math.max(0, ...t.map(([sy]) => sy));
+    });
+    this.row = new Float32Array(cols * 3);
+    this.open = new Map();
+    this.out = new Uint8Array(cols * dh * 3);
+  }
+
+  // rows of `stride` pixels with cn (3 or 4) channels, continuing from the previous push
+  push(px, rows, cn, stride = this.sw) {
+    const { dw, row, xStart, xIdx, xW } = this, f = Math.fround;
+    for (let r = 0; r < rows; r++, this.y++) {
+      const contrib = this.bySrc[this.y];
+      if (contrib.length) {
+        const base = r * stride * cn;
+        for (let dx = 0; dx < dw; dx++) {
+          let r0 = 0, r1 = 0, r2 = 0;
+          for (let t = xStart[dx]; t < xStart[dx + 1]; t++) {
+            const i = base + xIdx[t] * cn, ax = xW[t];
+            r0 = f(r0 + ax * px[i]); r1 = f(r1 + ax * px[i + 1]); r2 = f(r2 + ax * px[i + 2]);
+          }
+          row[dx * 3] = r0; row[dx * 3 + 1] = r1; row[dx * 3 + 2] = r2;
+        }
+        for (let c = 0; c < contrib.length; c += 2) {
+          const dy = contrib[c], ay = contrib[c + 1];
+          let acc = this.open.get(dy);
+          if (!acc) this.open.set(dy, acc = new Float32Array(dw * 3));
+          for (let i = 0; i < acc.length; i++) acc[i] += ay * row[i];
         }
       }
-      for (let i = 0; i < acc.length; i++) acc[i] += ay * row[i];
+      while (this.next < this.dh && this.last[this.next] <= this.y) {
+        const acc = this.open.get(this.next), o = this.next * dw * 3;
+        if (acc) for (let i = 0; i < acc.length; i++) this.out[o + i] = Math.min(255, Math.max(0, Math.round(acc[i])));
+        this.open.delete(this.next++);
+      }
     }
-    const o = dy * dw * 3;
-    for (let i = 0; i < acc.length; i++) out[o + i] = Math.min(255, Math.max(0, Math.round(acc[i])));
   }
-  return { w: dw, h: dh, px: out, cn: 3 };
+
+  result() {
+    return { w: this.dw, h: this.dh, px: this.out, cn: 3 };
+  }
+}
+
+export function resize(img, dw, dh) {
+  const r = new Resampler(img.w, img.h, dw, dh);
+  r.push(img.px, img.h, img.cn);
+  return r.result();
+}
+
+// image size measured at (interface/app.py MAX_POST_MP / POST_UM_PER_PX): large images are reduced to postUm
+export function workSize(w, h, um, maxMP, postUm) {
+  if (w * h <= maxMP * 1e6 || um >= postUm) return [w, h];
+  const s = um / postUm;
+  return [Math.max(1, pyRound(w * s)), Math.max(1, pyRound(h * s))];
 }
 
 export function toRGB(img) {

@@ -1,5 +1,6 @@
 // Decodes source images off the page's main thread: Review previews and re-measure inputs.
-import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js?v=dev";
+import { decode, previewJpeg, resize, toRGB, workSize } from "./imaging.js?v=dev";
+import { isSvs, openSvs, readSvsScaled } from "./svs.js?v=dev";
 
 const UTIF_URL = "https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js";
 const UTIF_SRI = "sha384-RyBmXHdfZ/Uon+ud+/AqSyWpUWnKYt2tkRG/P4gWoRUGDU+qIAV3tGBPNlYTBZEF";
@@ -15,23 +16,30 @@ async function loadUtif() {
 }
 
 async function handle({ id, op, file, maxSide, um, maxMP, postUm, rotSize }) {
-  let img = await decode(file);
-  const iw = img.w, ih = img.h;
+  // .svs: read band by band straight to the needed sizes; other formats are decoded whole
+  const svs = isSvs(file.name) ? await openSvs(file) : null;
+  let img = svs ? null : await decode(file);
+  const iw = svs?.w ?? img.w, ih = svs?.h ?? img.h;
   if (op === "preview") {
+    if (svs) {
+      const f = Math.min(1, maxSide / Math.max(iw, ih));
+      img = (await readSvsScaled(svs, { p: [Math.max(1, Math.round(iw * f)), Math.max(1, Math.round(ih * f))] })).p;
+    }
     const blob = await previewJpeg(img, maxSide);
     return [{ id, iw, ih, blob }, []];
   }
   // re-measure input: 224 px square for the rotation model (if needed) + image at the measuring resolution
-  const sq = rotSize ? resize(img, rotSize, rotSize).px : null;
-  let work = img, workUm = um;
-  if (iw * ih > maxMP * 1e6 && um < postUm) {
-    const s = um / postUm;
-    work = resize(img, Math.max(1, pyRound(iw * s)), Math.max(1, pyRound(ih * s)));
-    workUm = um * iw / work.w;
+  const [ww, wh] = workSize(iw, ih, um, maxMP, postUm);
+  let sq = null, work;
+  if (svs) {
+    ({ sq = null, work } = await readSvsScaled(svs, { work: [ww, wh], ...(rotSize ? { sq: [rotSize, rotSize] } : {}) }));
+  } else {
+    sq = rotSize ? resize(img, rotSize, rotSize) : null;
+    work = ww === iw && wh === ih ? img : resize(img, ww, wh);
   }
   img = null;
-  const rgb = toRGB(work);
-  return [{ id, iw, ih, w: work.w, h: work.h, rgb, workUm, sq }, [rgb.buffer, ...(sq ? [sq.buffer] : [])]];
+  const workUm = work.w === iw ? um : um * iw / work.w, rgb = toRGB(work), sqPx = sq?.px ?? null;
+  return [{ id, iw, ih, w: work.w, h: work.h, rgb, workUm, sq: sqPx }, [rgb.buffer, ...(sqPx ? [sqPx.buffer] : [])]];
 }
 
 // one image at a time: a 100 MP TIFF needs ~1 GB while decoding
