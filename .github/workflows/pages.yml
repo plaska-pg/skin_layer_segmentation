@@ -44,7 +44,8 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site/web _site/interface _site/runs/web _site/training/semseg
-          cp web/index.html web/app.js web/style.css web/worker.js web/pipeline.py web/obb.py web/review.py _site/web/
+          cp web/index.html web/app.js web/style.css web/worker.js web/imaging.js web/image_worker.js web/pipeline.py \
+            web/obb.py web/review.py web/review_edit.py _site/web/
           cp interface/seg_editor.js _site/interface/
           cp postprocess.py measurement.py config.py base_config.yaml _site/
           cp training/__init__.py training/qc_sections.py _site/training/

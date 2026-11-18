@@ -3,21 +3,35 @@
 // linear ramp, bilinear upsampling of probabilities, argmax). Measuring and the Review editor's merge / cut /
 // re-measure run postprocess.py & co. in Pyodide workers (worker.js); the editor is interface/seg_editor.js.
 import mountEditor from "../interface/seg_editor.js";
+import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js";
 
-const { ort, UTIF } = window;
+const { ort } = window;
 const $ = (id) => document.getElementById(id);
 const COLORS = [null, [230, 80, 60], [60, 170, 90], [70, 110, 230]];
 // larger images are measured at POST_UM_PER_PX so Pyodide stays under its 4 GB memory limit
 const MAX_POST_MP = 45, POST_UM_PER_PX = 0.4;
 const WORKER_RECYCLE_MB = 1024;
 const EDITOR_MAX_SIDE = 4096, EDITOR_HEIGHT = 720;  // interface/seg_editor.py
+// display-size copy of each source image, written next to the results so Review opens without decoding the source
+const PREVIEW_DIR = "review_cache";
 const CLASS_COLORS = { SC: "#00c8ff", Epidermis: "#ffc800", gland: "#00ff00" };
-const PY_FILES = {
-  "pipeline.py": "pipeline.py", "obb.py": "obb.py", "review.py": "review.py", "postprocess.py": "../postprocess.py",
-  "measurement.py": "../measurement.py", "config.py": "../config.py", "base_config.yaml": "../base_config.yaml",
-  "training/__init__.py": "../training/__init__.py", "training/qc_sections.py": "../training/qc_sections.py",
-  "training/semseg/__init__.py": "../training/semseg/__init__.py",
+const SEMSEG_FILES = {
+  "training/__init__.py": "../training/__init__.py", "training/semseg/__init__.py": "../training/semseg/__init__.py",
   "training/semseg/add_segmentations.py": "../training/semseg/add_segmentations.py",
+};
+// Pyodide workers: measuring (process_image, re-measure) and the light Review editor engine (merge / cut / save)
+const MEASURE_PY = {
+  module: "review", modules: ["pipeline", "review"],
+  packages: ["numpy", "scipy", "scikit-image", "opencv-python", "pyyaml"],
+  files: {
+    "pipeline.py": "pipeline.py", "obb.py": "obb.py", "review.py": "review.py", "postprocess.py": "../postprocess.py",
+    "measurement.py": "../measurement.py", "config.py": "../config.py", "base_config.yaml": "../base_config.yaml",
+    "training/__init__.py": "../training/__init__.py", "training/qc_sections.py": "../training/qc_sections.py",
+  },
+};
+const EDIT_PY = {
+  module: "review_edit", modules: ["review_edit"], packages: ["numpy", "opencv-python", "pyyaml"],
+  files: { "review_edit.py": "review_edit.py", ...SEMSEG_FILES },
 };
 
 function sameOrigin(path) {
@@ -55,8 +69,6 @@ function progress(frac, label) {
 }
 const tick = () => new Promise((r) => setTimeout(r));
 const ms = (t0) => `${((performance.now() - t0) / 1000).toFixed(2)} s`;
-// Python round(): half to even
-const pyRound = (v) => (Math.abs(v % 1) === 0.5 ? 2 * Math.round(v / 2) : Math.round(v));
 
 async function fetchBytes(url, label) {
   const res = await fetch(url);
@@ -91,76 +103,6 @@ async function getSession(backend, key = "seg") {
     log(`${key} session ${backend}: ${ms(t0)}`);
   }
   return sessions[id];
-}
-
-async function decode(file) {
-  if (/\.tiff?$/i.test(file.name)) {
-    const buf = await file.arrayBuffer();
-    const ifds = UTIF.decode(buf);
-    const ifd = ifds.reduce((a, b) => (b.t256[0] * b.t257[0] > a.t256[0] * a.t257[0] ? b : a));
-    UTIF.decodeImage(buf, ifd);
-    return { w: ifd.width, h: ifd.height, px: UTIF.toRGBA8(ifd), cn: 4 };
-  }
-  const bmp = await createImageBitmap(file, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
-  const canvas = new OffscreenCanvas(bmp.width, bmp.height), ctx = canvas.getContext("2d");
-  ctx.drawImage(bmp, 0, 0);
-  const px = ctx.getImageData(0, 0, bmp.width, bmp.height).data;
-  const w = bmp.width, h = bmp.height;
-  bmp.close();
-  canvas.width = canvas.height = 0;
-  return { w, h, px, cn: 4 };
-}
-
-// OpenCV computeResizeAreaTab: source indices and weights for each destination index
-function areaTab(ssize, dsize) {
-  const scale = ssize / dsize;
-  const tab = [];
-  for (let d = 0; d < dsize; d++) {
-    const f1 = d * scale, f2 = f1 + scale, cell = Math.min(scale, ssize - f1);
-    let s2 = Math.min(Math.floor(f2), ssize - 1);
-    const s1 = Math.min(Math.ceil(f1), s2);
-    const e = [];
-    if (s1 - f1 > 1e-3) e.push([s1 - 1, (s1 - f1) / cell]);
-    for (let s = s1; s < s2; s++) e.push([s, 1 / cell]);
-    if (f2 - s2 > 1e-3) e.push([s2, Math.min(f2 - s2, 1, cell) / cell]);
-    tab.push(e);
-  }
-  return tab;
-}
-
-// cv2.INTER_LINEAR pixel-centre taps with BORDER_REPLICATE
-function linearTab(ssize, dsize) {
-  const tab = [];
-  for (let d = 0; d < dsize; d++) {
-    const s = (d + 0.5) * (ssize / dsize) - 0.5, i = Math.floor(s), f = s - i;
-    const c = (k) => Math.min(Math.max(k, 0), ssize - 1);
-    tab.push([[c(i), 1 - f], [c(i + 1), f]]);
-  }
-  return tab;
-}
-
-function resize(img, dw, dh) {
-  const { w, h, px, cn } = img;
-  const area = dw < w || dh < h;
-  const xt = (area ? areaTab : linearTab)(w, dw), yt = (area ? areaTab : linearTab)(h, dh);
-  const out = new Uint8Array(dw * dh * 3), row = new Float32Array(dw * 3), acc = new Float32Array(dw * 3);
-  for (let dy = 0; dy < dh; dy++) {
-    acc.fill(0);
-    for (const [sy, ay] of yt[dy]) {
-      row.fill(0);
-      const base = sy * w * cn;
-      for (let dx = 0; dx < dw; dx++) {
-        for (const [sx, ax] of xt[dx]) {
-          const i = base + sx * cn;
-          row[dx * 3] += ax * px[i]; row[dx * 3 + 1] += ax * px[i + 1]; row[dx * 3 + 2] += ax * px[i + 2];
-        }
-      }
-      for (let i = 0; i < acc.length; i++) acc[i] += ay * row[i];
-    }
-    const o = dy * dw * 3;
-    for (let i = 0; i < acc.length; i++) out[o + i] = Math.min(255, Math.max(0, Math.round(acc[i])));
-  }
-  return { w: dw, h: dh, px: out, cn: 3 };
 }
 
 function ramp(n, r) {
@@ -360,6 +302,15 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
   const k = await rotationK(backend, img);
   log(`rotation: ${k * 90} deg clockwise to upright, ${ms(t0)}`);
 
+  t0 = performance.now();
+  let preview = null;
+  try {
+    preview = { blob: await previewJpeg(img, EDITOR_MAX_SIDE), width: img.w, height: img.h, k };
+    log(`review preview: ${ms(t0)}`);
+  } catch (e) {
+    log(`review preview failed (${describeError(e)}); Review will build it`);
+  }
+
   const scale = mpp / manifest.reference_um_per_px;
   const tw = Math.max(1, pyRound(img.w * scale)), th = Math.max(1, pyRound(img.h * scale));
   let net = img;
@@ -406,7 +357,7 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
     (line) => { log(line); status(`Measuring: ${line.replace(/^[^:]*: /, "")}`); });
   log(`measuring: ${ms(t0)} (measurement engine memory ${res.heapMB} MB)`);
   log(`total: ${ms(tAll)}`);
-  return { res, stem, workMpp };
+  return { res, stem, workMpp, preview };
 }
 
 // ---------------------------------------------------------------- folder mode (File System Access API)
@@ -559,11 +510,13 @@ async function processJob({ dir, path, files, outName }, jobIdx, nJobs, mpp, ses
     if (state.stop) break;
     const t0 = performance.now();
     try {
-      const { res, workMpp } = await processFile(await h.getFile(), mpp, session, dir.name, opts);
+      const file = await h.getFile();
+      const { res, workMpp, preview } = await processFile(file, mpp, session, dir.name, opts);
       for (const [f, data] of Object.entries(res.files)) {
         const p = outputPath(stem, f);
         if (p) await writeFile(out, p, data);
       }
+      if (preview) await writePreview(out, stem, file, preview);
       const meas = res.files[`${stem}_measurement.jpg`];
       if (meas) {
         setImg($("run-latest"), new Blob([meas], { type: "image/jpeg" }));
@@ -679,10 +632,16 @@ function initScanner(mpp) {
 }
 
 async function rotationK(backend, img) {
+  const s = manifest.rotation.size;
+  return rotationFromSquare(backend, resize(img, s, s).px);
+}
+
+// sq: RGB size x size, INTER_AREA from the full image
+async function rotationFromSquare(backend, sq) {
   const r = manifest.rotation, s = r.size, plane = s * s;
-  const sq = resize(img, s, s), data = new Float32Array(3 * plane);
+  const data = new Float32Array(3 * plane);
   for (let i = 0; i < plane; i++) {
-    data[i] = sq.px[3 * i]; data[plane + i] = sq.px[3 * i + 1]; data[2 * plane + i] = sq.px[3 * i + 2];
+    data[i] = sq[3 * i]; data[plane + i] = sq[3 * i + 1]; data[2 * plane + i] = sq[3 * i + 2];
   }
   const session = await getSession(backend, "rot");
   const out = await session.run({ [r.input.name]: new ort.Tensor("float32", data, [1, 3, s, s]) });
@@ -690,19 +649,11 @@ async function rotationK(backend, img) {
   return (4 - logits.indexOf(Math.max(...logits))) % 4;
 }
 
-function toRGB(img) {
-  if (img.cn === 3) return img.px;
-  const out = new Uint8Array(img.w * img.h * 3);
-  for (let i = 0, o = 0; o < out.length; i += 4, o += 3) {
-    out[o] = img.px[i]; out[o + 1] = img.px[i + 1]; out[o + 2] = img.px[i + 2];
-  }
-  return out;
-}
-
 // A Pyodide worker (worker.js) with request ids; recycled when its never-shrinking heap gets large
 class PyWorker {
-  constructor(name) {
+  constructor(name, profile) {
     this.name = name;
+    this.profile = profile;
     this.start();
   }
 
@@ -716,8 +667,9 @@ class PyWorker {
     this.ready.catch(() => {});
     w.onmessage = ({ data }) => this.message(data);
     w.onerror = (e) => this.fail(new Error(e.message || `${this.name} crashed (likely out of memory)`));
-    const files = Object.fromEntries(Object.entries(PY_FILES).map(([n, p]) => [n, sameOrigin(p).href]));
-    w.postMessage({ type: "init", files });
+    const { files, packages, modules } = this.profile;
+    w.postMessage({ type: "init", packages, modules,
+      files: Object.fromEntries(Object.entries(files).map(([n, p]) => [n, sameOrigin(p).href])) });
   }
 
   message(data) {
@@ -757,7 +709,7 @@ class PyWorker {
   }
 
   call(fn, args, transfer = []) {
-    return this.send({ type: "call", fn, args }, transfer);
+    return this.send({ type: "call", mod: this.profile.module, fn, args }, transfer);
   }
 }
 
@@ -954,8 +906,101 @@ const rv = { pred: null, stems: [], rows: new Map(), stem: null, view: "edit", d
   loads: 0 };
 
 function ensureEditPy() {
-  editPy ??= new PyWorker("editor engine");
+  editPy ??= new PyWorker("editor engine", EDIT_PY);
   return editPy;
+}
+
+// ---------------------------------------------------------------- Review previews (<predicted>/review_cache)
+async function writePreview(predDir, stem, file, { blob, width, height, k = null }) {
+  const meta = { source: file.name, size: file.size, last_modified: file.lastModified, width, height, k };
+  await writeFile(predDir, `${PREVIEW_DIR}/${stem}.jpg`, blob);
+  await writeFile(predDir, `${PREVIEW_DIR}/${stem}.json`, JSON.stringify(meta));
+  return meta;
+}
+
+// the saved preview, if it was made from this exact source file
+async function readPreview(predDir, stem, file) {
+  const dir = await subdir(predDir, PREVIEW_DIR);
+  if (!dir) return null;
+  let meta;
+  try {
+    meta = JSON.parse((await readText(dir, `${stem}.json`)) ?? "null");
+  } catch {
+    return null;
+  }
+  if (!meta || meta.size !== file.size || meta.last_modified !== file.lastModified) return null;
+  try {
+    return { blob: await (await dir.getFileHandle(`${stem}.jpg`)).getFile(), meta };
+  } catch (e) {
+    if (e.name === "NotFoundError") return null;
+    throw e;
+  }
+}
+
+const previewJobs = new Map();
+
+// saved preview, else built from the source in image_worker.js and saved for next time
+function ensurePreview(pred, stem, src) {
+  const key = `${pred.path}|${stem}`;
+  if (!previewJobs.has(key)) {
+    previewJobs.set(key, (async () => {
+      const file = await src.getFile();
+      const hit = await readPreview(pred.dir, stem, file);
+      if (hit) return { ...hit, built: false };
+      const r = await imageJob({ op: "preview", file, maxSide: EDITOR_MAX_SIDE });
+      let meta = { width: r.iw, height: r.ih, k: null };
+      try {
+        meta = await writePreview(pred.dir, stem, file, { blob: r.blob, width: r.iw, height: r.ih });
+      } catch (e) {
+        console.warn(`could not save the preview of ${stem}`, e);
+      }
+      return { blob: r.blob, meta, built: true };
+    })().finally(() => previewJobs.delete(key)));
+  }
+  return previewJobs.get(key);
+}
+
+async function savePreviewK(d) {
+  const dir = await subdir(d.pred.dir, PREVIEW_DIR);
+  const meta = dir && JSON.parse((await readText(dir, `${d.stem}.json`)) ?? "null");
+  if (meta && meta.k == null) await writeFile(dir, `${d.stem}.json`, JSON.stringify({ ...meta, k: d.k }));
+}
+
+let imageWorker = null, imageNext = 0;
+const imagePending = new Map();
+
+function imageJob(msg) {
+  if (!imageWorker) {
+    imageWorker = new Worker("image_worker.js", { type: "module" });
+    imageWorker.onmessage = ({ data }) => {
+      const p = imagePending.get(data.id);
+      imagePending.delete(data.id);
+      if (data.error) p?.reject(new Error(data.error));
+      else p?.resolve(data);
+    };
+    imageWorker.onerror = (e) => {
+      const err = new Error(e.message || "image decoder crashed (likely out of memory)");
+      for (const p of imagePending.values()) p.reject(err);
+      imagePending.clear();
+      imageWorker.terminate();
+      imageWorker = null;
+    };
+  }
+  const id = imageNext++;
+  return new Promise((resolve, reject) => {
+    imagePending.set(id, { resolve, reject });
+    imageWorker.postMessage({ ...msg, id });
+  });
+}
+
+// the next image's preview is built while this one is being edited
+function prefetchNext() {
+  const pred = rv.pred, stem = rv.stems[rv.stems.indexOf(rv.stem) + 1];
+  if (!stem || state.busy || saveJobs.some((j) => !j.end)) return;
+  (async () => {
+    const src = await findSource(pred, stem, rv.info);
+    if (src) await ensurePreview(pred, stem, src);
+  })().catch((e) => console.warn(`preparing ${stem}:`, e));
 }
 
 async function loadReview() {
@@ -1028,7 +1073,7 @@ async function labelFile(dir, stem) {
 async function findSource(pred, stem, info) {
   const d = pred.parent;
   if (!d) return null;
-  const names = [info.files[stem]?.file, ...[".tif", ".tiff", ".png", ".jpg", ".jpeg"].map((e) => stem + e)];
+  const names = [info?.files?.[stem]?.file, ...[".tif", ".tiff", ".png", ".jpg", ".jpeg"].map((e) => stem + e)];
   const tiffDir = await subdir(d, `TIFF_${d.name}`);
   const cands = [...(tiffDir ? [[tiffDir, `${stem}.tif`]] : []), ...names.filter(Boolean).map((n) => [d, n])];
   for (const [dir, name] of cands) {
@@ -1042,41 +1087,41 @@ async function findSource(pred, stem, info) {
   return null;
 }
 
-async function toJpegUrl(img) {
-  const canvas = new OffscreenCanvas(img.w, img.h), ctx = canvas.getContext("2d");
-  const im = ctx.createImageData(img.w, img.h);
-  for (let i = 0, o = 0; o < im.data.length; i += img.cn, o += 4) {
-    im.data[o] = img.px[i]; im.data[o + 1] = img.px[i + 1]; im.data[o + 2] = img.px[i + 2]; im.data[o + 3] = 255;
-  }
-  ctx.putImageData(im, 0, 0);
-  return URL.createObjectURL(await canvas.convertToBlob({ type: "image/jpeg", quality: 0.85 }));
-}
-
 async function openDoc() {
   const pred = rv.pred, stem = rv.stem;
   if (rv.doc?.pred === pred && rv.doc?.stem === stem) return updateEditor();
   const token = rv.token = {};
+  const tAll = performance.now(), laps = [];
+  let t0 = tAll;
+  const lap = (name) => { laps.push(`${name} ${ms(t0)}`); t0 = performance.now(); };
   try {
     setHeader(`Loading ${stem}...`);
     const py = ensureEditPy();
-    rv.info ??= (await py.call("run_info", [(await readText(pred.dir, "run_config.yaml")) ?? ""])).result;
-    const info = rv.info;
+    const infoP = rv.info ? Promise.resolve(rv.info) : readText(pred.dir, "run_config.yaml")
+      .then((text) => py.call("run_info", [text ?? ""]))
+      .then(({ result }) => { if (rv.pred === pred) rv.info = result; return result; });
+    infoP.catch(() => {});
     const lbl = await labelFile(pred.dir, stem);
     if (!lbl) throw new Error(`No raw or postprocessed segmentation found for ${stem} in ${pred.path}`);
-    const src = await findSource(pred, stem, info);
+    // run_config (read by the editor engine) is only needed when the source isn't <stem>.<ext>
+    const src = (await findSource(pred, stem, rv.info)) ?? (await findSource(pred, stem, await infoP));
     if (!src) throw new Error(`Source image of ${stem} not found next to ${pred.path} (.svs files need their TIFF copy)`);
-    const file = await src.getFile();
-    let img = await decode(file);
-    const iw = img.w, ih = img.h, f = Math.min(1, EDITOR_MAX_SIDE / Math.max(iw, ih));
-    const disp = f < 1 ? resize(img, Math.max(1, Math.round(iw * f)), Math.max(1, Math.round(ih * f))) : img;
-    img = null;
-    const image = await toJpegUrl(disp);
+    lap("label + source");
+    const pv = await ensurePreview(pred, stem, src);
+    lap(pv.built ? "preview built" : "preview from review_cache");
+    const info = await infoP;
+    lap("editor engine");
+    const iw = pv.meta.width, ih = pv.meta.height;
     const { polys, other } = (await py.call("read_polys", [lbl.text, JSON.stringify(info.names), iw, ih])).result;
-    if (token !== rv.token) return URL.revokeObjectURL(image);
+    lap("polygons");
+    if (token !== rv.token) return;
     if (rv.doc?.image) URL.revokeObjectURL(rv.doc.image);
-    rv.doc = { id: `${pred.path}|${stem}|${++rv.loads}`, pred, stem, src, info, iw, ih, polys, other, image,
-      version: 0, dirty: false, noop: false, message: `loaded ${lbl.kind} segmentation` };
+    rv.doc = { id: `${pred.path}|${stem}|${++rv.loads}`, pred, stem, src, info, iw, ih, k: pv.meta.k ?? null, polys,
+      other, image: URL.createObjectURL(pv.blob), version: 0, dirty: false, noop: false,
+      message: `loaded ${lbl.kind} segmentation` };
     updateEditor();
+    log(`Review ${stem}: ${laps.join(", ")}; total ${ms(tAll)}`);
+    prefetchNext();
   } catch (e) {
     console.error(e);
     $("rv-error").textContent = describeError(e);
@@ -1159,21 +1204,20 @@ async function remeasureJob(d, label, job) {
   job.started = Date.now();
   try {
     const file = await d.src.getFile();
-    let img = await decode(file);
-    if (!currentBackend) await prepareBackend();
-    const k = await rotationK(currentBackend, img);
     const um = d.info.files[d.stem]?.um_per_px || d.info.um_default || 1.0;
-    let work = img, workUm = um;
-    if (img.w * img.h > MAX_POST_MP * 1e6 && um < POST_UM_PER_PX) {
-      const s = um / POST_UM_PER_PX;
-      work = resize(img, Math.max(1, pyRound(img.w * s)), Math.max(1, pyRound(img.h * s)));
-      workUm = um * img.w / work.w;
+    // decoded off the page; the rotation comes from review_cache when the run saved it
+    const needK = d.k == null;
+    const w = await imageJob({ op: "work", file, um, maxMP: MAX_POST_MP, postUm: POST_UM_PER_PX,
+      rotSize: needK ? manifest.rotation.size : 0 });
+    if (needK) {
+      if (!currentBackend) await prepareBackend();
+      d.k = await rotationFromSquare(currentBackend, w.sq);
+      await savePreviewK(d).catch((e) => console.warn("could not save the rotation", e));
     }
-    img = null;
-    const rgb = toRGB(work), steps = await readBytes(d.pred.dir, `${d.stem}_steps.jpg`);
-    const r = await measureWorker.call("remeasure", [file.name, rgb, work.w, work.h, workUm, k, label,
+    const workUm = w.workUm, steps = await readBytes(d.pred.dir, `${d.stem}_steps.jpg`);
+    const r = await measureWorker.call("remeasure", [file.name, w.rgb, w.w, w.h, workUm, d.k, label,
       JSON.stringify(d.info.names), steps, d.info.lateral_clip_frac ?? null, file.lastModified],
-      [rgb.buffer, ...(steps ? [steps.buffer] : [])]);
+      [w.rgb.buffer, ...(steps ? [steps.buffer] : [])]);
     if (!r.result.row) {
       job.message = "labels saved; SC or Epidermis is empty, so measurements were not updated";
     } else {
@@ -1181,7 +1225,7 @@ async function remeasureJob(d, label, job) {
       await writeFile(d.pred.dir, `${d.stem}_steps.jpg`, r.files["steps.jpg"]);
       await updateRow(d.pred.dir, d.stem,
         { ...r.result.row, edited: isoNow(), processed_um_per_px: +workUm.toFixed(4) },
-        { "folder name": d.pred.parent?.name ?? "", total_tissue_um2: r.result.tissue }, d.info.columns);
+        { "folder name": d.pred.parent?.name ?? "", total_tissue_um2: r.result.tissue }, r.result.columns);
       job.message = "measurements, steps image and CSV row updated";
     }
   } catch (e) {
@@ -1416,7 +1460,7 @@ async function init() {
     const r = await fetch(jsonUrl);
     if (!r.ok) throw new Error(`model settings: HTTP ${r.status}`);
     manifest = await r.json();
-    measureWorker = new PyWorker("measurement engine");
+    measureWorker = new PyWorker("measurement engine", MEASURE_PY);
     // base_config's ROI/follicle/quality defaults, unless the user already changed a toggle
     measureWorker.ready.then((defaults) => {
       if (toggleDefaultsApplied || !defaults) return;
@@ -1441,6 +1485,7 @@ async function init() {
       models[k] = await fetchBytes(modelUrls[k], `Downloading ${key} model`);
     }
     state.modelsReady = true;
+    ensureEditPy();
     if (!state.busy) setHeader(idleHeader());
     setBusy(state.busy);
   } catch (e) {
