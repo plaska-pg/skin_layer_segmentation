@@ -309,6 +309,9 @@ function setBusy(busy) {
   $("run").disabled = busy || !state.root || !state.modelsReady;
   $("run-dlg-wait").hidden = state.modelsReady;
   $("open-run").hidden = busy || !state.root;
+  // the run writes into the current folder, so it can't change mid-run
+  $("choose-folder").disabled = busy || !window.showDirectoryPicker;
+  $("choose-folder").title = busy ? "Stop the run to choose another folder" : "";
   $("stop").hidden = !busy;
   $("status-progress").hidden = !busy;
   $("status-box").classList.toggle("busy", busy);
@@ -825,7 +828,7 @@ async function showLastRun(outs, warnings) {
 const EXAMPLE_DIR = "example/";
 // colours of measurement.CLASS_COLORS / EDJ_COLOR (BGR there) so each card matches its overlay in the image
 const VIEW_METRICS = [["SC mean height", "SC thickness", "\u00b5m", "#e8a13a"],
-  ["Epidermal mean height", "Epidermis thickness", "\u00b5m", "#1fa8c0"], ["EDJ tortuosity", "EDJ tortuosity", "", "#000000"],
+  ["Epidermal mean height", "Epidermis thickness", "\u00b5m", "#3E5191"], ["EDJ tortuosity", "EDJ tortuosity", "", "#000000"],
   ["quality", "Section quality", "/ 3"], ["num_glands", "Glands", "", "#3cc83c"]];
 const vw = { items: [], idx: 0, view: "measurement", token: 0, empty: "", live: [], liveCaption: "" };
 
@@ -849,6 +852,23 @@ async function loadExample() {
 function showExample() {
   return showViewer(state.example ?? [], { badge: "Example", example: true, empty: "Loading the example...",
     caption: "Two slides from the MDE study (Motic 40X, 0.2577 \u00b5m/px). Click the image to open it full size." });
+}
+
+// the Run viewer follows the sidebar: the selected predicted folder's results, else the example
+async function showFolderView() {
+  if (state.busy) return;
+  const p = state.pred;
+  if (!state.root || !p) {
+    await showExample();
+    if (state.root) $("vw-caption").textContent = `No results in ${state.root.name} yet, so an example is shown. ` +
+      "Press Run... to analyze this folder.";
+    return;
+  }
+  const rows = parseCsv((await readText(p.dir, "_results.csv")) ?? "").rows.filter((r) => r["file name"]);
+  if (state.busy || state.pred !== p) return;
+  const items = rows.map((row) => runItem(p.dir, p.path, row["file name"], row, row["file name"]));
+  await showViewer(items, { badge: "Results", review: true, empty: `No measurements in ${p.path} yet.`,
+    caption: `${items.length} image(s) in ${p.path}. Click the image to open it full size.` });
 }
 
 function showViewer(items, { badge, caption = "", empty = "No results to show.", select = 0, example = false,
@@ -1177,11 +1197,11 @@ async function setRoot(handle) {
     state.lastRun = null;
     $("last-warnings").replaceChildren();
     hideQueue();
-    showExample().catch(showError);
   }
   idb("readwrite", (s) => s.put(handle, "root")).catch(() => {});
   await refreshPreds();
   await refreshRunImages();
+  await showFolderView();
   renderPage();
 }
 
@@ -1782,9 +1802,17 @@ function wire() {
   $("choose-folder").addEventListener("click", chooseFolder);
   $("pred-select").addEventListener("change", (e) => {
     state.pred = state.preds[Number(e.target.value)] ?? null;
+    if (!state.busy) {
+      state.lastRun = null;
+      hideQueue();
+      showFolderView().catch(showError);
+    }
     if (state.page === "review") loadReview().catch(showError);
   });
-  $("pred-refresh").addEventListener("click", () => refreshPreds().then(renderPage).catch(showError));
+  $("pred-refresh").addEventListener("click", () => refreshPreds().then(async () => {
+    if (!state.lastRun) await showFolderView();
+    renderPage();
+  }).catch(showError));
   segControl("scope", (v) => { state.scope = v; renderRun(); });
   segControl("tta");
   for (const k of ["roi", "follicle", "quality"]) {
@@ -1854,7 +1882,7 @@ async function init() {
     $("cta-support").hidden = false;
   }
   showExample();
-  loadExample().then(() => { if (!state.busy && !state.lastRun) showExample(); })
+  loadExample().then(() => { if (!state.lastRun) return showFolderView(); })
     .catch((e) => showViewer([], { badge: "Example", empty: `The example could not be loaded (${e.message}).` }));
   // a remembered folder that still has permission skips the landing page
   try {
