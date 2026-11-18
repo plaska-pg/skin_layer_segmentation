@@ -164,6 +164,7 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 #vw-view { margin-left: auto; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: .5rem; }
 .metric { background: var(--bg2); border-radius: var(--radius); padding: .35rem .75rem; min-width: 0; }
+.metric.colored { border-left: 5px solid var(--c); background: color-mix(in srgb, var(--c) 14%, var(--bg)); }
 .metric .k { font-size: .78rem; color: var(--text-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .metric .v { font-size: 1.25rem; font-weight: 600; line-height: 1.3; white-space: nowrap; }
 .metric .v small { font-size: .8rem; font-weight: 400; color: var(--text-soft); margin-left: .2rem; }

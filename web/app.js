@@ -646,8 +646,10 @@ async function showLastRun(outs, warnings) {
 
 // ---------------------------------------------------------------- Run page viewer: the example, a live run, the last run
 const EXAMPLE_DIR = "example/";
-const VIEW_METRICS = [["SC mean height", "SC thickness", "\u00b5m"], ["Epidermal mean height", "Epidermis thickness", "\u00b5m"],
-  ["EDJ tortuosity", "EDJ tortuosity", ""], ["quality", "Section quality", "/ 3"], ["num_glands", "Glands", ""]];
+// colours of measurement.CLASS_COLORS / EDJ_COLOR (BGR there) so each card matches its overlay in the image
+const VIEW_METRICS = [["SC mean height", "SC thickness", "\u00b5m", "#e8a13a"],
+  ["Epidermal mean height", "Epidermis thickness", "\u00b5m", "#1fa8c0"], ["EDJ tortuosity", "EDJ tortuosity", "", "#000000"],
+  ["quality", "Section quality", "/ 3"], ["num_glands", "Glands", "", "#3cc83c"]];
 const vw = { items: [], idx: 0, view: "measurement", token: 0, empty: "", live: [], liveCaption: "" };
 
 // src(view) gives the item's measurement / steps image: a URL (example) or a Blob read from its predicted folder
@@ -712,9 +714,10 @@ function stepViewer(d) {
 }
 
 function renderMetrics(row) {
-  $("vw-metrics").replaceChildren(...(row ? VIEW_METRICS : []).map(([key, name, unit]) => {
+  $("vw-metrics").replaceChildren(...(row ? VIEW_METRICS : []).map(([key, name, unit, color]) => {
     const card = document.createElement("div"), k = document.createElement("div"), v = document.createElement("div");
-    card.className = "metric";
+    card.className = color ? "metric colored" : "metric";
+    if (color) card.style.setProperty("--c", color);
     card.title = key;
     k.className = "k";
     k.textContent = name;
@@ -1052,7 +1055,7 @@ function emptyInfo(el, msg) {
     b.type = "button";
     b.className = "btn primary";
     b.style.marginLeft = "1rem";
-    b.textContent = "\u{1F4C2} Analyze your images";
+    b.textContent = "Choose skin images to analyze";
     b.disabled = !window.showDirectoryPicker;
     b.addEventListener("click", chooseFolder);
     el.append(b);
