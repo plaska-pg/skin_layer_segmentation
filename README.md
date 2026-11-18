@@ -43,6 +43,13 @@ Commit, then mirror HEAD into the shared folder (give users view-only access):
 ```
 Users get it as soon as OneDrive syncs; `run_app.cmd` prints the published `VERSION` at start.
 
+### Browser version (GitHub Pages)
+
+`web/` is the same app running entirely in the browser (Chrome or Edge): models via ONNX Runtime Web (WebGPU), measuring and editing via `postprocess.py` & co. in Pyodide. Images never leave the computer; results are written into the chosen folder in the same layout as `predict.py`.
+
+- Publish: `.github/workflows/pages.yml` runs on every push to `main` (Settings > Pages > Source: **GitHub Actions**). It exports `models/` to ONNX (`web/export_onnx.py`, cached until the weights or code change) and deploys the site.
+- Local: `pip install onnx==1.23.2 onnxruntime==1.32.0 onnxscript==0.7.2`, `python web/export_onnx.py`, then `python -m http.server 8765 --bind 127.0.0.1` in the repo root and open http://127.0.0.1:8765/web/index.html.
+
 ## Run inference
 
 App (Run / Review / Results pages):

@@ -1,0 +1,67 @@
+# Browser version (web/) on GitHub Pages: exports the models in models/ to ONNX and publishes the static site.
+# Repository settings > Pages > Source must be "GitHub Actions".
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache ONNX models
+        id: onnx
+        uses: actions/cache@v4
+        with:
+          path: runs/web
+          key: onnx-${{ hashFiles('models/*.pt', 'base_config.yaml', 'config.py', 'predict.py', 'postprocess.py', 'web/export_onnx.py', 'web/obb.py', 'training/**/*.py') }}
+
+      - uses: actions/setup-python@v5
+        if: steps.onnx.outputs.cache-hit != 'true'
+        with:
+          python-version: "3.14"
+
+      - name: Export ONNX models
+        if: steps.onnx.outputs.cache-hit != 'true'
+        run: |
+          pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt onnx==1.23.2 onnxruntime==1.32.0 onnxscript==0.7.2
+          python web/export_onnx.py
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/web _site/interface _site/runs/web _site/training/semseg
+          cp web/index.html web/app.js web/style.css web/worker.js web/pipeline.py web/obb.py web/review.py _site/web/
+          cp interface/seg_editor.js _site/interface/
+          cp postprocess.py measurement.py config.py base_config.yaml _site/
+          cp training/__init__.py training/qc_sections.py _site/training/
+          cp training/semseg/__init__.py training/semseg/add_segmentations.py _site/training/semseg/
+          cp runs/web/seg.json runs/web/seg.onnx runs/web/rot.onnx runs/web/roi.onnx runs/web/follicle.onnx \
+            runs/web/quality.onnx _site/runs/web/
+          printf '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=web/index.html">\n<a href="web/index.html">Skin layer segmentation</a>\n' > _site/index.html
+          du -sh _site
+
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -53,7 +53,8 @@ import cv2
 import numpy as np
 import yaml
 
-cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # scanner TIFF tags spam warnings
+if hasattr(cv2.utils, "logging"):  # absent in the browser (Pyodide) build
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # scanner TIFF tags spam warnings
 
 EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 SOURCE_EXTS = EXTS | {".svs"}  # cv2 reads an .svs's full-resolution page, as predict.py does

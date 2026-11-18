@@ -25,13 +25,13 @@ Gland predictions are rotated and smoothed - never ROI/follicle masked or clippe
 """
 
 import os
+import sys
 import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 from scipy import ndimage as ndi
 from skimage.measure import label
 from skimage.morphology import skeletonize
@@ -40,10 +40,8 @@ from config import CONFIG, repo_path
 from measurement import (CSV_COLUMNS, SKELETON_METHOD, _distance_transform, _file_date, _layer_spine,
                          draw_gl_midline_panel, draw_spine_panel, measure_layers, overlay, skeleton_spine,
                          tissue_area_um2)
-from training.annotate_qc_boxes import ROI_CLASS, even_sections, section_quad
-from training.detection.follicle_tiles import detect_tiled, tile_scale
-from training.quality.train_qual import load_model, mode_of, predict_tiles, prepare, score_color, warp_section
-from training.rotation.rotate import build_model, pick_device, predict_orientation, rotate_k
+
+# Model code (torch, training.*) is imported where used, so this module also loads in the browser (Pyodide).
 
 # um, not raw px: native pixel size varies with scan resolution (e.g. 0.26 vs
 # 0.645 um/px), so a fixed px count means a different physical distance on
@@ -76,6 +74,8 @@ QUALITY_ENABLED = _PP_CFG.get("quality_enabled", True)
 QUALITY_WEIGHTS = repo_path(_PP_CFG.get("quality_weights", "models/qual_v2.pt"))
 QUALITY_DEVICE = _PP_CFG.get("quality_device", "auto")
 QUALITY_SECTIONS = _PP_CFG.get("quality_sections", 5)
+# Pyodide's OpenCV is ~5-30x slower than these exact replacements for large ellipse kernels
+IN_BROWSER = sys.platform == "emscripten"
 
 
 def _component_spines(mask: np.ndarray):
@@ -134,8 +134,7 @@ def lateral_clip_keep(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LA
     _, lab = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
     lut = np.zeros(int(lab.max()) + 1)
     lut[lab[ys - r0, xs - c0]] = s
-    s_img = lut[lab]
-    inside = (s_img >= frac * total) & (s_img <= (1 - frac) * total)
+    inside = ((lut >= frac * total) & (lut <= (1 - frac) * total))[lab]
     keep[r0:r1, c0:c1] = ~band[r0:r1, c0:c1] | inside
     return keep
 
@@ -143,6 +142,56 @@ def lateral_clip_keep(sc_mask: np.ndarray, gl_mask: np.ndarray, frac: float = LA
 # ----------------------------------------------------------------------------
 # morphology
 # ----------------------------------------------------------------------------
+
+def _boundary(mask: np.ndarray) -> np.ndarray:
+    """Pixels of mask with an in-frame 4-neighbour outside it."""
+    b = np.zeros_like(mask)
+    b[1:] |= mask[1:] & ~mask[:-1]
+    b[:-1] |= mask[:-1] & ~mask[1:]
+    b[:, 1:] |= mask[:, 1:] & ~mask[:, :-1]
+    b[:, :-1] |= mask[:, :-1] & ~mask[:, 1:]
+    return b
+
+
+def _stamp_dilate(mask: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """cv2.dilate(mask, kernel) for a bool mask and a kernel with one run of ones per row,
+    by stamping the kernel's row runs at boundary pixels (cost ~ boundary length, not frame area)."""
+    h, w = mask.shape
+    ay, ax = kernel.shape[0] // 2, kernel.shape[1] // 2
+    qy, qx = np.nonzero(_boundary(mask))
+    if not qy.size:
+        return mask
+    ys, x0s, x1s = [], [], []
+    for i, row in enumerate(kernel):
+        cols = np.flatnonzero(row)
+        if not cols.size:
+            continue
+        y = qy - (i - ay)
+        ok = (y >= 0) & (y < h)
+        ys.append(y[ok])
+        x0s.append(np.clip(qx[ok] - (cols[-1] - ax), 0, w))
+        x1s.append(np.clip(qx[ok] - (cols[0] - ax) + 1, 0, w))
+    y, x0, x1 = (np.concatenate(a) for a in (ys, x0s, x1s))
+    order = np.argsort(y, kind="stable")
+    y, x0, x1 = y[order], x0[order], x1[order]
+    c0, c1 = x0.min(), x1.max()
+    out = mask.copy()
+    band = 512  # rows per accumulation buffer, bounds memory on whole slides
+    for r0 in range(y[0], y[-1] + 1, band):
+        i0, i1 = np.searchsorted(y, [r0, r0 + band])
+        if i0 == i1:
+            continue
+        r1 = y[i1 - 1] + 1
+        diff = np.zeros((r1 - r0, c1 - c0 + 1), np.int32)
+        np.add.at(diff, (y[i0:i1] - r0, x0[i0:i1] - c0), 1)
+        np.add.at(diff, (y[i0:i1] - r0, x1[i0:i1] - c0), -1)
+        out[r0:r1, c0:c1] |= np.cumsum(diff, axis=1, dtype=np.int32)[:, :c1 - c0] > 0
+    return out
+
+
+def _stamp_erode(mask: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    return ~_stamp_dilate(~mask, kernel[::-1, ::-1])
+
 
 def kernel_px(size_um: float, um_per_px: float) -> int:
     """Kernel diameter in native px (forced odd); <= 1 means no-op."""
@@ -155,6 +204,9 @@ def erode_dilate(mask: np.ndarray, size_px: int) -> np.ndarray:
     if size_px <= 1 or not mask.any():
         return mask
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size_px, size_px))
+    if IN_BROWSER:
+        out = _stamp_dilate(_stamp_erode(mask.astype(bool), kernel), kernel)
+        return _stamp_erode(_stamp_dilate(out, kernel), kernel)
     out = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
     return cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel).astype(bool)
 
@@ -167,7 +219,8 @@ def keep_touching_components(sc: np.ndarray, gl: np.ndarray, gap_px: int):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
     def _filter(mask, other):
-        near = cv2.dilate(other.astype(np.uint8), kernel).astype(bool)
+        near = (_stamp_dilate(other.astype(bool), kernel) if IN_BROWSER
+                else cv2.dilate(other.astype(np.uint8), kernel).astype(bool))
         _, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
         hit = np.unique(labels[near & mask])
         return np.isin(labels, hit[hit > 0])
@@ -182,12 +235,19 @@ def keep_touching_components(sc: np.ndarray, gl: np.ndarray, gap_px: int):
 _rotation_model_cache = {}
 
 
+def rotate_k(img, k):
+    """Rotate img by k*90 degrees clockwise (same as training.rotation.rotate.rotate_k, which needs torch)."""
+    return np.ascontiguousarray(np.rot90(img, k=-k))
+
+
 def _get_rotation_model(weights_path: str = ROTATION_WEIGHTS, device_str: str = ROTATION_DEVICE):
     """Lazily loads+caches the rotate.py orientation classifier (one entry
     per distinct weights/device combo) so repeated process_image calls don't
     reload it from disk each time."""
     key = (weights_path, device_str)
     if key not in _rotation_model_cache:
+        import torch
+        from training.rotation.rotate import build_model, pick_device
         device = pick_device(device_str)
         ckpt = torch.load(weights_path, map_location=device)
         model = build_model(ckpt["backbone"], pretrained=False).to(device)
@@ -197,13 +257,15 @@ def _get_rotation_model(weights_path: str = ROTATION_WEIGHTS, device_str: str = 
     return _rotation_model_cache[key]
 
 
-def rotate_to_canonical(img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarray):
+def rotate_to_canonical(img: np.ndarray, sc_mask: np.ndarray, gl_mask: np.ndarray, k: int = None):
     """Uses the trained rotate.py classifier to predict how far img was
     rotated from its upright orientation, then applies the same inverse
-    quarter-turn correction rotate.py's own predict() uses."""
-    model, device, size = _get_rotation_model()
-    k_pred = predict_orientation(model, img, size, device)
-    k = (4 - k_pred) % 4
+    quarter-turn correction rotate.py's own predict() uses. A given `k`
+    (the correction, e.g. predicted in the browser) skips the classifier."""
+    if k is None:
+        from training.rotation.rotate import predict_orientation
+        model, device, size = _get_rotation_model()
+        k = (4 - predict_orientation(model, img, size, device)) % 4
     return rotate_k(img, k), rotate_k(sc_mask, k), rotate_k(gl_mask, k), k
 
 
@@ -228,6 +290,7 @@ def _get_obb_model(weights_path: str, device_str: str, name: str):
         else:
             try:
                 from ultralytics import YOLO
+                from training.rotation.rotate import pick_device
                 model = (YOLO(weights_path), str(pick_device(device_str)))
             except ImportError:
                 print(f"WARNING: ultralytics not installed; skipping {name} detection", flush=True)
@@ -261,6 +324,7 @@ def detect_follicles(img_bgr: np.ndarray, um_per_px: float, weights_path: str, d
         if loaded is None:
             return None
         model, device = loaded
+        from training.detection.follicle_tiles import detect_tiled, tile_scale
         scale = tile_scale(model)
         if scale:
             return detect_tiled(model, img_bgr, um_per_px, scale, conf, device)
@@ -349,6 +413,8 @@ def _get_quality_model(weights_path: str, device_str: str):
         if not Path(weights_path).exists():
             print(f"WARNING: quality weights not found at {weights_path}; skipping quality scoring", flush=True)
         else:
+            from training.quality.train_qual import load_model
+            from training.rotation.rotate import pick_device
             device = pick_device(device_str)
             model, ckpt = load_model(weights_path, device)
             loaded = (model, ckpt, device)
@@ -360,26 +426,23 @@ def score_sections(img_bgr: np.ndarray, rois, n_sections: int, weights_path: str
     """Splits each ROI quad into n_sections even sections along its long axis and
     scores each (expected rating, 1 worst - 3 best). Returns (scores, quads) with
     quads in img_bgr's pixel coordinates, or None if no quality model is available."""
+    from training.qc_sections import mode_of, section_tiles
+    from training.quality.train_qual import predict_tiles
     with _quality_lock:
         loaded = _get_quality_model(weights_path, device_str)
         if loaded is None:
             return None
         model, ckpt, device = loaded
         # same downscale as annotate_boxes.load_scaled, which built the training crops
-        h, w = img_bgr.shape[:2]
-        f = min(1.0, ckpt["max_side"] / max(h, w))
-        small = cv2.resize(img_bgr, (round(w * f), round(h * f)), interpolation=cv2.INTER_AREA) if f < 1 else img_bgr
-        src = prepare(small, mode_of(ckpt))
-        cuts = even_sections(n_sections)["cuts"]
-        quads = [section_quad([ROI_CLASS, *np.asarray(quad, np.float32).ravel()], cuts[k], cuts[k + 1])
-                 for quad, _ in rois for k in range(n_sections)]
-        tiles = [warp_section(src, q * f, ckpt["imgsz"], letterbox=ckpt.get("letterbox", True)) for q in quads]
+        tiles, quads = section_tiles(img_bgr, rois, n_sections, ckpt["max_side"], ckpt["imgsz"], mode_of(ckpt),
+                                     ckpt.get("letterbox", True))
         scores, _, _ = predict_tiles(model, tiles, device)
     return scores, quads
 
 
 def draw_quality_panel(img: np.ndarray, scores, quads) -> np.ndarray:
     """Sections filled red (1) -> yellow (2) -> green (3) by score, outlined and labelled."""
+    from training.qc_sections import score_color
     fill = img.copy()
     for s, q in zip(scores, quads):
         cv2.fillPoly(fill, [np.round(q).astype(np.int32).reshape(-1, 1, 2)], score_color(s))
@@ -409,15 +472,19 @@ def _label_panel(img: np.ndarray, text: str, bar_h: int = 28) -> np.ndarray:
     return np.vstack([bar, img])
 
 
+def _fit_height(panel: np.ndarray, target_h: int = 480) -> np.ndarray:
+    h, w = panel.shape[:2]
+    if h == target_h:
+        return panel
+    return cv2.resize(panel, (max(1, int(round(w * target_h / h))), target_h))
+
+
 def make_composite(panels, target_h: int = 480) -> np.ndarray:
     """panels: list of (label, image_bgr). Resized to a common height and
     stacked horizontally with a caption bar above each."""
     labeled = []
     for name, panel in panels:
-        h, w = panel.shape[:2]
-        scale = target_h / h
-        resized = cv2.resize(panel, (max(1, int(round(w * scale))), target_h))
-        labeled.append(_label_panel(resized, name))
+        labeled.append(_label_panel(_fit_height(panel, target_h), name))
     max_h = max(p.shape[0] for p in labeled)
     labeled = [cv2.copyMakeBorder(p, 0, max_h - p.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255))
                for p in labeled]
@@ -538,17 +605,17 @@ def measure_rotated(rot_img: np.ndarray, rot_sc: np.ndarray, rot_gl: np.ndarray,
 
 
 def remeasure_labels(orig_bgr: np.ndarray, label_mask: np.ndarray, class_index: dict, um_per_px: float,
-                     lateral_clip_frac: float = LATERAL_CLIP_FRAC, source_path: Path = None):
+                     lateral_clip_frac: float = LATERAL_CLIP_FRAC, source_path: Path = None, k: int = None):
     """Measures user-edited segmentations as they are: no ROI / follicle masking or morphology.
-    `label_mask` holds class_index values. Returns (row_extra, measurement_panel, corrected_overlay),
-    or None if SC or Epidermis is empty."""
+    `label_mask` holds class_index values; `k` = known rotation correction (else predicted).
+    Returns (row_extra, measurement_panel, corrected_overlay), or None if SC or Epidermis is empty."""
     sc_id = class_index["SC"]
     gl_id = class_index.get("Epidermis", class_index.get("Epidermal", class_index.get("Granular Layer")))
     gland_id = class_index.get("gland", class_index.get("glands"))
     sc, gl = label_mask == sc_id, label_mask == gl_id
     if not sc.any() or not gl.any():
         return None
-    rot_img, rot_sc, rot_gl, k = rotate_to_canonical(orig_bgr, sc, gl)
+    rot_img, rot_sc, rot_gl, k = rotate_to_canonical(orig_bgr, sc, gl, k)
     rot_gland = rotate_k(label_mask == gland_id, k) if gland_id is not None else None
     keep = np.ones(rot_img.shape[:2], bool)
     row_extra, measurement_panel, _ = measure_rotated(rot_img, rot_sc, rot_gl, rot_gland, keep, um_per_px,
@@ -602,10 +669,13 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
     # Preserve raw-frame QA, but rotate the complete prediction before any
     # ROI selection so all downstream postprocessing uses the canonical orientation.
     rot_img, rot_sc_full, rot_gl_full, k = rotate_to_canonical(
-        orig_bgr, pred_mask == sc_id, pred_mask == gl_id)
+        orig_bgr, pred_mask == sc_id, pred_mask == gl_id, settings.get("rotation_k"))
     rot_gland = rotate_k(gland_full, k)
     log(f"rotated {k * 90} deg")
-    raw_overlay = overlay(orig_bgr, {"SC": pred_mask == sc_id, "Epidermal": pred_mask == gl_id, "gland": gland_full})
+    # steps panels are shrunk to the composite height as soon as they are drawn (same resize make_composite
+    # would do), so full-resolution copies don't pile up in memory
+    raw_overlay = _fit_height(overlay(orig_bgr, {"SC": pred_mask == sc_id, "Epidermal": pred_mask == gl_id,
+                                                 "gland": gland_full}))
     rotated_overlay = overlay(rot_img, {"SC": rot_sc_full, "Epidermal": rot_gl_full, "gland": rot_gland})
     log("raw + rotated overlays")
     rot_gland = erode_dilate(rot_gland, kernel_px(gland_kernel_um, um_per_px))
@@ -613,7 +683,8 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
 
     follicles = None
     if follicle_enabled:
-        follicles = detect_follicles(
+        # precomputed detections (the browser runs the detectors itself) take precedence
+        follicles = settings["follicles"] if "follicles" in settings else detect_follicles(
             rot_img, um_per_px,
             weights_path=settings.get("follicle_weights", FOLLICLE_WEIGHTS),
             device_str=settings.get("follicle_device", FOLLICLE_DEVICE),
@@ -625,12 +696,12 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
                          for quad, confidence in follicles]
     fol_removed = follicle_mask(rot_img.shape, follicles, follicle_mask_frac)
     follicle_panels = [] if follicles is None else [
-        (f"Follicles ({len(follicles)})", draw_obb_panel(rotated_overlay, follicles, fol_removed))]
+        (f"Follicles ({len(follicles)})", _fit_height(draw_obb_panel(rotated_overlay, follicles, fol_removed)))]
     log("follicles: " + ("disabled/skipped" if follicles is None else f"{len(follicles)} detected"))
 
     rois = None
     if roi_enabled:
-        rois = detect_obb(
+        rois = settings["rois"] if "rois" in settings else detect_obb(
             rot_img,
             weights_path=settings.get("roi_weights", ROI_WEIGHTS),
             device_str=settings.get("roi_device", ROI_DEVICE),
@@ -638,21 +709,23 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
             max_side=settings.get("roi_max_side", ROI_MAX_SIDE),
             imgsz=settings.get("roi_imgsz", ROI_IMGSZ), name="ROI")
     roi_panels = [] if rois is None else [
-        (f"ROI Boxes ({len(rois)})", draw_obb_panel(rotated_overlay, rois, color=(255, 0, 255)))]
+        (f"ROI Boxes ({len(rois)})", _fit_height(draw_obb_panel(rotated_overlay, rois, color=(255, 0, 255))))]
+    rotated_overlay = _fit_height(rotated_overlay)
     log("ROI: " + ("disabled/skipped" if rois is None else f"{len(rois)} boxes"))
     quality = ""
     # rois is None when detection didn't run (disabled / no weights) -> leave blank
     if rois == [] and quality_enabled:
         quality = 0
     if rois and quality_enabled:
-        scored = score_sections(
+        # precomputed (scores, quads) from the browser take precedence
+        scored = settings["quality"] if "quality" in settings else score_sections(
             rot_img, rois,
             n_sections=settings.get("quality_sections", QUALITY_SECTIONS),
             weights_path=settings.get("quality_weights", QUALITY_WEIGHTS),
             device_str=settings.get("quality_device", QUALITY_DEVICE))
         if scored is not None:
             quality = round(float(np.mean(scored[0])), 3)
-            roi_panels.append((f"Quality ({quality:.2f})", draw_quality_panel(rot_img, *scored)))
+            roi_panels.append((f"Quality ({quality:.2f})", _fit_height(draw_quality_panel(rot_img, *scored))))
         log(f"quality: {quality}")
     if rois:
         keep = roi_mask(rot_img.shape, rois)
@@ -675,14 +748,15 @@ def process_image(stem: str, folder_name: str, orig_bgr: np.ndarray, pred_mask: 
         return (None, None) if return_visuals else None
     log(f"kept SC {int(rot_sc.sum())} px, Epidermis {int(rot_gl.sum())} px")
 
-    roi_overlay = overlay(rot_img, {"SC": rot_sc, "Epidermal": rot_gl, "gland": rot_gland})
+    roi_overlay = _fit_height(overlay(rot_img, {"SC": rot_sc, "Epidermal": rot_gl, "gland": rot_gland}))
 
-    midline_panel = draw_gl_midline_panel(rot_img, rot_sc, rot_gl)
+    midline_panel = _fit_height(draw_gl_midline_panel(rot_img, rot_sc, rot_gl))
     log("ROI overlay + midline panel")
 
     row_extra, measurement_panel, spine_panel = measure_rotated(
         rot_img, rot_sc, rot_gl, rot_gland if gland_id is not None else None, keep, um_per_px,
         lateral_clip_frac, source_path, log=log)
+    spine_panel = _fit_height(spine_panel)
 
     composite = make_composite([
         ("Original", orig_bgr),

@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Skin segmentation</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.js"
+          integrity="sha384-vdDj+w5K0qlH8UgWJk1y/VQKvheIizpzLGonwCzeCc+ch0GiyjYbnJQvPvRKkbxn"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js"
+          integrity="sha384-RyBmXHdfZ/Uon+ud+/AqSyWpUWnKYt2tkRG/P4gWoRUGDU+qIAV3tGBPNlYTBZEF"
+          crossorigin="anonymous"></script>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <h1>Skin segmentation</h1>
+    <div class="field">
+      <span class="label" title="Folder of images. Results go to predicted_* folders inside it, and Review and Results read them from there.">Working folder</span>
+      <input type="text" id="folder-name" readonly placeholder="No folder chosen">
+    </div>
+    <button class="btn wide" id="choose-folder" type="button">Browse...</button>
+    <button class="btn wide" id="reopen-folder" type="button" hidden style="margin-top:.5rem"></button>
+    <p class="caption" id="folder-support" hidden>Choosing a folder needs Chrome or Edge.</p>
+    <div class="field" style="margin-top:1.25rem">
+      <span class="label" title="Output folder opened on the Review page.">Predicted folder</span>
+      <div class="row">
+        <select id="pred-select" class="grow"><option value="">None yet</option></select>
+        <button class="btn" id="pred-refresh" type="button" title="Look for new predicted folders">&#x21bb;</button>
+      </div>
+    </div>
+    <p class="caption">Runs on this computer in the browser; images are not uploaded.</p>
+  </aside>
+  <div class="content">
+    <header>
+      <a href="#run" data-page="run">&#x25B6; Run</a>
+      <a href="#review" data-page="review">&#x2611; Review</a>
+      <a href="#results" data-page="results">&#x25A6; Results</a>
+    </header>
+    <main>
+      <div class="caption" id="header-status">Loading models...</div>
+
+      <section id="page-run" data-page="run">
+        <div class="info" id="run-nofolder">Choose a working folder in the sidebar.</div>
+        <div id="run-body" hidden>
+          <div class="field">
+            <span class="label">Process</span>
+            <div class="seg" id="scope">
+              <button type="button" data-v="folder" class="on">This folder</button>
+              <button type="button" data-v="subfolders">Include subfolders</button>
+              <button type="button" data-v="one">One image</button>
+            </div>
+          </div>
+          <div class="field" id="image-field" hidden>
+            <label for="run-image">Image</label>
+            <select id="run-image"></select>
+          </div>
+          <h3>Settings</h3>
+          <div class="cols2">
+            <div>
+              <div class="field">
+                <label for="scanner" title="Sets the image resolution (µm per pixel).">Scanner</label>
+                <select id="scanner"></select>
+              </div>
+              <div class="field" id="mpp-field" hidden>
+                <label for="mpp">µm per pixel</label>
+                <input type="number" id="mpp" step="any" min="0.01">
+              </div>
+              <div class="field">
+                <span class="label" title="Average predictions over flipped / rotated copies (4x or 8x slower).">Test-time augmentation</span>
+                <div class="seg" id="tta">
+                  <button type="button" data-v="none" class="on">none</button>
+                  <button type="button" data-v="flip">flip</button>
+                  <button type="button" data-v="d4">d4</button>
+                </div>
+              </div>
+            </div>
+            <div>
+              <label class="switch"><input type="checkbox" id="opt-roi" checked> Detect ROI (drop SC/Epidermis outside it)</label>
+              <label class="switch"><input type="checkbox" id="opt-follicle" checked> Detect and mask follicles</label>
+              <label class="switch"><input type="checkbox" id="opt-quality" checked> Score section quality</label>
+            </div>
+          </div>
+          <details class="expander">
+            <summary>Advanced settings</summary>
+            <div>
+              <div class="cols2">
+                <div class="field">
+                  <label for="backend">Compute</label>
+                  <select id="backend">
+                    <option value="webgpu">GPU (WebGPU)</option>
+                    <option value="wasm">CPU (WebAssembly)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="limit">Limit images per folder (0 = all)</label>
+                  <input type="number" id="limit" min="0" step="1" value="0">
+                </div>
+              </div>
+              <label class="check"><input type="checkbox" id="resume" checked> Resume (reuse already-processed images)</label>
+              <p class="caption">Results go to predicted_&lt;folder&gt; inside each image folder (predicted_&lt;image&gt; for one image).
+                Images over 45 MP are measured at 0.4 µm/px to fit in browser memory.</p>
+            </div>
+          </details>
+          <button class="btn primary" id="run" type="button" disabled>&#x25B6; Run</button>
+
+          <div id="run-progress" hidden>
+            <p class="caption" id="run-caption"></p>
+            <button class="btn" id="stop" type="button">&#x25A0; Stop after this image</button>
+            <div class="caption" id="progress-text" style="margin-top:.75rem"></div>
+            <div class="progress"><div id="progress-bar"></div></div>
+            <canvas class="preview" id="run-preview" hidden></canvas>
+            <img class="preview" id="run-latest" alt="Latest measurement" hidden>
+            <details class="expander"><summary>Log</summary><div><pre class="log" id="log"></pre></div></details>
+          </div>
+
+          <div id="last-run" hidden>
+            <hr>
+            <div class="row" style="align-items:center">
+              <h3 class="grow" style="margin:0">Last run</h3>
+              <button class="btn primary" id="review-last" type="button">&#x2611; Review results</button>
+            </div>
+            <div id="last-warnings"></div>
+            <img class="preview" id="last-image" alt="Latest measurement" hidden>
+            <div class="table-wrap" id="last-table"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-review" data-page="review" hidden>
+        <div class="info" id="review-empty"></div>
+        <div id="review-body" hidden>
+          <div class="cols-3-2">
+            <div class="field">
+              <label for="rv-image">Image</label>
+              <select id="rv-image"></select>
+            </div>
+            <div class="field">
+              <span class="label">View</span>
+              <div class="seg" id="rv-view">
+                <button type="button" data-v="edit" class="on">Edit</button>
+                <button type="button" data-v="measurement">Measurement</button>
+                <button type="button" data-v="steps">Steps</button>
+              </div>
+            </div>
+          </div>
+          <div id="rv-error" class="warn" hidden></div>
+          <div id="rv-editor">
+            <div class="seg-ed" tabindex="0">
+              <div class="top"><div class="bar"></div><div class="status"></div></div>
+              <div class="hint"></div>
+              <canvas></canvas>
+            </div>
+          </div>
+          <div id="rv-image-view" hidden>
+            <div class="imgnav">
+              <button class="btn" id="rv-prev" type="button" title="Previous image">&#x2039;</button>
+              <span class="caption" id="rv-pos"></span>
+              <button class="btn" id="rv-next" type="button" title="Next image">&#x203A;</button>
+            </div>
+            <p class="caption" id="rv-steps-note" hidden>Postprocessing steps. Each save appends your corrected segmentation as a new pane.</p>
+            <img class="preview" id="rv-img" alt="">
+            <div class="info" id="rv-img-missing" hidden></div>
+          </div>
+          <details class="expander">
+            <summary>All values</summary>
+            <div><div class="table-wrap" id="rv-values"></div></div>
+          </details>
+        </div>
+      </section>
+
+      <section id="page-results" data-page="results" hidden>
+        <button class="btn" id="results-refresh" type="button">&#x21bb; Refresh</button>
+        <div class="info" id="results-empty" style="margin-top:1rem" hidden></div>
+        <div id="results-body" hidden>
+          <div class="cols2" style="margin-top:1rem">
+            <div class="field"><span class="label">Folders</span><details class="multi" id="res-folders"><summary>All folders</summary><div></div></details></div>
+            <div class="field"><span class="label">More columns</span><details class="multi" id="res-columns"><summary>Add columns</summary><div></div></details></div>
+          </div>
+          <p class="caption" id="res-caption"></p>
+          <div class="table-wrap" id="res-table"></div>
+          <div class="row" style="margin-top:.75rem">
+            <button class="btn primary" id="res-open" type="button" hidden></button>
+            <button class="btn" id="res-download" type="button">&#x2B73; Download combined CSV</button>
+          </div>
+          <div id="res-by-folder" hidden>
+            <h3>By folder</h3>
+            <div class="field" style="max-width:24rem"><label for="res-metric">Metric</label><select id="res-metric"></select></div>
+            <div class="bars" id="res-bars"></div>
+            <div class="table-wrap" id="res-stats"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+</body>
+</html>

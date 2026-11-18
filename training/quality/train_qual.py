@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for r
 from training.annotate_qc_boxes import (CSV_HEADER, RATING_COLORS, ROI_CLASS, even_sections,  # noqa: E402
                                      list_images, load_excluded, load_scaled, section_quad, slide_key)
 from training.config_utils import apply_config  # noqa: E402
+from training.qc_sections import mode_of, prepare, score_color, to_gray, warp_section  # noqa: E402,F401
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -56,28 +57,6 @@ QUAD_COLS = CSV_HEADER[2:]
 
 
 # ---------------------------------------------------------------------------- data
-def warp_section(img, quad, size, jitter=0.0, rng=None, letterbox=False):
-    """Section quad (top-left, top-right, bottom-right, bottom-left) -> upright size x size BGR tile."""
-    q = np.asarray(quad, np.float32)
-    w = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
-    h = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
-    if jitter:
-        q = q + rng.uniform(-jitter, jitter, (4, 2)).astype(np.float32) * min(w, h)
-    if not letterbox:
-        m = cv2.getPerspectiveTransform(q, np.float32([[0, 0], [size, 0], [size, size], [0, size]]))
-        # replicate edges so no fill colour is invented where a jittered quad leaves the image
-        return cv2.warpPerspective(img, m, (size, size), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    # letterbox on white: only for checkpoints trained before stretching
-    s = size / max(w, h, 1.0)
-    dw, dh = max(1, round(w * s)), max(1, round(h * s))
-    m = cv2.getPerspectiveTransform(q, np.float32([[0, 0], [dw, 0], [dw, dh], [0, dh]]))
-    tile = np.full((size, size, 3), 255, np.uint8)
-    x0, y0 = (size - dw) // 2, (size - dh) // 2
-    tile[y0:y0 + dh, x0:x0 + dw] = cv2.warpPerspective(img, m, (dw, dh), flags=cv2.INTER_LINEAR,
-                                                       borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    return tile
-
-
 def augment(tile, rng, hsv_h=0.011, hsv_s=0.3, hsv_v=0.2, blur_p=0.2):
     """Flips, then hue shift +/- hsv_h (fraction of the hue circle), saturation / brightness x (1 +/- hsv_s / hsv_v)."""
     if rng.random() < 0.5:
@@ -97,19 +76,6 @@ def augment(tile, rng, hsv_h=0.011, hsv_s=0.3, hsv_v=0.2, blur_p=0.2):
 def to_tensor(tiles):
     x = np.stack([cv2.cvtColor(np.ascontiguousarray(t), cv2.COLOR_BGR2RGB) for t in tiles]).astype(np.float32) / 255
     return torch.from_numpy(np.ascontiguousarray(((x - MEAN) / STD).transpose(0, 3, 1, 2)))
-
-
-def to_gray(img):
-    # kept as 3 identical channels so the ImageNet-pretrained first layer still applies
-    return cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-
-
-def prepare(img, mode):
-    return to_gray(img) if mode == "gray" else img
-
-
-def mode_of(ckpt):
-    return ckpt.get("mode") or ("gray" if ckpt.get("gray") else "color")
 
 
 def load_rated(a):
@@ -473,14 +439,6 @@ def detect_rois(a, paths, out: Path, cache):
         w.writerow(["image", "class", *QUAD_COLS, "conf"])
         w.writerows(rows)
     return path
-
-
-def score_color(score):
-    """Piecewise-linear BGR colour from rating 1 (red) through 2 (yellow) to 3 (green)."""
-    t = float(np.clip(score, 1, 3))
-    lo = min(int(t), 2)
-    c0, c1 = np.array(RATING_COLORS[lo], np.float32), np.array(RATING_COLORS[lo + 1], np.float32)
-    return tuple(int(v) for v in c0 + (c1 - c0) * (t - lo))
 
 
 def cmd_predict(a):

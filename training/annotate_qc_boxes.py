@@ -69,6 +69,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root, for running this file as a script
 from training.detection.follicle_tiles import (TILE_OVERLAP, clip_quad, has_tissue, iter_tiles, load_calibration,
                                                resize)
+from training.qc_sections import (RATING_COLORS, ROI_CLASS, divider_seg, even_sections, quad_pts,  # noqa: F401
+                                  roi_axis, section_quad)
 
 Image.MAX_IMAGE_PIXELS = None  # slides exceed PIL's decompression-bomb limit; only headers are read
 cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)  # scanner TIFF tags spam warnings
@@ -84,8 +86,6 @@ KEY_LEFT, KEY_RIGHT, CTRL_Z = 2424832, 2555904, 26  # cv2.waitKeyEx codes on Win
 KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN = 2490368, 2621440, 2162688, 2228224
 MENU_W, ROW = 520, 22  # image dropdown width and row height (display px)
 GRAB = 10  # display px within which a click grabs a box corner
-ROI_CLASS = "roi"
-RATING_COLORS = {1: (0, 0, 255), 2: (0, 220, 255), 3: (0, 200, 0)}  # BGR: red, yellow, green
 MIN_GAP = 0.02  # smallest section length as a fraction of the ROI length
 
 
@@ -201,39 +201,9 @@ def merge_annotations(a):
     print(f"{len(excluded)} images excluded -> {exclude}: {excluded}")
 
 
-def quad_pts(box):
-    return np.array(box[1:9], np.float32).reshape(4, 2)
-
-
 def obb_line(box, cls_id, w, h):
     return f"{cls_id} " + " ".join(
         f"{min(max(px / w, 0), 1):.6f} {min(max(py / h, 0), 1):.6f}" for px, py in quad_pts(box)) + "\n"
-
-
-def roi_axis(box):
-    """(a0, a1, b0, b1): the two long edges, both running from the left (or top, if vertical) end;
-    edge b lies clockwise of edge a, so crops are never mirrored."""
-    q = quad_pts(box)
-    e = [np.linalg.norm(q[(k + 1) % 4] - q[k]) for k in range(4)]
-    a0, a1, b0, b1 = (q[0], q[1], q[3], q[2]) if e[0] + e[2] >= e[1] + e[3] else (q[1], q[2], q[0], q[3])
-    axis = (a1 + b1) - (a0 + b0)
-    if axis[0 if abs(axis[0]) >= abs(axis[1]) else 1] < 0:
-        a0, a1, b0, b1 = a1, a0, b1, b0
-    d, v = a1 - a0, b0 - a0
-    if d[0] * v[1] - d[1] * v[0] < 0:
-        a0, a1, b0, b1 = b0, b1, a0, a1
-    return a0, a1, b0, b1
-
-
-def divider_seg(box, t):
-    a0, a1, b0, b1 = roi_axis(box)
-    return a0 + (a1 - a0) * t, b0 + (b1 - b0) * t
-
-
-def section_quad(box, ta, tb):
-    """Section corners ordered top-left, top-right, bottom-right, bottom-left in the ROI's frame."""
-    (p0, q0), (p1, q1) = divider_seg(box, ta), divider_seg(box, tb)
-    return np.array([p0, p1, q1, q0], np.float32)
 
 
 def axis_t(box, ix, iy):
@@ -247,10 +217,6 @@ def seg_dist(p, a, b):
     ab = b - a
     t = np.clip(np.dot(p - a, ab) / max(float(np.dot(ab, ab)), 1e-9), 0, 1)
     return float(np.linalg.norm(p - (a + t * ab)))
-
-
-def even_sections(n):
-    return {"cuts": [k / n for k in range(n + 1)], "ratings": [None] * n}
 
 
 def load_sections(path: Path):
