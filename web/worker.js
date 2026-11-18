@@ -38,7 +38,9 @@ async function importVerified(url, sri) {
   }
 }
 
-async function init({ files, packages, modules }) {
+async function init({ version, files, packages, modules }) {
+  if (version !== (new URL(import.meta.url).searchParams.get("v") ?? ""))
+    throw new Error("the app was updated while this page was open: reload the page (Ctrl+Shift+R)");
   const { loadPyodide } = await importVerified(PYODIDE_URL + "pyodide.mjs", PYODIDE_SRI);
   py = await loadPyodide({ indexURL: PYODIDE_URL });
   py.setStdout({ batched: (line) => postMessage({ type: "log", line }) });

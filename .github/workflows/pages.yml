@@ -52,6 +52,7 @@ jobs:
           cp training/semseg/__init__.py training/semseg/add_segmentations.py _site/training/semseg/
           cp runs/web/seg.json runs/web/seg.onnx runs/web/rot.onnx runs/web/roi.onnx runs/web/follicle.onnx \
             runs/web/quality.onnx _site/runs/web/
+          sed -i "s/?v=dev/?v=${GITHUB_SHA::8}/g" _site/web/*.js _site/web/index.html
           printf '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=web/index.html">\n<a href="web/index.html">Skin layer segmentation</a>\n' > _site/index.html
           du -sh _site
 

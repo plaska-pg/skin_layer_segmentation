@@ -2,9 +2,11 @@
 // Segmentation: port of predict.predict_mask (resize to the model's um/px, overlapping tiles cross-faded with a
 // linear ramp, bilinear upsampling of probabilities, argmax). Measuring and the Review editor's merge / cut /
 // re-measure run postprocess.py & co. in Pyodide workers (worker.js); the editor is interface/seg_editor.js.
-import mountEditor from "../interface/seg_editor.js";
-import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js";
+import mountEditor from "../interface/seg_editor.js?v=dev";
+import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js?v=dev";
 
+// ?v=<commit> on every app file (set by the Pages build) keeps cached files from different deploys apart
+const VERSION = new URL(import.meta.url).searchParams.get("v") ?? "";
 const { ort } = window;
 const $ = (id) => document.getElementById(id);
 const COLORS = [null, [230, 80, 60], [60, 170, 90], [70, 110, 230]];
@@ -662,13 +664,13 @@ class PyWorker {
     this.pending = new Map();
     this.next = 0;
     this.onLog = null;
-    const w = this.worker = new Worker("worker.js", { type: "module" });
+    const w = this.worker = new Worker(`worker.js?v=${VERSION}`, { type: "module" });
     this.ready = new Promise((resolve, reject) => { this.readyCb = { resolve, reject }; });
     this.ready.catch(() => {});
     w.onmessage = ({ data }) => this.message(data);
     w.onerror = (e) => this.fail(new Error(e.message || `${this.name} crashed (likely out of memory)`));
     const { files, packages, modules } = this.profile;
-    w.postMessage({ type: "init", packages, modules,
+    w.postMessage({ type: "init", version: VERSION, packages, modules,
       files: Object.fromEntries(Object.entries(files).map(([n, p]) => [n, sameOrigin(p).href])) });
   }
 
@@ -971,7 +973,7 @@ const imagePending = new Map();
 
 function imageJob(msg) {
   if (!imageWorker) {
-    imageWorker = new Worker("image_worker.js", { type: "module" });
+    imageWorker = new Worker(`image_worker.js?v=${VERSION}`, { type: "module" });
     imageWorker.onmessage = ({ data }) => {
       const p = imagePending.get(data.id);
       imagePending.delete(data.id);

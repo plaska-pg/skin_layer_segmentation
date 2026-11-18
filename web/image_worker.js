@@ -1,5 +1,5 @@
 // Decodes source images off the page's main thread: Review previews and re-measure inputs.
-import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js";
+import { decode, previewJpeg, pyRound, resize, toRGB } from "./imaging.js?v=dev";
 
 const UTIF_URL = "https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js";
 const UTIF_SRI = "sha384-RyBmXHdfZ/Uon+ud+/AqSyWpUWnKYt2tkRG/P4gWoRUGDU+qIAV3tGBPNlYTBZEF";
