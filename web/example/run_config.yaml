@@ -1,0 +1,25 @@
+{
+ "run": {
+  "model_class_names": [
+   "SC",
+   "Epidermis",
+   "gland"
+  ]
+ },
+ "parameters": {
+  "um_per_px": 0.2577
+ },
+ "resolved": {
+  "lateral_clip_frac": 0.05,
+  "input_files": [
+   {
+    "file": "mde101f.svs.tif",
+    "um_per_px": 0.2577
+   },
+   {
+    "file": "mde103f.svs.tif",
+    "um_per_px": 0.2577
+   }
+  ]
+ }
+}

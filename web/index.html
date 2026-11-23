@@ -19,9 +19,11 @@
     <h1>Skin segmentation</h1>
     <div class="field">
       <span class="label" title="Folder of images. Results go to predicted_* folders inside it, and Review and Results read them from there.">Working folder</span>
-      <input type="text" id="folder-name" readonly placeholder="No folder chosen">
+      <div class="row">
+        <input type="text" id="folder-name" class="grow" readonly placeholder="No folder chosen">
+        <button class="btn" id="choose-folder" type="button">Browse...</button>
+      </div>
     </div>
-    <button class="btn wide" id="choose-folder" type="button">Browse...</button>
     <p class="caption" id="folder-support" hidden>Choosing a folder needs Chrome or Edge.</p>
     <div class="field" style="margin-top:1.25rem">
       <span class="label" title="Output folder opened on the Review page.">Predicted folder</span>
@@ -108,6 +110,7 @@
       <section id="page-review" data-page="review" hidden>
         <div class="info" id="review-empty"></div>
         <div id="review-body" hidden>
+          <div class="info rv-example-note" id="rv-example-note" hidden></div>
           <div class="cols-3-2">
             <div class="field">
               <label for="rv-image">Image</label>
@@ -151,6 +154,7 @@
         <button class="btn" id="results-refresh" type="button">&#x21bb; Refresh</button>
         <div class="info" id="results-empty" style="margin-top:1rem" hidden></div>
         <div id="results-body" hidden>
+          <div class="info rv-example-note" id="res-example-note" style="margin-top:1rem" hidden></div>
           <div class="cols2" style="margin-top:1rem">
             <div class="field"><span class="label">Folders</span><details class="multi" id="res-folders"><summary>All folders</summary><div></div></details></div>
             <div class="field"><span class="label">More columns</span><details class="multi" id="res-columns"><summary>Add columns</summary><div></div></details></div>
@@ -173,7 +177,14 @@
   </div>
 </div>
 <dialog id="run-dlg" class="dlg run-dlg">
-  <h3>Analyze <span id="run-dlg-folder"></span></h3>
+  <h3>Analyze images</h3>
+  <div class="field">
+    <span class="label">Folder</span>
+    <div class="folder-row">
+      <span class="folder-chip" id="run-dlg-folder"></span>
+      <button class="btn sm" id="run-dlg-change" type="button">Change...</button>
+    </div>
+  </div>
   <p class="caption" id="run-dlg-count"></p>
   <div class="field">
     <span class="label">Process</span>

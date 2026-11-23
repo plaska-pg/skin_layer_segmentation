@@ -1,0 +1,28 @@
+{
+ "folder": "examples_v1",
+ "predicted": "predicted_examples_v1",
+ "files": [
+  "_results.csv",
+  "run_config.yaml",
+  "mde101f.svs_measurement.jpg",
+  "mde101f.svs_steps.jpg",
+  "postprocessed_segmentations/mde101f.svs.txt",
+  "review_cache/mde101f.svs.jpg",
+  "review_cache/mde101f.svs.json",
+  "mde103f.svs_measurement.jpg",
+  "mde103f.svs_steps.jpg",
+  "postprocessed_segmentations/mde103f.svs.txt",
+  "review_cache/mde103f.svs.jpg",
+  "review_cache/mde103f.svs.json"
+ ],
+ "sources": {
+  "mde101f.svs.tif": {
+   "size": 72446554,
+   "last_modified": 0
+  },
+  "mde103f.svs.tif": {
+   "size": 49286336,
+   "last_modified": 0
+  }
+ }
+}

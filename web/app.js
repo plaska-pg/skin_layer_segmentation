@@ -829,7 +829,7 @@ const EXAMPLE_DIR = "example/";
 // colours of measurement.CLASS_COLORS / EDJ_COLOR (BGR there) so each card matches its overlay in the image
 const VIEW_METRICS = [["SC mean height", "SC thickness", "\u00b5m", "#e8a13a"],
   ["Epidermal mean height", "Epidermis thickness", "\u00b5m", "#3E5191"], ["EDJ tortuosity", "EDJ tortuosity", "", "#000000"],
-  ["quality", "Section quality", "/ 3"], ["num_glands", "Glands", "", "#3cc83c"]];
+  ["quality", "Section quality", "/ 3"], ["total_sebocyte_um2", "Sebocyte area", "\u00b5m\u00b2", "#3cc83c"]];
 const vw = { items: [], idx: 0, view: "measurement", token: 0, empty: "", live: [], liveCaption: "" };
 
 // src(view) gives the item's measurement / steps image: a URL (example) or a Blob read from its predicted folder
@@ -845,13 +845,102 @@ async function loadExample() {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   state.example = parseCsv(await r.text()).rows.filter((row) => row["file name"]).map((row) => {
     const stem = row["file name"];
-    return { stem, row, label: stem, src: async (view) => `${EXAMPLE_DIR}${encodeURIComponent(stem)}_${view}.jpg?v=${VERSION}` };
+    return { stem, row, label: stem, example: true,
+      src: async (view) => `${EXAMPLE_DIR}${encodeURIComponent(stem)}_${view}.jpg?v=${VERSION}` };
   });
 }
 
 function showExample() {
-  return showViewer(state.example ?? [], { badge: "Example", example: true, empty: "Loading the example...",
+  return showViewer(state.example ?? [], { badge: "Example", example: true, review: true, empty: "Loading the example...",
     caption: "Two slides from the MDE study (Motic 40X, 0.2577 \u00b5m/px). Click the image to open it full size." });
+}
+
+// read-only stand-in for a FileSystemDirectoryHandle over files shipped with the site, so Review can open the example
+function urlDir(name, entries) {
+  const missing = (n) => new DOMException(`${n} not found`, "NotFoundError");
+  return {
+    kind: "directory", name,
+    async getFileHandle(n) {
+      if (entries[n]?.kind !== "file") throw missing(n);
+      return entries[n];
+    },
+    async getDirectoryHandle(n, opts) {
+      if (entries[n]?.kind === "directory") return entries[n];
+      throw opts?.create ? new DOMException("the example is read-only", "NoModificationAllowedError") : missing(n);
+    },
+    async *entries() { yield* Object.entries(entries); },
+  };
+}
+
+function urlFile(name, url) {
+  return { kind: "file", name, async getFile() {
+    const r = await fetch(url);
+    if (!r.ok) throw new DOMException(`${name}: HTTP ${r.status}`, "NotFoundError");
+    return new File([await r.blob()], name);
+  } };
+}
+
+let examplePredP = null;
+
+// the example as a predicted folder: web/example/files.json lists its files; the source slides aren't shipped,
+// only their size / date so review_cache's previews count as up to date
+function examplePred() {
+  examplePredP ??= (async () => {
+    const r = await fetch(`${EXAMPLE_DIR}files.json?v=${VERSION}`);
+    if (!r.ok) throw new Error(`example files: HTTP ${r.status}`);
+    const m = await r.json(), tree = {};
+    for (const p of m.files) {
+      const parts = p.split("/");
+      let node = tree;
+      for (const d of parts.slice(0, -1)) node = node[d] ??= {};
+      node[parts.at(-1)] = urlFile(parts.at(-1), `${EXAMPLE_DIR}${parts.map(encodeURIComponent).join("/")}?v=${VERSION}`);
+    }
+    const build = (name, obj) => urlDir(name, Object.fromEntries(Object.entries(obj)
+      .map(([k, v]) => [k, v.kind === "file" ? v : build(k, v)])));
+    const dir = build(m.predicted, tree);
+    const sources = Object.fromEntries(Object.entries(m.sources).map(([name, s]) => [name,
+      { kind: "file", name, getFile: async () => ({ name, size: s.size, lastModified: s.last_modified }) }]));
+    return { path: `Example (${m.predicted})`, dir, parent: urlDir(m.folder, { [m.predicted]: dir, ...sources }),
+      example: true };
+  })();
+  examplePredP.catch(() => { examplePredP = null; });
+  return examplePredP;
+}
+
+function openExampleReview(stem) {
+  rv.example = true;
+  rv.target = stem;
+  if (state.page === "review") loadReview().catch(showError);
+  else location.hash = "#review";
+}
+
+function renderExampleNote(pred) {
+  $("rv-editor").classList.toggle("readonly", Boolean(pred.example));
+  exampleNote($("rv-example-note"), pred.example, "Example slides, read-only: try the editing tools; saving is turned off.",
+    state.pred && `Back to ${state.pred.path}`, () => {
+      rv.example = false;
+      loadReview().catch(showError);
+    });
+}
+
+// banner over example data: back to the user's own data, or the choose-folder button when there is no folder
+function exampleNote(note, on, text, backLabel, onBack) {
+  note.hidden = !on;
+  if (!on) return;
+  const span = document.createElement("span"), b = document.createElement("button");
+  span.textContent = text;
+  b.type = "button";
+  b.className = "btn primary sm";
+  if (state.root) {
+    b.hidden = !backLabel;
+    b.textContent = backLabel || "";
+    b.addEventListener("click", onBack);
+  } else {
+    b.textContent = "Choose skin images to analyze";
+    b.disabled = !window.showDirectoryPicker;
+    b.addEventListener("click", chooseFolder);
+  }
+  note.replaceChildren(span, b);
 }
 
 // the Run viewer follows the sidebar: the selected predicted folder's results, else the example
@@ -878,6 +967,7 @@ function showViewer(items, { badge, caption = "", empty = "No results to show.",
   $("vw-caption").textContent = caption;
   $("vw-download").hidden = !example;
   $("review-last").hidden = !review || !items.length;
+  $("review-last").textContent = example ? "\u2611 Review example" : "\u2611 Review results";
   $("vw-select").replaceChildren(...items.map((it, i) => option(String(i), it.label)));
   return showViewerItem();
 }
@@ -922,7 +1012,8 @@ function renderMetrics(row) {
     k.textContent = name;
     v.className = "v";
     const val = row[key], num = val !== "" && val != null && !Number.isNaN(Number(val));
-    v.textContent = num ? String(+Number(val).toFixed(2)) : "\u2013";
+    const n = Number(val);
+    v.textContent = !num ? "\u2013" : Math.abs(n) >= 1000 ? Math.round(n).toLocaleString() : String(+n.toFixed(2));
     if (num && unit) {
       const small = document.createElement("small");
       small.textContent = unit;
@@ -1174,16 +1265,21 @@ async function chooseFolder() {
     return;
   }
   await setRoot(handle).catch(showError);
-  openRunDialog();
+  if ($("run-dlg").open) fillRunDialog();
+  else openRunDialog();
+}
+
+function fillRunDialog() {
+  const n = $("run-image").options.length;
+  $("run-dlg-folder").textContent = $("run-dlg-folder").title = state.root.name;
+  $("run-dlg-count").textContent = n ? `${n} image(s) directly in this folder.`
+    : "No images directly in this folder; use Include subfolders to process the folders inside it.";
+  renderRun();
 }
 
 function openRunDialog() {
   if (!state.root || state.busy || $("run-dlg").open) return;
-  const n = $("run-image").options.length;
-  $("run-dlg-folder").textContent = state.root.name;
-  $("run-dlg-count").textContent = n ? `${n} image(s) directly in this folder.`
-    : "No images directly in this folder; use Include subfolders to process the folders inside it.";
-  renderRun();
+  fillRunDialog();
   $("run-dlg").showModal();
 }
 
@@ -1191,8 +1287,11 @@ function openRunDialog() {
 async function setRoot(handle) {
   state.root = handle;
   state.pred = null;
+  rv.example = false;
+  res.example = false;
   document.body.classList.remove("no-folder");
-  $("folder-name").value = handle.name;
+  $("folder-name").value = $("folder-name").title = handle.name;
+  $("choose-folder").textContent = "Change...";
   if (!state.busy) {
     state.lastRun = null;
     $("last-warnings").replaceChildren();
@@ -1291,13 +1390,14 @@ function openInReview(path, stem) {
     state.pred = p;
     $("pred-select").value = String(state.preds.indexOf(p));
   }
+  rv.example = false;
   rv.target = stem;
   location.hash = "#review";
 }
 
 // ---------------------------------------------------------------- Review page (interface/app.py review_page)
 const rv = { pred: null, stems: [], rows: new Map(), stem: null, view: "edit", doc: null, info: null, target: null,
-  loads: 0 };
+  loads: 0, example: false };
 
 function ensureEditPy() {
   editPy ??= new PyWorker("editor engine", EDIT_PY);
@@ -1400,11 +1500,20 @@ function prefetchNext() {
 async function loadReview() {
   const empty = (msg) => {
     emptyInfo($("review-empty"), msg);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn";
+    b.style.marginLeft = "1rem";
+    b.textContent = "Review the example";
+    b.addEventListener("click", () => openExampleReview(null));
+    $("review-empty").append(b);
     $("review-body").hidden = true;
   };
-  if (!state.root) return empty("No folder chosen yet. Analyze a folder of images first, then check and correct the results here.");
-  const pred = state.pred;
+  // without a folder of its own, Review shows the read-only example
+  const useExample = rv.example || !state.root;
+  const pred = useExample ? await examplePred() : state.pred;
   if (!pred) return empty("No predicted folders in this working folder yet. Process images on the Run page first.");
+  renderExampleNote(pred);
   ensureEditPy();
   if (rv.pred !== pred) Object.assign(rv, { pred, info: null });
   const csv = parseCsv((await readText(pred.dir, "_results.csv")) ?? "");
@@ -1546,6 +1655,12 @@ async function onEditorTrigger(name, value) {
   if (!d) return;
   if (name === "nav") return stepReview(value);
   if (name === "need_image") return updateEditor();
+  if (name === "save" && d.pred.example) {
+    const dirty = d.dirty || JSON.stringify(value.polys) !== JSON.stringify(d.polys);
+    Object.assign(d, { polys: value.polys, dirty, noop: false, version: d.version + 1,
+      message: "the example is read-only; choose your own images to save edits" });
+    return updateEditor();
+  }
   if (name === "save") return saveDoc(d, value.polys);
   if (name !== "op") return;
   const polys = value.polys;
@@ -1683,7 +1798,7 @@ function idleHeader() {
 // ---------------------------------------------------------------- Results page (interface/app.py results_page)
 const KEY_METRICS = ["SC mean height", "Epidermal mean height", "EDJ tortuosity", "quality"];
 const RESULT_COLUMNS = ["folder name", "file name", ...KEY_METRICS, "edited"];
-const res = { rows: [], fields: [], folders: new Set(), extra: new Set(), pick: null, metric: null };
+const res = { rows: [], fields: [], folders: new Set(), extra: new Set(), pick: null, metric: null, example: false };
 
 async function findResults(dir, path, out) {
   const names = new Set(), subs = [];
@@ -1702,18 +1817,36 @@ async function findResults(dir, path, out) {
 async function loadResults() {
   const empty = (msg) => {
     emptyInfo($("results-empty"), msg);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn";
+    b.style.marginLeft = "1rem";
+    b.textContent = "Show the example";
+    b.addEventListener("click", () => {
+      res.example = true;
+      loadResults().catch(showError);
+    });
+    $("results-empty").append(b);
     $("results-body").hidden = true;
   };
-  if (!state.root) return empty("No folder chosen yet. Analyze a folder of images first; its measurements are combined here.");
-  setHeader("Searching for _results.csv...");
-  const files = await findResults(state.root, "", []);
+  // without a folder of its own, Results shows the example run
+  const example = res.example || !state.root;
+  let files;
+  if (example) {
+    const p = await examplePred();
+    const handle = await p.dir.getFileHandle("_results.csv");
+    files = [{ dirPath: p.path, path: `${p.path}/_results.csv`, handle, example: true }];
+  } else {
+    setHeader("Searching for _results.csv...");
+    files = await findResults(state.root, "", []);
+  }
   res.rows = [];
   res.fields = [];
   for (const f of files) {
     try {
       const p = parseCsv(await (await f.handle.getFile()).text());
       res.fields = [...new Set([...res.fields, ...p.fields])];
-      for (const r of p.rows) res.rows.push({ ...r, "results path": f.path, _dir: f.dirPath });
+      for (const r of p.rows) res.rows.push({ ...r, "results path": f.path, _dir: f.dirPath, _example: f.example });
     } catch (e) {
       console.warn(`could not read ${f.path}`, e);
     }
@@ -1722,6 +1855,11 @@ async function loadResults() {
   res.files = files.length;
   res.pick = null;
   if (!state.busy) setHeader(idleHeader());
+  exampleNote($("res-example-note"), example, "Example run on two slides, read-only. Select a row to open it in Review.",
+    `Back to ${state.root?.name ?? ""} results`, () => {
+      res.example = false;
+      loadResults().catch(showError);
+    });
   if (!res.rows.length) return empty("No _results.csv files in this folder yet. Process images on the Run page first.");
   $("results-empty").hidden = true;
   $("results-body").hidden = false;
@@ -1819,6 +1957,7 @@ function wire() {
   $("choose-folder").addEventListener("click", chooseFolder);
   $("pred-select").addEventListener("change", (e) => {
     state.pred = state.preds[Number(e.target.value)] ?? null;
+    rv.example = false;
     if (!state.busy) {
       state.lastRun = null;
       hideQueue();
@@ -1849,6 +1988,7 @@ function wire() {
     });
   });
   $("run-cancel").addEventListener("click", () => $("run-dlg").close());
+  $("run-dlg-change").addEventListener("click", chooseFolder);
   $("open-run").addEventListener("click", openRunDialog);
   $("stop").addEventListener("click", () => {
     state.stop = true;
@@ -1857,7 +1997,8 @@ function wire() {
   });
   $("review-last").addEventListener("click", () => {
     const it = vw.items[vw.idx];
-    if (it?.path) openInReview(it.path, it.stem);
+    if (it?.example) openExampleReview(it.stem);
+    else if (it?.path) openInReview(it.path, it.stem);
   });
   $("cta-choose").addEventListener("click", chooseFolder);
   $("log-toggle").addEventListener("click", () => { $("log-pop").hidden = !$("log-pop").hidden; });
@@ -1886,7 +2027,10 @@ function wire() {
   $("rv-next").addEventListener("click", () => stepReview(1));
   $("results-refresh").addEventListener("click", () => loadResults().catch(showError));
   $("res-metric").addEventListener("change", (e) => { res.metric = e.target.value; renderResults(); });
-  $("res-open").addEventListener("click", () => res.pick && openInReview(res.pick._dir, res.pick["file name"]));
+  $("res-open").addEventListener("click", () => {
+    if (res.pick?._example) openExampleReview(res.pick["file name"]);
+    else if (res.pick) openInReview(res.pick._dir, res.pick["file name"]);
+  });
   $("res-download").addEventListener("click", downloadResults);
 }
 
@@ -1910,6 +2054,7 @@ async function init() {
     state.root = null;
     document.body.classList.add("no-folder");
     $("folder-name").value = "";
+    $("choose-folder").textContent = "Browse...";
     renderPage();
   }
   try {
