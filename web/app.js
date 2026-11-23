@@ -1412,7 +1412,7 @@ async function writePreview(predDir, stem, file, { blob, width, height, k = null
   return meta;
 }
 
-// the saved preview, if it was made from this exact source file
+// the saved preview, if it was made from this exact source file (any saved preview when file is null)
 async function readPreview(predDir, stem, file) {
   const dir = await subdir(predDir, PREVIEW_DIR);
   if (!dir) return null;
@@ -1422,7 +1422,7 @@ async function readPreview(predDir, stem, file) {
   } catch {
     return null;
   }
-  if (!meta || meta.size !== file.size || meta.last_modified !== file.lastModified) return null;
+  if (!meta || (file && (meta.size !== file.size || meta.last_modified !== file.lastModified))) return null;
   try {
     return { blob: await (await dir.getFileHandle(`${stem}.jpg`)).getFile(), meta };
   } catch (e) {
@@ -1609,9 +1609,13 @@ async function openDoc() {
     if (!lbl) throw new Error(`No raw or postprocessed segmentation found for ${stem} in ${pred.path}`);
     // run_config (read by the editor engine) is only needed when the source isn't <stem>.<ext>
     const src = (await findSource(pred, stem, rv.info)) ?? (await findSource(pred, stem, await infoP));
-    if (!src) throw new Error(`Source image of ${stem} not found next to ${pred.path}`);
     lap("label + source");
-    const pv = await ensurePreview(pred, stem, src);
+    // without the source, the saved preview still allows viewing and editing (but not re-measuring)
+    const pv = src ? await ensurePreview(pred, stem, src) : await readPreview(pred.dir, stem, null);
+    if (!pv) throw new Error(pred.parent
+      ? `Source image of ${stem} not found in ${pred.parent.name}`
+      : `Source image of ${stem} not found: ${pred.path} is itself a predicted folder; choose the folder that ` +
+        `holds the images and ${pred.path} as the working folder`);
     lap(pv.built ? "preview built" : "preview from review_cache");
     const info = await infoP;
     lap("editor engine");
@@ -1622,7 +1626,8 @@ async function openDoc() {
     if (rv.doc?.image) URL.revokeObjectURL(rv.doc.image);
     rv.doc = { id: `${pred.path}|${stem}|${++rv.loads}`, pred, stem, src, info, iw, ih, k: pv.meta.k ?? null, polys,
       other, image: URL.createObjectURL(pv.blob), version: 0, dirty: false, noop: false,
-      message: `loaded ${lbl.kind} segmentation` };
+      message: src || pred.example ? `loaded ${lbl.kind} segmentation`
+        : `loaded ${lbl.kind} segmentation; source image not found, so saving can't re-measure` };
     updateEditor();
     log(`Review ${stem}: ${laps.join(", ")}; total ${ms(tAll)}`);
     prefetchNext();
@@ -1689,8 +1694,9 @@ async function saveDoc(d, polys) {
     }
     await writeFile(segDir, `${d.stem}.txt`, text);
     Object.assign(d, { polys, dirty: false, noop: false, version: d.version + 1,
-      message: "saved; re-measuring in the background" });
-    queueRemeasure(d, text);
+      message: d.src ? "saved; re-measuring in the background"
+        : "labels saved; the source image wasn't found, so the measurements were not updated" });
+    if (d.src) queueRemeasure(d, text);
   } catch (e) {
     console.error(e);
     Object.assign(d, { polys, dirty: true, noop: false, version: d.version + 1, message: `save failed: ${describeError(e)}` });
