@@ -1,6 +1,6 @@
 /* Streamlit's default light theme, so the page looks like interface/app.py */
 :root {
-  --primary: #ff4b4b; --primary-soft: rgba(255, 75, 75, .08); --text: #31333f; --text-soft: rgba(49, 51, 63, .6);
+  --primary: #003DA5; --primary-soft: rgba(255, 75, 75, .08); --text: #ffffff; --text-soft: rgba(206, 206, 206, 0.6);
   --bg: #fff; --bg2: #f0f2f6; --border: rgba(49, 51, 63, .2); --radius: .5rem; --header-h: 3.5rem;
   /* names interface/seg_editor.js's CSS expects (Streamlit theme variables) */
   --st-font: var(--font); --st-text-color: var(--text); --st-primary-color: var(--primary);

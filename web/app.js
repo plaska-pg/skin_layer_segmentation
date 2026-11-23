@@ -2040,7 +2040,25 @@ function wire() {
   $("res-download").addEventListener("click", downloadResults);
 }
 
+// GitHub Pages lets browsers reuse index.html for 10 minutes (and Back restores the old page), so a return visit
+// can run the previous deploy's code; reload under a new URL when version.json names a newer deploy
+async function checkDeploy() {
+  if (!VERSION || VERSION === "dev") return;
+  try {
+    const r = await fetch(`version.json?t=${Date.now()}`, { cache: "no-store" });
+    const { v } = await r.json();
+    const url = new URL(location.href);
+    if (!v || v === VERSION || url.searchParams.get("v") === v) return;
+    url.searchParams.set("v", v);
+    location.replace(url.href);
+  } catch {
+    // offline or no version.json: keep the loaded code
+  }
+}
+
 async function init() {
+  checkDeploy();
+  window.addEventListener("pageshow", (e) => { if (e.persisted) checkDeploy(); });
   wire();
   showPage(location.hash.slice(1));
   if (!window.showDirectoryPicker) {
