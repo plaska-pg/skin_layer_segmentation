@@ -1,5 +1,5 @@
-// Image decoding and OpenCV-equivalent resizing, shared by the page (app.js) and image_worker.js.
-// TIFF decoding needs the UTIF global (index.html script tag; image_worker.js loads it itself).
+// Image decoding and OpenCV-equivalent resizing, shared by the page (app.js) and the workers.
+// TIFF decoding needs the UTIF global (image_worker.js loads it).
 
 // Python round(): half to even
 export const pyRound = (v) => (Math.abs(v % 1) === 0.5 ? 2 * Math.round(v / 2) : Math.round(v));
@@ -193,6 +193,60 @@ export function toRGB(img) {
     out[o] = img.px[i]; out[o + 1] = img.px[i + 1]; out[o + 2] = img.px[i + 2];
   }
   return out;
+}
+
+// nearest-neighbour RGBA copy at most maxSide px, for drawing on a canvas
+export function thumbnail(img, maxSide) {
+  const s = Math.min(1, maxSide / Math.max(img.w, img.h));
+  const w = Math.max(1, Math.round(img.w * s)), h = Math.max(1, Math.round(img.h * s));
+  const px = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(img.h - 1, Math.floor((y + 0.5) / s));
+    for (let x = 0; x < w; x++) {
+      const si = (sy * img.w + Math.min(img.w - 1, Math.floor((x + 0.5) / s))) * img.cn, o = 4 * (y * w + x);
+      px[o] = img.px[si]; px[o + 1] = img.px[si + 1]; px[o + 2] = img.px[si + 2]; px[o + 3] = 255;
+    }
+  }
+  return { w, h, px };
+}
+
+// predict._upsample_argmax: cv2.remap INTER_LINEAR, which quantises coordinates to 1/32 px
+function remapTab(ssize, dsize) {
+  const i0 = new Int32Array(dsize), i1 = new Int32Array(dsize), f = new Float32Array(dsize);
+  for (let d = 0; d < dsize; d++) {
+    const X = Math.round(((d + 0.5) * (ssize / dsize) - 0.5) * 32), i = X >> 5;
+    i0[d] = Math.min(Math.max(i, 0), ssize - 1);
+    i1[d] = Math.min(Math.max(i + 1, 0), ssize - 1);
+    f[d] = (X & 31) / 32;
+  }
+  return { i0, i1, f };
+}
+
+export function upsampleArgmax(probs, nCls, w, h, ow, oh) {
+  const mask = new Uint8Array(ow * oh), plane = w * h;
+  if (ow === w && oh === h) {
+    for (let o = 0; o < plane; o++) {
+      let best = -1;
+      for (let c = 0; c < nCls; c++) if (probs[c * plane + o] > best) { best = probs[c * plane + o]; mask[o] = c; }
+    }
+    return mask;
+  }
+  const X = remapTab(w, ow), Y = remapTab(h, oh);
+  for (let oy = 0; oy < oh; oy++) {
+    const r0 = Y.i0[oy] * w, r1 = Y.i1[oy] * w, fy = Y.f[oy];
+    for (let ox = 0; ox < ow; ox++) {
+      const a = r0 + X.i0[ox], b = r0 + X.i1[ox], c0 = r1 + X.i0[ox], d = r1 + X.i1[ox], fx = X.f[ox];
+      let best = -1, arg = 0;
+      for (let c = 0, q = 0; c < nCls; c++, q += plane) {
+        const top = probs[q + a] + fx * (probs[q + b] - probs[q + a]);
+        const bot = probs[q + c0] + fx * (probs[q + d] - probs[q + c0]);
+        const v = top + fy * (bot - top);
+        if (v > best) { best = v; arg = c; }
+      }
+      mask[oy * ow + ox] = arg;
+    }
+  }
+  return mask;
 }
 
 function toImageData(img) {

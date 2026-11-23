@@ -3,7 +3,7 @@
 // linear ramp, bilinear upsampling of probabilities, argmax). Measuring and the Review editor's merge / cut /
 // re-measure run postprocess.py & co. in Pyodide workers (worker.js); the editor is interface/seg_editor.js.
 import mountEditor from "../interface/seg_editor.js?v=dev";
-import { crop, decode, previewJpeg, pyRound, resize, tissueBox, toRGB, workSize } from "./imaging.js?v=dev";
+import { pyRound, workSize } from "./imaging.js?v=dev";
 import { canCopyTiff, isSvs, openSvs, readSvsScaled, TiffWriter } from "./svs.js?v=dev";
 
 // ?v=<commit> on every app file (set by the Pages build) keeps cached files from different deploys apart
@@ -18,6 +18,8 @@ const MAX_SVS_WORK_MP = 150;
 const CROP_MARGIN_UM = 200, MAX_MEASURE_MP = 90;
 const WORKER_RECYCLE_MB = 1024;
 const EDITOR_MAX_SIDE = 4096, EDITOR_HEIGHT = 720;  // interface/seg_editor.py
+// longest side of the image shown on the Run page while it is processed
+const DISPLAY_SIDE = 1200;
 // display-size copy of each source image, written next to the results so Review opens without decoding the source
 const PREVIEW_DIR = "review_cache";
 const CLASS_COLORS = { SC: "#00c8ff", Epidermis: "#ffc800", gland: "#00ff00" };
@@ -176,6 +178,7 @@ async function ttaProbs(session, data, PH, PW, nCls, tta) {
   return acc;
 }
 
+// weighted sums of the tile probabilities and the weights; image_worker.js divides and takes the argmax
 async function tiledProbs(session, img, nCls, tta = "none", onTile = null) {
   const { w, h, px, cn } = img, tile = manifest.tile;
   const m = Math.floor(tile * manifest.tile_overlap / 2), stride = tile - 2 * m;
@@ -211,71 +214,20 @@ async function tiledProbs(session, img, nCls, tta = "none", onTile = null) {
       await tick();
     }
   }
-  for (let c = 0; c < nCls; c++) for (let o = 0; o < plane; o++) probs[c * plane + o] /= wsum[o];
   log(`tiles: ${n} x ${tile}px, TTA ${tta}, inference ${(runMs / 1000).toFixed(2)} s (${(runMs / n).toFixed(0)} ms/tile)`);
-  return probs;
+  return { probs, wsum };
 }
 
-// predict._upsample_argmax: cv2.remap INTER_LINEAR, which quantises coordinates to 1/32 px
-function remapTab(ssize, dsize) {
-  const i0 = new Int32Array(dsize), i1 = new Int32Array(dsize), f = new Float32Array(dsize);
-  for (let d = 0; d < dsize; d++) {
-    const X = Math.round(((d + 0.5) * (ssize / dsize) - 0.5) * 32), i = X >> 5;
-    i0[d] = Math.min(Math.max(i, 0), ssize - 1);
-    i1[d] = Math.min(Math.max(i + 1, 0), ssize - 1);
-    f[d] = (X & 31) / 32;
-  }
-  return { i0, i1, f };
-}
-
-function upsampleArgmax(probs, nCls, w, h, ow, oh) {
-  const mask = new Uint8Array(ow * oh), plane = w * h;
-  if (ow === w && oh === h) {
-    for (let o = 0; o < plane; o++) {
-      let best = -1;
-      for (let c = 0; c < nCls; c++) if (probs[c * plane + o] > best) { best = probs[c * plane + o]; mask[o] = c; }
-    }
-    return mask;
-  }
-  const X = remapTab(w, ow), Y = remapTab(h, oh);
-  for (let oy = 0; oy < oh; oy++) {
-    const r0 = Y.i0[oy] * w, r1 = Y.i1[oy] * w, fy = Y.f[oy];
-    for (let ox = 0; ox < ow; ox++) {
-      const a = r0 + X.i0[ox], b = r0 + X.i1[ox], c0 = r1 + X.i0[ox], d = r1 + X.i1[ox], fx = X.f[ox];
-      let best = -1, arg = 0;
-      for (let c = 0, q = 0; c < nCls; c++, q += plane) {
-        const top = probs[q + a] + fx * (probs[q + b] - probs[q + a]);
-        const bot = probs[q + c0] + fx * (probs[q + d] - probs[q + c0]);
-        const v = top + fy * (bot - top);
-        if (v > best) { best = v; arg = c; }
-      }
-      mask[oy * ow + ox] = arg;
-    }
-  }
-  return mask;
-}
-
-// the image being processed, downscaled, replacing whatever the viewer showed
-function drawRaw(img) {
-  const s = Math.min(1, 1200 / Math.max(img.w, img.h));
-  const pw = Math.max(1, Math.round(img.w * s)), ph = Math.max(1, Math.round(img.h * s));
-  const canvas = $("run-preview"), ctx = canvas.getContext("2d");
+// the image being processed (image_worker.js thumbnail), replacing whatever the viewer showed
+function drawRaw(disp) {
+  const canvas = $("run-preview");
   vw.token++;
   canvas.hidden = false;
   $("vw-img").hidden = true;
   $("vw-empty").hidden = true;
   renderMetrics(null);
-  canvas.width = pw; canvas.height = ph;
-  const im = ctx.createImageData(pw, ph);
-  for (let y = 0; y < ph; y++) {
-    const sy = Math.min(img.h - 1, Math.floor((y + 0.5) / s));
-    for (let x = 0; x < pw; x++) {
-      const si = (sy * img.w + Math.min(img.w - 1, Math.floor((x + 0.5) / s))) * img.cn, o = 4 * (y * pw + x);
-      im.data[o] = img.px[si]; im.data[o + 1] = img.px[si + 1]; im.data[o + 2] = img.px[si + 2];
-      im.data[o + 3] = 255;
-    }
-  }
-  ctx.putImageData(im, 0, 0);
+  canvas.width = disp.w; canvas.height = disp.h;
+  canvas.getContext("2d").putImageData(new ImageData(disp.px, disp.w, disp.h), 0, 0);
 }
 
 // share of the current image done, as a pie over the viewer
@@ -325,120 +277,91 @@ async function processFile(file, mpp, session, folderName = "", opts = readOptio
   let t0 = performance.now();
   status(`${file.name}: reading...`);
   imageProgress(0, `Reading ${file.name}`);
-  await tick();
   const svs = isSvs(file.name) ? await openSvs(file) : null;
   if (svs?.mpp) mpp = svs.mpp;
-  let img = svs ? null : await decode(file);
-  const iw = svs?.w ?? img.w, ih = svs?.h ?? img.h, rs = manifest.rotation.size;
-  const scale = mpp / manifest.reference_um_per_px;
-  const tw = Math.max(1, pyRound(iw * scale)), th = Math.max(1, pyRound(ih * scale));
-  const [ww, wh] = workSize(iw, ih, mpp, MAX_POST_MP, POST_UM_PER_PX);
-  const workMpp = ww === iw ? mpp : mpp * iw / ww;
-  let net, work, sq;
-  if (svs) {
-    log(`${file.name}: ${iw} x ${ih} px, ${svs.mpp ? `${mpp} \u00b5m/px from its header`
-      : `no \u00b5m/px in its header, using ${mpp}`}`);
-    if (ww * wh > MAX_SVS_WORK_MP * 1e6)
-      throw new Error(`${file.name} is too large for the browser (${(ww * wh / 1e6).toFixed(0)} MP at ` +
-        `${workMpp.toFixed(3)} \u00b5m/px); use the desktop app`);
-    let sink = null;
-    if (tiff && canCopyTiff(svs)) tiff.sink = sink = new TiffWriter(tiff.writable, iw, ih, svs.tw, svs.th);
-    else if (tiff) {
-      log(`${file.name}: tile size ${svs.tw} x ${svs.th} can't be copied to a TIFF in the browser`);
-      await tiff.discard();
-    }
-    ({ net, work, sq } = await readSvsScaled(svs, { net: [tw, th], work: [ww, wh], sq: [rs, rs] },
-      { tiff: sink, onRow: (r, n) => {
-        status(`${file.name}: reading ${Math.round((100 * r) / n)}%`);
-        imageProgress(0.1 * r / n);
-      } }));
-    log(`read at ${tw} x ${th} px (${manifest.reference_um_per_px} \u00b5m/px) and ${ww} x ${wh} px ` +
-      `(${workMpp.toFixed(4)} \u00b5m/px)${sink ? " + TIFF copy" : ""}: ${ms(t0)}`);
-    drawRaw(work);
-  } else {
-    log(`${file.name}: ${iw} x ${ih} px, decode ${ms(t0)}`);
-    drawRaw(img);
-  }
-  imageProgress(0.1, "Finding the orientation");
-
-  t0 = performance.now();
-  const k = await rotationFromSquare(backend, (sq ?? resize(img, rs, rs)).px);
-  log(`rotation: ${k * 90} deg clockwise to upright, ${ms(t0)}`);
-
-  t0 = performance.now();
-  let preview = null;
+  const rs = manifest.rotation.size, scale = mpp / manifest.reference_um_per_px;
+  // decoding, resizing, previews and the mask run in image_worker.js; the page only runs the models
+  const onPrep = (p) => {
+    if (p.disp) drawRaw(p.disp);
+    status(`${file.name}: ${p.label.toLowerCase()}...`);
+    imageProgress(p.frac, p.label);
+  };
+  let iw, ih, ww, wh, net, sq, prep;
   try {
-    preview = { blob: await previewJpeg(img ?? work, EDITOR_MAX_SIDE), width: iw, height: ih, k };
-    log(`review preview: ${ms(t0)}`);
+    if (svs) {
+      ({ w: iw, h: ih } = svs);
+      const tw = Math.max(1, pyRound(iw * scale)), th = Math.max(1, pyRound(ih * scale));
+      [ww, wh] = workSize(iw, ih, mpp, MAX_POST_MP, POST_UM_PER_PX);
+      const svsMpp = ww === iw ? mpp : mpp * iw / ww;
+      log(`${file.name}: ${iw} x ${ih} px, ${svs.mpp ? `${mpp} \u00b5m/px from its header`
+        : `no \u00b5m/px in its header, using ${mpp}`}`);
+      if (ww * wh > MAX_SVS_WORK_MP * 1e6)
+        throw new Error(`${file.name} is too large for the browser (${(ww * wh / 1e6).toFixed(0)} MP at ` +
+          `${svsMpp.toFixed(3)} \u00b5m/px); use the desktop app`);
+      let sink = null;
+      if (tiff && canCopyTiff(svs)) tiff.sink = sink = new TiffWriter(tiff.writable, iw, ih, svs.tw, svs.th);
+      else if (tiff) {
+        log(`${file.name}: tile size ${svs.tw} x ${svs.th} can't be copied to a TIFF in the browser`);
+        await tiff.discard();
+      }
+      let work;
+      ({ net, work, sq } = await readSvsScaled(svs, { net: [tw, th], work: [ww, wh], sq: [rs, rs] },
+        { tiff: sink, onRow: (r, n) => {
+          status(`${file.name}: reading ${Math.round((100 * r) / n)}%`);
+          imageProgress(0.1 * r / n);
+        } }));
+      log(`read at ${tw} x ${th} px (${manifest.reference_um_per_px} \u00b5m/px) and ${ww} x ${wh} px ` +
+        `(${svsMpp.toFixed(4)} \u00b5m/px)${sink ? " + TIFF copy" : ""}: ${ms(t0)}`);
+      sq = sq.px;
+      prep = await imageJob({ op: "hold", work, maxSide: EDITOR_MAX_SIDE, dispSide: DISPLAY_SIDE },
+        [work.px.buffer], onPrep);
+    } else {
+      prep = await imageJob({ op: "prepare", file, um: mpp, scale, maxMP: MAX_POST_MP, postUm: POST_UM_PER_PX,
+        rotSize: rs, maxSide: EDITOR_MAX_SIDE, dispSide: DISPLAY_SIDE }, [], onPrep);
+      ({ iw, ih, ww, wh, net, sq } = prep);
+    }
   } catch (e) {
-    log(`review preview failed (${describeError(e)}); Review will build it`);
+    imageJob({ op: "drop" }).catch(() => {});
+    throw e;
   }
+  prep.logs.forEach(log);
+  const workMpp = ww === iw ? mpp : mpp * iw / ww;
 
-  if (!svs) {
-    net = img;
-    if (scale !== 1 && (tw !== iw || th !== ih)) {
-      t0 = performance.now();
-      status(`${file.name}: resizing...`);
-      imageProgress(0.12, "Resizing");
-      await tick();
-      net = resize(img, tw, th);
-      log(`resize to ${tw} x ${th} px (${manifest.reference_um_per_px} um/px): ${ms(t0)}`);
-    }
-    work = img;
-    if (ww !== iw || wh !== ih) {
-      t0 = performance.now();
-      status(`${file.name}: reducing resolution for measuring...`);
-      await tick();
-      work = resize(img, ww, wh);
-      log(`${(iw * ih / 1e6).toFixed(0)} MP > ${MAX_POST_MP} MP: measuring at ${ww} x ${wh} px ` +
-        `(${workMpp.toFixed(4)} um/px), ${ms(t0)}`);
-    }
-  }
-  img = null;
-  const nCls = manifest.classes.length;
-  let probs = await tiledProbs(session, net, nCls, opts.tta,
-    (i, n) => imageProgress(0.15 + 0.4 * i / n, `Segmenting: tile ${i} / ${n}`));
-
-  t0 = performance.now();
-  status(`${file.name}: building mask...`);
-  imageProgress(0.55, "Building the mask");
-  await tick();
-  const mask = upsampleArgmax(probs, nCls, net.w, net.h, work.w, work.h);
-  probs = net = null;
-  log(`mask at ${work.w} x ${work.h} px: ${ms(t0)}`);
-
-  const stem = file.name.replace(/\.[^.]+$/, "");
-  log(`segmentation (${backend}): ${ms(tAll)}`);
-
-  // a whole slide is mostly glass: measure only the tissue so Pyodide stays within memory
-  let region = null, wm = mask, det = null;
-  if (work.w * work.h > MAX_POST_MP * 1e6) {
+  let fin, k, preview = null;
+  try {
     t0 = performance.now();
-    const box = tissueBox(work, { mask, block: Math.max(8, Math.round(20 / workMpp)),
-      margin: Math.round(CROP_MARGIN_UM / workMpp) });
-    if (box) {
-      region = [...box, work.w, work.h];
-      // the detectors and quality model downscale the whole image to max_side anyway
-      const side = Math.max(...["roi", "follicle", "quality"].map((m) => manifest[m]?.max_side ?? 0));
-      const f = Math.min(1, side / Math.max(work.w, work.h));
-      const d = resize(work, Math.max(1, pyRound(work.w * f)), Math.max(1, pyRound(work.h * f)));
-      det = { rgb: d.px, w: d.w, h: d.h };
-      wm = crop({ w: work.w, h: work.h, px: mask, cn: 1 }, box).px;
-      work = crop(work, box);
-      log(`measuring the tissue only: ${box[2]} x ${box[3]} px at (${box[0]}, ${box[1]}), ${ms(t0)}`);
-    }
+    imageProgress(0.12, "Finding the orientation");
+    k = await rotationFromSquare(backend, sq);
+    log(`rotation: ${k * 90} deg clockwise to upright, ${ms(t0)}`);
+    if (prep.blob) preview = { blob: prep.blob, width: iw, height: ih, k };
+
+    const nCls = manifest.classes.length;
+    const { probs, wsum } = await tiledProbs(session, net, nCls, opts.tta,
+      (i, n) => imageProgress(0.15 + 0.4 * i / n, `Segmenting: tile ${i} / ${n}`));
+    status(`${file.name}: building mask...`);
+    imageProgress(0.55, "Building the mask");
+    const detSide = Math.max(...["roi", "follicle", "quality"].map((m) => manifest[m]?.max_side ?? 0));
+    fin = await imageJob({ op: "finish", probs, wsum, nCls, nw: net.w, nh: net.h, maxMP: MAX_POST_MP,
+      workUm: workMpp, cropMarginUm: CROP_MARGIN_UM, detSide }, [probs.buffer, wsum.buffer]);
+  } catch (e) {
+    imageJob({ op: "drop" }).catch(() => {});
+    throw e;
   }
-  if (work.w * work.h > MAX_MEASURE_MP * 1e6)
+  net = null;
+  const stem = file.name.replace(/\.[^.]+$/, "");
+  fin.logs.forEach(log);
+  log(`segmentation (${backend}): ${ms(tAll)}`);
+  if (fin.w * fin.h > MAX_MEASURE_MP * 1e6)
     throw new Error(`${file.name}: the tissue is too large to measure in the browser ` +
-      `(${(work.w * work.h / 1e6).toFixed(0)} MP at ${workMpp.toFixed(3)} \u00b5m/px); use the desktop app`);
+      `(${(fin.w * fin.h / 1e6).toFixed(0)} MP at ${workMpp.toFixed(3)} \u00b5m/px); use the desktop app`);
 
   t0 = performance.now();
   status(`${file.name}: measuring...`);
   imageProgress(0.6, "Measuring");
-  const rgb = toRGB(work);
+  const { rgb, mask: wm, region, det } = fin;
   let lines = 0;
   const res = await measureWorker.run(
-    { name: file.name, rgb, mask: wm, w: work.w, h: work.h, umPerPx: workMpp, k, lastModified: file.lastModified,
+    { name: file.name, rgb, mask: wm, w: fin.w, h: fin.h, umPerPx: workMpp, k, lastModified: file.lastModified,
       quality: JSON.stringify(manifest.quality), folderName, options: opts.detect, region, det },
     [rgb.buffer, wm.buffer, ...(det ? [det.rgb.buffer] : [])],
     (line) => {
@@ -1475,11 +1398,12 @@ async function savePreviewK(d) {
 let imageWorker = null, imageNext = 0;
 const imagePending = new Map();
 
-function imageJob(msg) {
+function imageJob(msg, transfer = [], onProgress = null) {
   if (!imageWorker) {
     imageWorker = new Worker(`image_worker.js?v=${VERSION}`, { type: "module" });
     imageWorker.onmessage = ({ data }) => {
       const p = imagePending.get(data.id);
+      if (data.type === "progress") return p?.onProgress?.(data);
       imagePending.delete(data.id);
       if (data.error) p?.reject(new Error(data.error));
       else p?.resolve(data);
@@ -1494,8 +1418,8 @@ function imageJob(msg) {
   }
   const id = imageNext++;
   return new Promise((resolve, reject) => {
-    imagePending.set(id, { resolve, reject });
-    imageWorker.postMessage({ ...msg, id });
+    imagePending.set(id, { resolve, reject, onProgress });
+    imageWorker.postMessage({ ...msg, id }, transfer);
   });
 }
 
