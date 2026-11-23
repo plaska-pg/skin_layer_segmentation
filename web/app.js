@@ -554,12 +554,15 @@ async function subdir(dir, name) {
   }
 }
 
-// modal yes/no question; Escape or Cancel answers false
-function confirmDialog({ title, text, items = [], ok = "Continue" }) {
+// modal question; resolves "ok", "alt" (optional second choice) or "" (Escape / Cancel)
+function confirmDialog({ title, text, items = [], ok = "Continue", alt = "" }) {
   const dlg = $("confirm-dlg");
   $("dlg-title").textContent = title;
   $("dlg-text").textContent = text;
   $("dlg-ok").textContent = ok;
+  $("dlg-ok").classList.toggle("primary", !alt);
+  $("dlg-alt").textContent = alt;
+  $("dlg-alt").hidden = !alt;
   $("dlg-list").replaceChildren(...items.map((t) => {
     const li = document.createElement("li");
     li.textContent = t;
@@ -568,7 +571,8 @@ function confirmDialog({ title, text, items = [], ok = "Continue" }) {
   $("dlg-list").hidden = !items.length;
   dlg.returnValue = "";
   dlg.showModal();
-  return new Promise((resolve) => dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true }));
+  return new Promise((resolve) => dlg.addEventListener("close", () =>
+    resolve(["ok", "alt"].includes(dlg.returnValue) ? dlg.returnValue : ""), { once: true }));
 }
 
 function setImg(img, blob) {
@@ -582,7 +586,8 @@ function setImg(img, blob) {
 async function runJobs() {
   const mpp = Number($("mpp").value);
   if (!(mpp > 0)) { setHeader("Enter the \u00b5m per pixel of the images first.", "err"); return; }
-  const root = state.root, opts = readOptions(), resume = $("resume").checked;
+  const root = state.root, opts = readOptions();
+  let resume = $("resume").checked;
   const limit = Math.max(0, Math.floor(Number($("limit").value) || 0));
   let jobs;
   if (state.scope === "one") {
@@ -605,18 +610,24 @@ async function runJobs() {
       if (e.name !== "NotFoundError" && e.name !== "TypeMismatchError") throw e;
     }
   }
-  if (existing.length && !(await confirmDialog({
-    title: existing.length === 1 ? `${existing[0]} already exists` : `${existing.length} predicted folders already exist`,
-    text: resume
-      ? "Resume is on: images already in its _results.csv are kept. Every other image is processed and its outputs " +
-        "replace files with the same name in it."
-      : "Resume is off: every image is processed again and its outputs replace the existing files in it.",
-    items: existing.length > 1 ? existing.slice(0, 8).concat(existing.length > 8 ? [`and ${existing.length - 8} more`] : [])
-      : [],
-    ok: "Overwrite and run",
-  }))) {
-    openRunDialog();
-    return;
+  if (existing.length) {
+    const answer = await confirmDialog({
+      title: existing.length === 1 ? `${existing[0]} already exists` : `${existing.length} predicted folders already exist`,
+      text: resume
+        ? "Resume is on: images already in its _results.csv are kept. Every other image is processed and its outputs " +
+          "replace files with the same name in it."
+        : "Every image will be processed again and its outputs will replace the existing files. " +
+          "Would you rather resume your run? Images already in _results.csv are then kept and only the rest are processed.",
+      items: existing.length > 1 ? existing.slice(0, 8).concat(existing.length > 8 ? [`and ${existing.length - 8} more`] : [])
+        : [],
+      ok: resume ? "Continue" : "Overwrite all",
+      alt: resume ? "" : "Resume run",
+    });
+    if (!answer) {
+      openRunDialog();
+      return;
+    }
+    if (answer === "alt") resume = $("resume").checked = true;
   }
   state.busy = true;
   state.stop = false;

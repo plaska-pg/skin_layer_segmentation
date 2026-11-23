@@ -231,7 +231,7 @@
         <label for="limit">Limit images per folder (0 = all)</label>
         <input type="number" id="limit" min="0" step="1" value="0">
       </div>
-      <label class="check"><input type="checkbox" id="resume" checked> Resume (reuse already-processed images)</label>
+      <label class="check"><input type="checkbox" id="resume"> Resume (reuse already-processed images)</label>
       <p class="caption">Results go to predicted_&lt;folder&gt; inside each image folder (predicted_&lt;image&gt; for one image).
         Images over 45 MP are measured at 0.4 µm/px to fit in browser memory.</p>
     </div>
@@ -249,7 +249,8 @@
     <ul id="dlg-list"></ul>
     <div class="dlg-actions">
       <button class="btn" value="cancel" autofocus>Cancel</button>
-      <button class="btn primary" value="ok" id="dlg-ok">Continue</button>
+      <button class="btn" value="ok" id="dlg-ok">Continue</button>
+      <button class="btn primary" value="alt" id="dlg-alt" hidden></button>
     </div>
   </form>
 </dialog>
