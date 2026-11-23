@@ -596,7 +596,7 @@ async function runJobs() {
     jobs = [{ dir: root, path: "", files: [await root.getFileHandle(name)],
       outName: `predicted_${name.replace(/\.[^.]+$/, "")}` }];
   } else {
-    jobs = (await imageFolders(root, "", state.scope === "subfolders"))
+    jobs = (await imageFolders(root, "", state.scope === "subfolders" ? 1 : 0))
       .map((f) => ({ ...f, files: limit ? f.files.slice(0, limit) : f.files, outName: `predicted_${f.dir.name}` }));
   }
   const total = jobs.reduce((n, j) => n + j.files.length, 0);
@@ -1035,16 +1035,17 @@ function renderMetrics(row) {
   }));
 }
 
-// folders that directly hold images; predicted_* (and legacy *_predicted) output folders are skipped, as in app.py
-async function imageFolders(dir, path, recursive, found = []) {
+// folders that directly hold images, down to `depth` levels below dir; predicted_* (and legacy *_predicted) output
+// folders are skipped, as in app.py
+async function imageFolders(dir, path, depth, found = []) {
   const files = [], subdirs = [];
   for await (const [name, h] of dir.entries()) {
     if (h.kind === "file" && IMAGE_RE.test(name)) files.push(h);
-    else if (h.kind === "directory" && recursive && !/^predicted_|_predicted/i.test(name)) subdirs.push(h);
+    else if (h.kind === "directory" && depth > 0 && !/^predicted_|_predicted/i.test(name)) subdirs.push(h);
   }
   const byName = (a, b) => a.name.localeCompare(b.name);
   if (files.length) found.push({ dir, path, files: files.sort(byName) });
-  for (const d of subdirs.sort(byName)) await imageFolders(d, path ? `${path}/${d.name}` : d.name, recursive, found);
+  for (const d of subdirs.sort(byName)) await imageFolders(d, path ? `${path}/${d.name}` : d.name, depth - 1, found);
   return found;
 }
 
