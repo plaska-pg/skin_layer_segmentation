@@ -6,7 +6,7 @@
   --primary: #003DA6; --primary-hover: #0059B6; --primary-soft: rgba(0, 61, 166, .08);
   --accent: #00A1DF; --navy: #152169; --on-navy: #fff; --on-navy-soft: rgba(255, 255, 255, .72);
   --text: #1b1f3a; --text-soft: rgba(27, 31, 58, .6);
-  --bg: #fff; --bg2: #f0f4fa; --border: rgba(21, 33, 105, .18); --radius: .5rem; --header-h: 3.5rem;
+  --bg: #fff; --bg2: #f0f4fa; --border: rgba(21, 33, 105, .18); --radius: 0; --header-h: 3.5rem;
   /* names interface/seg_editor.js's CSS expects (Streamlit theme variables) */
   --st-font: var(--font); --st-text-color: var(--text); --st-primary-color: var(--primary);
   --st-background-color: var(--bg); --st-secondary-background-color: var(--bg2); --st-border-color: var(--border);
@@ -89,10 +89,10 @@ input[readonly] { color: var(--text-soft); }
   cursor: pointer; font-size: .9rem; }
 .seg button.on { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
 .switch { display: flex; align-items: center; gap: .6rem; margin: .45rem 0; cursor: pointer; font-size: .95rem; }
-.switch input { appearance: none; width: 2rem; height: 1.1rem; border-radius: 1rem; background: #ccd; position: relative;
+.switch input { appearance: none; width: 2rem; height: 1.1rem; border-radius: 0; background: #ccd; position: relative;
   cursor: pointer; flex: none; transition: background .15s; }
 .switch input::after { content: ""; position: absolute; top: .15rem; left: .15rem; width: .8rem; height: .8rem;
-  border-radius: 50%; background: #fff; transition: left .15s; }
+  border-radius: 0; background: #fff; transition: left .15s; }
 .switch input:checked { background: var(--primary); }
 .switch input:checked::after { left: 1.05rem; }
 .check { display: flex; align-items: center; gap: .5rem; font-size: .95rem; }
@@ -103,11 +103,11 @@ details.expander[open] > summary::before { transform: rotate(90deg); }
 details.expander > div { padding: 0 1rem 1rem; }
 .info { background: var(--primary-soft); color: #152169; border-radius: var(--radius); padding: 1rem; }
 .warn { background: rgba(255, 193, 7, .15); color: #6a4a00; border-radius: var(--radius); padding: 1rem; margin: .5rem 0; }
-.progress { height: .5rem; background: var(--bg2); border-radius: .25rem; overflow: hidden; margin-top: .25rem; }
+.progress { height: .5rem; background: var(--bg2); border-radius: 0; overflow: hidden; margin-top: .25rem; }
 .progress > div { height: 100%; width: 0; background: var(--primary); transition: width .2s; }
 pre.log { background: var(--bg2); border-radius: var(--radius); padding: .75rem 1rem; font-size: .8rem;
   white-space: pre-wrap; max-height: 24rem; overflow: auto; margin: 0; }
-img.preview, canvas.preview { max-width: 100%; display: block; margin: .75rem 0; border-radius: .25rem; }
+img.preview, canvas.preview { max-width: 100%; display: block; margin: .75rem 0; }
 hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
 
 /* tables (st.dataframe look) */
@@ -130,7 +130,7 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 /* bar chart */
 .bars { display: grid; grid-template-columns: max-content 1fr max-content; gap: .3rem .75rem; align-items: center;
   font-size: .875rem; margin: .5rem 0 1rem; }
-.bars .bar { height: 1rem; background: var(--primary); border-radius: 2px; min-width: 1px; }
+.bars .bar { height: 1rem; background: var(--primary); min-width: 1px; }
 
 /* review: interface/seg_editor.py's editor CSS */
 .seg-ed { outline: none; font-family: var(--st-font, sans-serif); color: var(--st-text-color); }
@@ -141,7 +141,7 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 .seg-ed .grp { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .seg-ed .grp.right { margin-left: auto; }
 .seg-ed .bar button { border: 2px solid var(--st-border-color, #888); background: var(--st-secondary-background-color);
-  color: var(--st-text-color); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.85rem; }
+  color: var(--st-text-color); border-radius: 0; padding: 4px 10px; cursor: pointer; font-size: 0.85rem; }
 .seg-ed .bar button.on { background: var(--st-primary-color); color: #fff; }
 .seg-ed .bar button.primary { background: var(--st-primary-color); color: #fff; border-color: var(--st-primary-color);
   margin-right: 8px; }
@@ -151,7 +151,7 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
   animation: seg-spin 0.8s linear infinite; }
 @keyframes seg-spin { to { transform: rotate(360deg); } }
 .seg-ed .pos { font-size: 0.85rem; min-width: 3.5em; text-align: center; }
-.seg-ed canvas { display: block; width: 100%; margin-top: 6px; cursor: crosshair; touch-action: none; border-radius: 4px; }
+.seg-ed canvas { display: block; width: 100%; margin-top: 6px; cursor: crosshair; touch-action: none; }
 .seg-ed .status { margin-top: 4px; font-size: 0.85rem; }
 .seg-ed .status.dirty { color: var(--st-red-color, #d33); }
 .seg-ed .hint { margin-top: 4px; font-size: 0.75rem; opacity: 0.7; }
@@ -188,7 +188,7 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 .viewer { display: flex; flex-direction: column; gap: .6rem; min-height: 0; min-width: 0; }
 .vw-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
 .badge { font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: .2rem .55rem;
-  border-radius: 1rem; background: var(--primary-soft); color: var(--primary); white-space: nowrap; }
+  background: var(--primary-soft); color: var(--primary); white-space: nowrap; }
 .vw-nav { display: flex; align-items: center; gap: .25rem; min-width: 0; flex: 1; max-width: 26rem; }
 .vw-nav select { height: 2rem; padding: .1rem .5rem; min-width: 0; }
 #vw-view { margin-left: auto; }
@@ -196,7 +196,7 @@ details.multi > div { position: absolute; z-index: 15; left: 0; right: 0; backgr
 .metric { background: var(--bg2); border-radius: var(--radius); padding: .35rem .75rem; min-width: 0; }
 .metric.colored { border-left: 0; background: var(--bg2); }
 .metric.colored .k::before { content: ""; display: inline-block; width: .7rem; height: .7rem; margin-right: .35rem;
-  vertical-align: -.05rem; border-radius: 2px; background: var(--c); }
+  vertical-align: -.05rem; background: var(--c); }
 .metric .k { font-size: .78rem; color: var(--text-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .metric .v { font-size: 1.25rem; font-weight: 600; line-height: 1.3; white-space: nowrap; }
 .metric .v small { font-size: .8rem; font-weight: 400; color: var(--text-soft); margin-left: .2rem; }
