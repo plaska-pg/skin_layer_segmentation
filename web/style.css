@@ -1,4 +1,7 @@
 /* Streamlit's default light theme, so the page looks like interface/app.py */
+/* Montserrat (OFL), variable weight, Latin subset */
+@font-face { font-family: "Montserrat"; src: url("fonts/Montserrat-latin.woff2") format("woff2");
+  font-weight: 100 900; font-style: normal; font-display: swap; }
 :root {
   --primary: #003DA6; --primary-hover: #0059B6; --primary-soft: rgba(0, 61, 166, .08);
   --accent: #00A1DF; --navy: #152169; --on-navy: #fff; --on-navy-soft: rgba(255, 255, 255, .72);
@@ -8,7 +11,7 @@
   --st-font: var(--font); --st-text-color: var(--text); --st-primary-color: var(--primary);
   --st-background-color: var(--bg); --st-secondary-background-color: var(--bg2); --st-border-color: var(--border);
   --st-red-color: #d33; --seg-ed-top: 0px;
-  --font: "Source Sans 3", "Source Sans Pro", -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font: "Montserrat", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
 }
 * { box-sizing: border-box; }
 body { margin: 0; font: 16px/1.6 var(--font); color: var(--text); background: var(--bg); }
@@ -73,6 +76,9 @@ input[readonly] { color: var(--text-soft); }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn.primary:hover:not(:disabled) { background: var(--primary-hover); color: #fff; }
 .btn:disabled { opacity: .45; cursor: default; }
+.btn-icon { width: 1.5rem; height: 1.5rem; flex: none; }
+/* the SVG has no fill (black); make it white on filled buttons */
+.btn.primary .btn-icon { filter: brightness(0) invert(1); }
 .btn.wide { width: 100%; }
 .row { display: flex; gap: .5rem; align-items: flex-end; }
 .row > .grow { flex: 1; min-width: 0; }
