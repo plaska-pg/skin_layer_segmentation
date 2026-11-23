@@ -1,6 +1,6 @@
 /* Streamlit's default light theme, so the page looks like interface/app.py */
 /* Montserrat (OFL), variable weight, Latin subset */
-@font-face { font-family: "Montserrat"; src: url("fonts/Montserrat-latin.woff2") format("woff2");
+@font-face { font-family: "Montserrat"; src: url("assets/fonts/Montserrat-latin.woff2") format("woff2");
   font-weight: 100 900; font-style: normal; font-display: swap; }
 :root {
   --primary: #003DA6; --primary-hover: #0059B6; --primary-soft: rgba(0, 61, 166, .08);
