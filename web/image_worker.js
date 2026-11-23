@@ -15,6 +15,79 @@ async function loadUtif() {
   if ("sha384-" + btoa(String.fromCharCode(...digest)) !== UTIF_SRI) throw new Error(`integrity check failed for ${UTIF_URL}`);
   // classic (non-module) script that sets self.UTIF
   new Function(new TextDecoder().decode(buf))();
+  boundLzw(self.UTIF);
+}
+
+// UTIF's LZW decoder reads codes until an end code and never checks the strip's length, so a strip whose end
+// code it misses (the last strip of S_EX 8_24 l10c4.svs.tif) loops forever. Same decoder, stopped at the end
+// of the strip's bytes and of its rows.
+function boundLzw(UTIF) {
+  const decompress = UTIF.decode._decompress;
+  let endBit = 0, outEnd = 0;
+  UTIF.decode._decompress = function (img, ifds, data, off, len, cmpr, tgt, toff, fo) {
+    if (cmpr === 5) {
+      const tiled = img.t322 != null, w = tiled ? img.t322[0] : img.width;
+      const rows = tiled ? img.t323[0] : Math.min(img.t278?.[0] ?? img.height, img.height);
+      const bipp = img.t258 ? Math.min(32, img.t258[0]) * img.t258.length : (img.t277?.[0] ?? 1);
+      endBit = (off + len) * 8;
+      outEnd = Math.min(tgt.length, toff + rows * Math.ceil(w * bipp / 8));
+    }
+    return decompress.call(this, img, ifds, data, off, len, cmpr, tgt, toff, fo);
+  };
+  let tab = null, tln = null, chr = null;
+  UTIF.decode._decodeLZW = function (data, off, tgt, toff) {
+    if (!tab) {
+      tab = new Uint32Array(0xffff); tln = new Uint16Array(0xffff); chr = new Uint8Array(2e6);
+      for (let i = 0; i < 256; i++) { chr[i << 2] = i; tab[i] = i << 2; tln[i] = 1; }
+    }
+    const copy = UTIF.decode._copyData;
+    let totl = 258, chrl = 258 << 2, bits = 9, boff = off << 3, Code = 0, OldCode = 0;
+    const read = () => {
+      const v = (data[boff >>> 3] << 16) | (data[(boff + 8) >>> 3] << 8) | data[(boff + 16) >>> 3];
+      const c = (v >> (24 - (boff & 7) - bits)) & ((1 << bits) - 1);
+      boff += bits;
+      return c;
+    };
+    while (boff + bits <= endBit && toff < outEnd) {
+      Code = read();
+      if (Code === 257) break;
+      if (Code === 256) {
+        bits = 9; totl = 258; chrl = 258 << 2;
+        if (boff + bits > endBit) break;
+        Code = read();
+        if (Code === 257) break;
+        tgt[toff++] = Code;
+      } else if (Code < totl) {
+        const cd = tab[Code], cl = tln[Code];
+        copy(chr, cd, tgt, toff, cl); toff += cl;
+        if (OldCode >= totl) { tab[totl] = chrl; chr[tab[totl]] = cd[0]; tln[totl] = 1; chrl = (chrl + 1 + 3) & ~0x03; totl++; }
+        else {
+          tab[totl] = chrl;
+          const nit = tab[OldCode];
+          let nil = tln[OldCode];
+          copy(chr, nit, chr, chrl, nil);
+          chr[chrl + nil] = chr[cd]; nil++;
+          tln[totl] = nil; totl++;
+          chrl = (chrl + nil + 3) & ~0x03;
+        }
+        if (totl + 1 === (1 << bits)) bits++;
+      } else if (Code === totl) {
+        if (OldCode >= totl) { tab[totl] = chrl; tln[totl] = 0; totl++; }
+        else {
+          tab[totl] = chrl;
+          const nit = tab[OldCode];
+          let nil = tln[OldCode];
+          copy(chr, nit, chr, chrl, nil);
+          chr[chrl + nil] = chr[chrl]; nil++;
+          tln[totl] = nil; totl++;
+          copy(chr, chrl, tgt, toff, nil); toff += nil;
+          chrl = (chrl + nil + 3) & ~0x03;
+        }
+        if (totl + 1 === (1 << bits)) bits++;
+      } else break;
+      OldCode = Code;
+    }
+  };
 }
 
 const ms = (t0) => `${((performance.now() - t0) / 1000).toFixed(2)} s`;
